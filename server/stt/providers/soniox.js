@@ -6,10 +6,12 @@
    ============================================ */
 
 const { STT_ERROR, sttError } = require('../contracts');
+const { PROVIDER_FORMATS } = require('../formats');
 
 const API_BASE = 'https://api.soniox.com/v1';
 const MAX_UPLOAD_BYTES = 500 * 1024 * 1024;
-const POLL_TIMEOUT_MS = 30 * 60 * 1000;
+// Was 30 minutes; BR-102 needs headroom for a 3-hour merged-part recording.
+const POLL_TIMEOUT_MS = 3 * 60 * 60 * 1000;
 
 const MODELS = [{ id: 'stt-async-v5', label: 'Soniox Async v5' }];
 
@@ -158,6 +160,7 @@ function createSonioxAdapter(deps) {
         transcript: buildSegments(tokens, false),
         translations: buildSegments(tokens, true),
         duration: Math.max(0, Math.round((Number(job.audio_duration_ms) || 0) / 1000)),
+        durationKind: 'audio-length',
         model: job.model || 'stt-async-v5'
       };
     } finally {
@@ -170,7 +173,17 @@ function createSonioxAdapter(deps) {
     }
   }
 
-  return { id, name: 'Soniox', kind: 'api', needsKey: true, supportsTranslation: true, supportsLive: true, maxUploadBytes: MAX_UPLOAD_BYTES, getStatus, listModels, testConnection, transcribe };
+  // Soniox's `audio_duration_ms` is the provider's own measured audio length
+  // for every model it offers today (Architecture §V9/§V12.1).
+  function durationKindFor() {
+    return 'audio-length';
+  }
+
+  return {
+    id, name: 'Soniox', kind: 'api', needsKey: true, supportsTranslation: true, supportsLive: true,
+    maxUploadBytes: MAX_UPLOAD_BYTES, formats: PROVIDER_FORMATS.soniox,
+    getStatus, listModels, testConnection, transcribe, durationKindFor
+  };
 }
 
 module.exports = { createSonioxAdapter };

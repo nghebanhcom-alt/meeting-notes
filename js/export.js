@@ -4,32 +4,71 @@
 
 const Export = {
   /**
-   * Export meeting to Markdown format
+   * Export meeting to Markdown format (BR-51..BR-54, Architecture.md §5.6).
+   * `options.includeTranscript` defaults to true (BR-54); `options.presetDeleted`
+   * lets the caller pass a live-preset-list lookup result (BR-52 "(preset đã
+   * bị xóa khỏi ứng dụng)") since this function has no async preset fetch of
+   * its own — it stays a pure renderer, same as `Summary.format`.
    */
-  toMarkdown(meeting) {
+  toMarkdown(meeting, options = {}) {
+    const includeTranscript = options.includeTranscript !== false;
     const lines = [];
 
     lines.push(`# ${meeting.title}`);
     lines.push('');
-    lines.push(`**Date:** ${Utils.formatDate(meeting.date)}`);
-    lines.push(`**Duration:** ${Utils.formatDurationHuman(meeting.duration)}`);
+    lines.push(`**Ngày:** ${Utils.formatDate(meeting.date)}  **Thời lượng:** ${Utils.formatDurationHuman(meeting.duration)}`);
 
-    if (meeting.participants.length > 0) {
-      lines.push(`**Participants:** ${meeting.participants.join(', ')}`);
+    // Pre-meeting info block (BR-51) — every field skipped when empty, no
+    // trailing blank heading.
+    const typeEntry = meeting.meetingType && typeof meetingTypeByCode === 'function'
+      ? meetingTypeByCode(meeting.meetingType) : null;
+    if (typeEntry) lines.push(`**Loại cuộc họp:** ${typeEntry.label}`);
+    if (meeting.topic) lines.push(`**Chủ đề:** ${meeting.topic}`);
+    if (meeting.leadBy) lines.push(`**Chủ trì:** ${meeting.leadBy}`);
+    if (meeting.participants && meeting.participants.length > 0) {
+      lines.push(`**Người tham dự:** ${meeting.participants.join(', ')}`);
+    }
+    if (meeting.tags && meeting.tags.length > 0) {
+      lines.push(`**Tag:** ${meeting.tags.join(', ')}`);
     }
     lines.push('');
 
-    // Summary
-    if (meeting.summary) {
-      lines.push('## Summary');
-      lines.push('');
-      lines.push(meeting.summary);
+    // TV14/BR-129/PRG-17 — a merged recording missing a part must say so up
+    // front, not just leave a gap for the reader to notice on their own.
+    // A no-op for a single-part meeting (missingParts is always empty/absent).
+    if (Array.isArray(meeting.missingParts) && meeting.missingParts.length > 0) {
+      lines.push(`⚠ Bản ghi này còn thiếu phần ${meeting.missingParts.join(', ')}.`);
       lines.push('');
     }
 
-    // Action Items
+    // Summary — rendered per-section from the snapshot (BR-20), one
+    // Markdown heading per section (Architecture.md §5.6).
+    const summarySnapshot = Summary.virtualSnapshotForLegacy(meeting);
+    if (summarySnapshot) {
+      for (const section of summarySnapshot.sections) {
+        const text = Summary._formatSection(section, (meeting.summaryDetails || {})[section.key]);
+        if (!text) continue;
+        lines.push(`## ${section.label}`);
+        lines.push('');
+        lines.push(text);
+        lines.push('');
+      }
+
+      // BR-52: preset name + generatedAt note.
+      const generatedAt = meeting.summaryGeneration?.generatedAt
+        ? new Date(meeting.summaryGeneration.generatedAt).toLocaleString()
+        : '';
+      const deletedNote = options.presetDeleted ? ', đã bị xóa khỏi ứng dụng' : '';
+      const noteParts = [`Tóm tắt bằng preset "${summarySnapshot.name}"${deletedNote}`];
+      if (generatedAt) noteParts.push(generatedAt);
+      lines.push(`> ${noteParts.join(' · ')}`);
+      lines.push('');
+    }
+
+    // Action Items (meeting.actionItems — the user's own curated list,
+    // untouched by preset changes, per Architecture §8/E3).
     if (meeting.actionItems && meeting.actionItems.length > 0) {
-      lines.push('## Action Items');
+      lines.push('## Việc cần làm');
       lines.push('');
       meeting.actionItems.forEach(item => {
         const check = item.done ? 'x' : ' ';
@@ -39,24 +78,40 @@ const Export = {
       lines.push('');
     }
 
-    // Transcript
-    if (meeting.transcript && meeting.transcript.length > 0) {
+    // Notes — moved BEFORE Transcript (§5.6, mirrors the prompt ordering
+    // rationale in Architecture WHY-7).
+    if (meeting.notes) {
+      lines.push('## Ghi chú');
+      lines.push('');
+      lines.push(meeting.notes);
+      lines.push('');
+    }
+
+    // Transcript — optional (BR-54).
+    if (includeTranscript && meeting.transcript && meeting.transcript.length > 0) {
       lines.push('## Transcript');
       lines.push('');
+      // A segment with `.kind` (part-divider/part-gap) only ever exists on a
+      // merged recording (Architecture §V4.3) — a single-part meeting's
+      // transcript has no such segment, so this branch is dead code for it
+      // and the .md output stays byte-for-byte identical to before TV14
+      // (test hồi quy).
       meeting.transcript.forEach(seg => {
+        if (seg.kind === 'part-divider') {
+          lines.push(`### ${seg.text.replace(/^—\s*/, '').replace(/\s*—$/, '')}`);
+          lines.push('');
+          return;
+        }
+        if (seg.kind === 'part-gap') {
+          lines.push(`*⚠ ${seg.text}*`);
+          lines.push('');
+          return;
+        }
         const time = Utils.formatTimestamp(seg.time);
         const speaker = seg.speaker || 'Speaker';
         lines.push(`**[${time}] ${speaker}:** ${seg.text}`);
         lines.push('');
       });
-    }
-
-    // Notes
-    if (meeting.notes) {
-      lines.push('## Notes');
-      lines.push('');
-      lines.push(meeting.notes);
-      lines.push('');
     }
 
     return lines.join('\n');
@@ -79,11 +134,17 @@ const Export = {
     }
     lines.push('');
 
-    if (meeting.summary) {
+    const summarySnapshotText = Summary.virtualSnapshotForLegacy(meeting);
+    if (summarySnapshotText) {
       lines.push('SUMMARY');
       lines.push('-'.repeat(40));
-      lines.push(meeting.summary);
-      lines.push('');
+      for (const section of summarySnapshotText.sections) {
+        const text = Summary._formatSection(section, (meeting.summaryDetails || {})[section.key]);
+        if (!text) continue;
+        lines.push(`${section.label}:`);
+        lines.push(text);
+        lines.push('');
+      }
     }
 
     if (meeting.actionItems && meeting.actionItems.length > 0) {
@@ -217,3 +278,13 @@ const Export = {
     });
   }
 };
+
+// Testability guard only (same pattern as js/meeting-types.js/js/tags.js) —
+// `typeof module` is always 'undefined' in the browser, so this changes
+// nothing about how index.html loads/uses `Export`. Lets
+// test/export-markdown.test.js exercise `toMarkdown` directly with `Utils`/
+// `Summary`/`meetingTypeByCode` provided as globals, for the TV14 mandatory
+// single-part byte-for-byte regression test.
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = Export;
+}

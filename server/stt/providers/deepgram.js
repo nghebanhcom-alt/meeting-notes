@@ -7,6 +7,7 @@
 
 const { STT_ERROR, sttError, groupWordsIntoSegments } = require('../contracts');
 const { fetchWithTimeout, httpErrorFor } = require('./http');
+const { PROVIDER_FORMATS } = require('../formats');
 
 const ENDPOINT = 'https://api.deepgram.com/v1/listen';
 // Prerecorded audio is read fully into memory and posted as the request body;
@@ -141,11 +142,22 @@ function createDeepgramAdapter(deps) {
       transcript: groupWordsIntoSegments(words, false),
       translations: [],
       duration: Number(body?.metadata?.duration) || 0,
+      durationKind: 'audio-length',
       model: modelId(model)
     };
   }
 
-  return { id, name: 'Deepgram', kind: 'api', needsKey: true, supportsTranslation: false, supportsLive: true, maxUploadBytes: MAX_UPLOAD_BYTES, getStatus, listModels, testConnection, transcribe, grantTemporaryKey };
+  // `metadata.duration` is Deepgram's own measured audio length for every
+  // model it offers today (Architecture §V9/§V12.1).
+  function durationKindFor() {
+    return 'audio-length';
+  }
+
+  return {
+    id, name: 'Deepgram', kind: 'api', needsKey: true, supportsTranslation: false, supportsLive: true,
+    maxUploadBytes: MAX_UPLOAD_BYTES, formats: PROVIDER_FORMATS.deepgram,
+    getStatus, listModels, testConnection, transcribe, grantTemporaryKey, durationKindFor
+  };
 }
 
 module.exports = { createDeepgramAdapter, MODELS };

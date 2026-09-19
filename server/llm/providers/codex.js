@@ -6,6 +6,9 @@
    prompt building and long-transcript orchestration.
    ============================================ */
 
+const fsp = require('fs/promises');
+const path = require('path');
+const crypto = require('crypto');
 const { LLM_ERROR, llmError, normalizeSummary, normalizeTitle } = require('../contracts');
 
 // Codex resolves its own model from the signed-in account. contextWindow 0
@@ -32,11 +35,29 @@ function codexArgs(schemaFile) {
  * @param {Function} deps.resolveCodexBinary returns the codex executable path
  * @param {string} deps.summarySchemaFile absolute path to summary JSON schema
  * @param {string} deps.titleSchemaFile absolute path to title JSON schema
+ * @param {string} [deps.tmpSchemaDir] absolute dir for per-request preset schema files (§6.1)
  * @param {number} deps.timeoutMs per-invocation timeout
  */
 function createCodexAdapter(deps) {
-  const { runProcess, resolveCodexBinary, summarySchemaFile, titleSchemaFile, timeoutMs } = deps;
+  const {
+    runProcess, resolveCodexBinary, summarySchemaFile, titleSchemaFile, timeoutMs,
+    tmpSchemaDir = path.join(path.dirname(summarySchemaFile), '.tmp')
+  } = deps;
   const id = 'codex';
+
+  // A preset's schema must live under schemas/ — the only path verified to
+  // be readable under --sandbox read-only (§6.1, WHY-7) — and survive both
+  // runStructured attempts (initial + one repair retry) before cleanup.
+  async function withTempSchemaFile(jsonSchema, run) {
+    await fsp.mkdir(tmpSchemaDir, { recursive: true });
+    const file = path.join(tmpSchemaDir, `${crypto.randomUUID()}.json`);
+    await fsp.writeFile(file, JSON.stringify(jsonSchema), 'utf8');
+    try {
+      return await run(file);
+    } finally {
+      await fsp.rm(file, { force: true });
+    }
+  }
 
   async function runCodex(prompt, schemaFile) {
     let result;
@@ -112,8 +133,10 @@ function createCodexAdapter(deps) {
     listModels,
     getModelSpec,
     testConnection,
-    summarize: ({ prompt }) => runStructured(prompt, summarySchemaFile, normalizeSummary)
-      .then(data => ({ data, usage: {}, model: 'default' })),
+    summarize: ({ prompt, format }) => (format
+      ? withTempSchemaFile(format.jsonSchema, schemaFile => runStructured(prompt, schemaFile, format.normalize))
+      : runStructured(prompt, summarySchemaFile, normalizeSummary)
+    ).then(data => ({ data, usage: {}, model: 'default' })),
     title: ({ prompt }) => runStructured(prompt, titleSchemaFile, normalizeTitle)
       .then(data => ({ data, usage: {}, model: 'default' }))
   };

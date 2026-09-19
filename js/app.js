@@ -428,6 +428,16 @@ const App = {
     });
   },
 
+  // R-Z/V11#8 — a merged (multi-part) meeting's audio lives at N part ids,
+  // not at `meeting.id`; deleting a meeting must free every one of them or
+  // audio quietly piles up forever in storage/audio/ (R-Q).
+  _audioIdsForMeeting(meeting) {
+    if (Array.isArray(meeting?.parts) && meeting.parts.length > 0) {
+      return meeting.parts.map(part => part.partId).filter(Boolean);
+    }
+    return [meeting.id];
+  },
+
   _updateMeetingsCount() {
     const count = Storage.getAllMeetings().length;
     const badge = document.getElementById('nav-meetings-count');
@@ -555,7 +565,7 @@ const App = {
     document.getElementById('dash-quick-record')?.addEventListener('click', () => this._quickStartMeeting());
     document.getElementById('dash-new-meeting')?.addEventListener('click', () => this.navigate('new'));
     document.getElementById('dash-view-all')?.addEventListener('click', () => this.navigate('meetings'));
-    document.getElementById('dash-upload')?.addEventListener('click', () => this._handleUpload());
+    document.getElementById('dash-upload')?.addEventListener('click', () => Import.open());
     this._bindMeetingItemClicks();
   },
 
@@ -711,6 +721,23 @@ const App = {
             </div>
 
             <div class="input-group">
+              <label for="meeting-type">Meeting type <span class="text-tertiary">(optional)</span></label>
+              <select class="input" id="meeting-type">
+                ${this._meetingTypeOptions('')}
+              </select>
+            </div>
+
+            <div class="input-group">
+              <label for="meeting-topic">Topic <span class="text-tertiary">(optional)</span></label>
+              <input type="text" class="input" id="meeting-topic" maxlength="200" placeholder="e.g. Q4 pricing review">
+            </div>
+
+            <div class="input-group">
+              <label for="meeting-lead-by">Led by <span class="text-tertiary">(optional)</span></label>
+              <input type="text" class="input" id="meeting-lead-by" maxlength="200" placeholder="Who is chairing this meeting?">
+            </div>
+
+            <div class="input-group">
               <label for="meeting-language">Spoken Language</label>
               <select class="input" id="meeting-language">
                 ${langOptions}
@@ -770,6 +797,15 @@ const App = {
     `;
   },
 
+  // BR-25 dropdown, shared by New Meeting and Meeting Detail (T3, T8).
+  _meetingTypeOptions(selectedCode) {
+    const options = ['<option value="">(chưa chọn)</option>'];
+    for (const entry of MEETING_TYPES) {
+      options.push(`<option value="${Utils.escapeHtml(entry.code)}" ${entry.code === selectedCode ? 'selected' : ''}>${Utils.escapeHtml(entry.label)}</option>`);
+    }
+    return options.join('');
+  },
+
   _bindNewMeeting() {
     const translationSelect = document.getElementById('meeting-translation-language');
     const translationHelp = document.getElementById('meeting-translation-help');
@@ -792,13 +828,22 @@ const App = {
       const language = document.getElementById('meeting-language').value;
       const translationLanguage = document.getElementById('meeting-translation-language').value;
       const captureSystemAudio = document.getElementById('setup-system-audio')?.checked || false;
+      const meetingType = Storage.normalizeMeetingType(document.getElementById('meeting-type')?.value);
+      const topic = Storage.normalizeShortText(document.getElementById('meeting-topic')?.value);
+      const leadBy = Storage.normalizeShortText(document.getElementById('meeting-lead-by')?.value);
+      const tags = this._initialTagsForMeetingType(meetingType);
 
+      // BR-24: none of these fields ever block Start Recording.
       const meeting = Storage.saveMeeting({
         title,
         participants,
         language,
         translationLanguage,
         captureSystemAudio,
+        meetingType,
+        topic,
+        leadBy,
+        tags,
         status: 'draft'
       });
 
@@ -812,12 +857,25 @@ const App = {
         .split(',').map(p => p.trim()).filter(Boolean);
       const language = document.getElementById('meeting-language').value;
       const translationLanguage = document.getElementById('meeting-translation-language').value;
+      const meetingType = Storage.normalizeMeetingType(document.getElementById('meeting-type')?.value);
+      const topic = Storage.normalizeShortText(document.getElementById('meeting-topic')?.value);
+      const leadBy = Storage.normalizeShortText(document.getElementById('meeting-lead-by')?.value);
+      const tags = this._initialTagsForMeetingType(meetingType);
 
-      Storage.saveMeeting({ title, participants, language, translationLanguage, status: 'draft' });
+      Storage.saveMeeting({ title, participants, language, translationLanguage, meetingType, topic, leadBy, tags, status: 'draft' });
       this.toast('Meeting draft saved', 'success');
       this.navigate('meetings');
       this._updateMeetingsCount();
     });
+  },
+
+  // BR-70 applied at meeting-creation time ("lần đầu" meetingType is chosen):
+  // New Meeting has no tag editor of its own, so this seeds `tags` with the
+  // meetingType's label the same way Meeting Detail's live listener does.
+  _initialTagsForMeetingType(meetingType) {
+    if (!meetingType) return [];
+    const entry = typeof meetingTypeByCode === 'function' ? meetingTypeByCode(meetingType) : null;
+    return entry ? [entry.label] : [];
   },
 
   /* ══════════════════════════════════════════
@@ -1075,17 +1133,23 @@ const App = {
       }
     };
 
+    // Mirrors Transcriber._resolveBackend(): only Deepgram has its own live
+    // backend, every other provider records live through Soniox.
+    const _liveProviderName = this._sttProviderName(
+      Storage.getSettings?.().sttProvider === 'deepgram' ? 'deepgram' : 'soniox'
+    );
+
     Transcriber.onStatusChange = (status) => {
       if (status === 'connecting') {
-        statusEl.innerHTML = '<span class="badge badge-warning">Connecting to Soniox…</span>';
+        statusEl.innerHTML = `<span class="badge badge-warning">Connecting to ${_liveProviderName}…</span>`;
       } else if (status === 'listening') {
-        statusEl.innerHTML = `<span class="badge badge-recording">● Recording · ${_activeAudioMode} · Soniox live</span>`;
+        statusEl.innerHTML = `<span class="badge badge-recording">● Recording · ${_activeAudioMode} · ${_liveProviderName} live</span>`;
       } else if (status === 'error') {
         statusEl.innerHTML = `<span class="badge badge-warning">Recording audio (${_activeAudioMode}) · transcription unavailable</span>`;
       }
     };
     Transcriber.onError = error => {
-      this.toast(error.message || 'Soniox transcription failed', 'error');
+      this.toast(error.message || `${_liveProviderName} transcription failed`, 'error');
     };
 
     // Toggle recording
@@ -1106,7 +1170,7 @@ const App = {
         Recorder.onSystemAudioLost = () => {
           _activeAudioMode = 'Mic';
           this.toast('System audio share was stopped. Continuing with microphone only.', 'warning');
-          statusEl.innerHTML = '<span class="badge badge-recording">● Recording · Mic only · Soniox live</span>';
+          statusEl.innerHTML = `<span class="badge badge-recording">● Recording · Mic only · ${_liveProviderName} live</span>`;
         };
 
         // Start recorder with optional system audio
@@ -1145,13 +1209,18 @@ const App = {
         if (transcriptionStarted) {
           const usageMeeting = Storage.getMeeting(meetingId);
           if (usageMeeting) {
+            // Mirror Transcriber._resolveBackend(): only Deepgram has its own
+            // live backend, every other provider records live through Soniox.
+            const liveProvider = Storage.getSettings?.().sttProvider === 'deepgram' ? 'deepgram' : 'soniox';
+            const isSoniox = liveProvider === 'soniox';
             usageMeeting.sonioxUsage = {
-              provider: 'soniox',
-              model: 'stt-rt-v5',
+              provider: liveProvider,
+              model: isSoniox ? 'stt-rt-v5' : (Storage.getSettings?.().sttModels?.deepgram || 'nova-3'),
               startedAt: new Date().toISOString(),
-              pricingUsdPerHour: this.SONIOX_REALTIME_USD_PER_HOUR,
-              translationEnabled: Boolean(meeting.translationLanguage),
-              estimatedCostUsd: 0
+              // Deepgram's live pricing isn't wired up here yet, so leave cost
+              // fields out rather than showing a fabricated number.
+              ...(isSoniox ? { pricingUsdPerHour: this.SONIOX_REALTIME_USD_PER_HOUR, estimatedCostUsd: 0 } : {}),
+              translationEnabled: Boolean(meeting.translationLanguage)
             };
             Storage.saveMeeting(usageMeeting);
           }
@@ -1168,7 +1237,7 @@ const App = {
         timerEl.classList.add('recording');
 
         statusEl.innerHTML = transcriptionStarted
-          ? `<span class="badge badge-recording">● Recording · ${_activeAudioMode} · Soniox live</span>`
+          ? `<span class="badge badge-recording">● Recording · ${_activeAudioMode} · ${_liveProviderName} live</span>`
           : `<span class="badge badge-warning">Recording audio (${_activeAudioMode}) · transcription unavailable</span>`;
       }
     };
@@ -1264,7 +1333,19 @@ const App = {
       `<span class="chip">${Utils.escapeHtml(p)}</span>`
     ).join('');
 
-    const transcriptHtml = (meeting.transcript || []).map((seg, i) => `
+    // A segment with `.kind` (part-divider/part-gap, TV12/§V4.3) is never
+    // contenteditable and renders in its own style so it can't be mistaken
+    // for real meeting content (UX §7 `.transcript-gap`). A plain segment
+    // (every segment of a single-part meeting) renders EXACTLY as before —
+    // test hồi quy for the "1 part = unchanged" acceptance criterion.
+    const transcriptHtml = (meeting.transcript || []).map((seg, i) => {
+      if (seg.kind === 'part-divider') {
+        return `<div class="transcript-part-divider" data-index="${i}">${Utils.escapeHtml(seg.text)}</div>`;
+      }
+      if (seg.kind === 'part-gap') {
+        return `<div class="transcript-gap" data-index="${i}">${Utils.escapeHtml(seg.text)}</div>`;
+      }
+      return `
       <div class="transcript-block" data-index="${i}">
         <span class="transcript-time">${Utils.formatTimestamp(seg.time)}</span>
         <div class="flex-1">
@@ -1272,7 +1353,8 @@ const App = {
           <div class="transcript-text" contenteditable="true" data-seg-index="${i}">${Utils.escapeHtml(seg.text)}</div>
         </div>
       </div>
-    `).join('') || '<div class="empty-state" style="padding:var(--space-8);"><p class="text-sm">No transcript recorded.</p></div>';
+    `;
+    }).join('') || '<div class="empty-state" style="padding:var(--space-8);"><p class="text-sm">No transcript recorded.</p></div>';
     const translationHtml = (meeting.translations || []).map(seg => `
       <div class="transcript-block">
         <span class="transcript-time">${Utils.formatTimestamp(seg.time)}</span>
@@ -1295,8 +1377,12 @@ const App = {
       </label>
     `).join('') || '';
 
-    // Audio player
-    const audioPlayerHtml = (meeting.audioId || meeting.audioBlob) ? `
+    // TV12/V11#22: a merged recording has no single combined audio file
+    // (Out of Scope, BR-134) — capabilities.singleAudioPlayback is false, so
+    // this renders a playlist of the individual part files instead of the
+    // single-file player.
+    const caps = Parts.meetingCapabilities(meeting);
+    const audioPlayerHtml = caps.singleAudioPlayback && (meeting.audioId || meeting.audioBlob) ? `
       <div class="audio-player" style="margin-bottom: var(--space-6);">
         <button class="play-btn" id="detail-play">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
@@ -1306,7 +1392,10 @@ const App = {
         </div>
         <span class="audio-time" id="detail-audio-time">0:00</span>
       </div>
-    ` : '';
+    ` : (caps.multiPart ? this._renderPartsPlaybackCard(meeting) : '');
+
+    const multiPartSectionHtml = caps.multiPart ? this._renderMultiPartSection(meeting) : '';
+    const qualityWarningHtml = this._renderQualityWarning(meeting, caps);
 
     return `
       <div class="view-enter">
@@ -1319,10 +1408,12 @@ const App = {
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
               </button>
               ${statusBadge}
+              ${meeting.source === 'import' ? '<span class="badge badge-primary" title="Bản ghi nhập từ file ghi âm ngoài">Nhập từ file</span>' : ''}
+              ${caps.multiPart && (meeting.missingParts || []).length > 0 ? `<span class="badge badge-warning">Thiếu ${(meeting.missingParts || []).length} phần</span>` : ''}
             </div>
             <div class="meeting-detail-meta">
-              <span>📅 ${Utils.formatDate(meeting.date)}</span>
-              <span>⏱️ ${Utils.formatDurationHuman(meeting.duration)}</span>
+              <span>📅 ${Utils.formatDate(meeting.date)}${this._dateVsCreatedAtHint(meeting) ? ` · <span class="text-tertiary" style="font-size:0.85em;">${Utils.escapeHtml(this._dateVsCreatedAtHint(meeting))}</span>` : ''}</span>
+              <span>⏱️ ${Utils.formatDurationHuman(meeting.duration)}${meeting.durationEstimated ? ' (ước lượng)' : ''}</span>
               ${meeting.sonioxUsage?.startedAt ? (() => {
                 const usage = meeting.sonioxUsage;
                 const providerName = this._sttProviderName(usage.provider || 'soniox');
@@ -1354,7 +1445,67 @@ const App = {
           </div>
         ` : ''}
 
+        ${multiPartSectionHtml}
+        ${qualityWarningHtml}
         ${audioPlayerHtml}
+
+        ${(!meeting.audioId && (meeting.transcript || []).length === 0 && !caps.multiPart) ? `
+          <div class="card" style="margin-bottom: var(--space-6);">
+            <div class="flex justify-between items-center">
+              <div>
+                <strong>Chưa có file ghi âm</strong>
+                <p class="text-sm text-tertiary" style="margin-top:2px;">Bản ghi này chưa có audio — gắn file ghi âm vào đây khi bạn đi họp về, ngữ cảnh đã điền vẫn được giữ nguyên.</p>
+              </div>
+              <button class="btn btn-secondary btn-sm" id="attach-recording">Gắn file ghi âm</button>
+            </div>
+          </div>
+        ` : ''}
+
+        <!-- Pre-meeting info (BR-23, BR-24, T3; date+participants: BR-144, T13) -->
+        <div class="card" style="margin-bottom: var(--space-6);">
+          <div class="flex justify-between items-center" style="margin-bottom: var(--space-4);">
+            <h4 style="margin:0;">Pre-meeting info</h4>
+            <button class="btn btn-primary btn-sm" id="save-premeeting">Save</button>
+          </div>
+          ${this._preMeetingStaleHint(meeting)}
+          <div class="flex flex-col gap-3">
+            <div class="input-group">
+              <label for="detail-date">Ngày giờ họp</label>
+              ${this._dateEditorHtml(meeting)}
+              ${this._dateVsCreatedAtHint(meeting) ? `<span class="text-xs text-tertiary">${Utils.escapeHtml(this._dateVsCreatedAtHint(meeting))}</span>` : ''}
+            </div>
+            <div class="input-group">
+              <label>Người tham dự</label>
+              <div class="tag-chip-row" id="detail-participants-list">${this._renderParticipantChips(meeting.participants || [])}</div>
+              <div style="position:relative;">
+                <input type="text" class="input" id="detail-participant-input" placeholder="Nhập tên rồi bấm Enter" autocomplete="off">
+              </div>
+            </div>
+            <div class="input-group">
+              <label for="detail-meeting-type">Meeting type</label>
+              <select class="input" id="detail-meeting-type">
+                ${this._meetingTypeOptions(meeting.meetingType || '')}
+              </select>
+            </div>
+            <div class="input-group">
+              <label for="detail-topic">Topic</label>
+              <input type="text" class="input" id="detail-topic" maxlength="200" value="${Utils.escapeHtml(meeting.topic || '')}">
+            </div>
+            <div class="input-group">
+              <label for="detail-lead-by">Led by</label>
+              <input type="text" class="input" id="detail-lead-by" maxlength="200" value="${Utils.escapeHtml(meeting.leadBy || '')}">
+            </div>
+            <div class="input-group">
+              <label for="detail-tag-input">Tags</label>
+              <div class="tag-chip-row" id="detail-tags-list">${this._renderTagChips(meeting.tags || [], { removable: true })}</div>
+              <div style="position:relative;">
+                <input type="text" class="input" id="detail-tag-input" maxlength="30" placeholder="Nhập tag rồi bấm Enter" autocomplete="off">
+                <div class="tag-suggestions" id="detail-tag-suggestions" style="display:none;"></div>
+              </div>
+            </div>
+          </div>
+          <p class="text-xs text-tertiary" id="lead-by-suggestion" style="margin-top: var(--space-2);"></p>
+        </div>
 
         <!-- Tabs -->
         <div class="tabs" style="margin-bottom: var(--space-6);">
@@ -1398,7 +1549,11 @@ const App = {
           <div class="tab-content" id="tab-summary">
             <div class="flex justify-between items-center" style="margin-bottom: var(--space-2); gap: var(--space-2); flex-wrap: wrap;">
               <span class="text-sm text-secondary">AI-generated summary</span>
-              <div class="flex gap-2" style="align-items:center;">
+              <div class="flex gap-2" style="align-items:center; flex-wrap: wrap;">
+                <select class="input input-sm" id="summary-preset" style="width: auto;" title="Summary preset">
+                  <option value="">Loading presets…</option>
+                </select>
+                <span class="text-xs text-tertiary" id="summary-preset-suggestion"></span>
                 <select class="input input-sm" id="summary-language" style="width: auto;" title="Summary language">
                   ${this._summaryLanguageOptions()}
                 </select>
@@ -1409,15 +1564,16 @@ const App = {
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
                   Copy
                 </button>
-                <button class="btn btn-primary btn-sm" id="generate-summary">
+                <button class="btn btn-primary btn-sm" id="generate-summary" ${this._anyPartRunning(meeting) ? 'disabled title="Chờ đủ các phần rồi hãy tạo tóm tắt — tóm tắt trên transcript còn thiếu sẽ bỏ sót nội dung."' : ''}>
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
                   ${meeting.summary ? 'Regenerate' : 'Generate Summary'}
                 </button>
               </div>
             </div>
-            <p class="text-xs text-tertiary" id="summary-provenance" style="margin-bottom: var(--space-4);">${this._summaryProvenance(meeting)}</p>
-            <div class="card" id="summary-content" style="white-space: pre-wrap; line-height: var(--leading-relaxed);">
-              ${meeting.summary ? Utils.escapeHtml(meeting.summary) : '<span class="text-tertiary">No summary yet. Click "Generate Summary" to create one.</span>'}
+            <p class="text-xs text-tertiary" id="summary-provenance" style="margin-bottom: var(--space-1);">${this._summaryProvenance(meeting)}</p>
+            <p class="text-xs" id="summary-preset-badge" style="margin-bottom: var(--space-4);"></p>
+            <div class="card" id="summary-content" style="line-height: var(--leading-relaxed);">
+              ${this._renderSummaryContent(meeting)}
             </div>
           </div>
 
@@ -1452,6 +1608,233 @@ const App = {
     `;
   },
 
+  // TV18 (BR-121/Q9) — the per-part playback list doubles as the UI for
+  // "sắp xếp lại sau khi đã transcribe" (▲▼, gated on no part still
+  // queued/processing so a job in flight never gets its part moved under
+  // it) and is where "+ Thêm phần" (Q9) lives, since both act on this same
+  // list of parts.
+  _renderPartsPlaybackCard(meeting) {
+    const parts = [...(meeting.parts || [])].sort((a, b) => a.order - b.order);
+    const canReorder = meeting.status !== 'processing' && parts.length > 1;
+    const rows = parts.map((part, i) => `
+      <div class="flex items-center gap-3">
+        <span class="text-xs text-tertiary" style="min-width:60px;">Phần ${part.order}</span>
+        ${part.status === 'completed' || part.status === 'failed' || part.status === 'dropped'
+          ? `<audio controls preload="none" style="flex:1; height:32px;" src="/api/audio/${encodeURIComponent(part.partId)}"></audio>`
+          : `<span class="text-xs text-tertiary" style="flex:1;">Chưa có audio để phát lại</span>`}
+        ${canReorder ? `
+          <button type="button" class="btn btn-ghost btn-icon btn-sm" data-action="part-move-up" data-part="${part.partId}" ${i === 0 ? 'disabled' : ''} title="Chuyển lên">▲</button>
+          <button type="button" class="btn btn-ghost btn-icon btn-sm" data-action="part-move-down" data-part="${part.partId}" ${i === parts.length - 1 ? 'disabled' : ''} title="Chuyển xuống">▼</button>
+        ` : ''}
+      </div>
+    `).join('');
+    return `
+      <div class="card" style="margin-bottom: var(--space-6);">
+        <div class="flex justify-between items-center" style="margin-bottom:var(--space-3);">
+          <p class="text-sm text-secondary" style="margin:0;">Nghe lại từng phần</p>
+          ${meeting.status !== 'processing' ? '<button class="btn btn-secondary btn-sm" id="add-part">+ Thêm phần</button>' : ''}
+        </div>
+        <div class="flex flex-col gap-2">${rows}</div>
+      </div>
+    `;
+  },
+
+  // TV12 — progress card (still running) or error card (has a failed/dropped
+  // part), per Architecture §V13/BR-101/106/128/129/132..136. Never a fake
+  // percentage bar (BR-101) — only a "N/M phần xong" count + elapsed time.
+  _renderMultiPartSection(meeting) {
+    const parts = meeting.parts || [];
+    const total = parts.length;
+    const done = parts.filter(p => p.status === 'completed' || p.status === 'failed' || p.status === 'dropped').length;
+    const startedAt = parts.reduce((min, p) => (p.addedAt && (!min || p.addedAt < min)) ? p.addedAt : min, null);
+    const elapsedMin = startedAt ? Math.max(0, Math.round((Date.now() - new Date(startedAt).getTime()) / 60000)) : 0;
+
+    const progressCard = meeting.status === 'processing' ? `
+      <div class="card" style="margin-bottom: var(--space-6);">
+        <div class="flex items-center gap-3">
+          <span class="spinner"></span>
+          <div>
+            <strong>Đang tạo transcript cho bản ghi của bạn</strong>
+            <p class="text-sm text-tertiary" style="margin-top:2px;">${done}/${total} phần xong · đã ${elapsedMin} phút</p>
+          </div>
+        </div>
+      </div>
+    ` : '';
+
+    const failedOrDropped = parts.filter(p => p.status === 'failed');
+    const errorCards = failedOrDropped.map(part => `
+      <div class="card" style="margin-bottom: var(--space-4); border-color: var(--color-warning); background: var(--color-warning-muted);" data-part-error="${part.partId}">
+        <strong style="color: var(--color-warning);">Phần ${part.order} chưa tạo được transcript</strong>
+        ${part.error?.message ? `<p class="text-xs text-tertiary" style="margin-top:var(--space-2);">Nhà cung cấp báo: ${Utils.escapeHtml(part.error.message)}</p>` : ''}
+        <div class="flex gap-2" style="margin-top:var(--space-3);">
+          <button class="btn btn-secondary btn-sm" data-action="retry-part" data-part="${part.partId}">Thử lại</button>
+          <button class="btn btn-secondary btn-sm" data-action="retry-part-other-provider" data-part="${part.partId}">Thử nhà cung cấp khác</button>
+          <button class="btn btn-ghost btn-sm" data-action="drop-part" data-part="${part.partId}">Bỏ phần ${part.order} khỏi bản ghi này</button>
+        </div>
+      </div>
+    `).join('');
+
+    return progressCard + errorCards;
+  },
+
+  // BR-106/126/128 — a measured (not guessed) quality warning, skipped when
+  // the recording's own duration is an estimate (durationEstimated) so the
+  // denominator can't be trusted (capabilities.qualityWarningEligible).
+  _renderQualityWarning(meeting, caps) {
+    if (!caps.qualityWarningEligible) return '';
+    const result = Parts.qualityWarning(meeting);
+    if (!result.warn) return '';
+    return `
+      <div class="card" style="margin-bottom: var(--space-6); border-color: var(--color-warning); background: var(--color-warning-muted);">
+        <p class="text-sm" style="margin:0;">⚠ Transcript ngắn hơn nhiều so với độ dài bản ghi. Thường là do micro đặt quá xa người nói.</p>
+      </div>
+    `;
+  },
+
+  _bindMultiPartActions(meetingId) {
+    document.querySelectorAll('[data-action="retry-part"]').forEach(btn => btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      try {
+        const response = await fetch(`/api/meetings/${encodeURIComponent(meetingId)}/parts/${encodeURIComponent(btn.dataset.part)}/retry`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}'
+        });
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(body.error?.message || 'Không thử lại được phần này.');
+        await this._reloadMeetingsFromServer();
+        this._backgroundAudioTasks.set(meetingId, { filename: Storage.getMeeting(meetingId)?.title || meetingId, phase: 'transcribing' });
+        this._renderBackgroundTaskIndicator();
+        this._pollPartsStatus(meetingId);
+        this.navigate(`meeting/${meetingId}`, { force: true });
+      } catch (error) {
+        this.toast(error.message, 'error');
+        btn.disabled = false;
+      }
+    }));
+
+    document.querySelectorAll('[data-action="drop-part"]').forEach(btn => btn.addEventListener('click', () => {
+      const meeting = Storage.getMeeting(meetingId);
+      const part = (meeting?.parts || []).find(p => p.partId === btn.dataset.part);
+      if (!part) return;
+      this.showModal(`
+        <div class="modal-header"><h3>Bỏ phần ${part.order}?</h3><button class="btn btn-ghost btn-icon" onclick="App.closeModal()">✕</button></div>
+        <p class="text-sm text-secondary">Bản ghi sẽ thiếu nội dung của phần ${part.order}. File ghi âm vẫn được giữ trên máy. Bản ghi sẽ được đánh dấu là thiếu nội dung.</p>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" onclick="App.closeModal()">Hủy</button>
+          <button class="btn btn-danger" id="confirm-drop-part">Vẫn bỏ phần này</button>
+        </div>
+      `);
+      document.getElementById('confirm-drop-part')?.addEventListener('click', async () => {
+        try {
+          const response = await fetch(`/api/meetings/${encodeURIComponent(meetingId)}/parts/${encodeURIComponent(part.partId)}`, { method: 'DELETE' });
+          if (!response.ok) throw new Error('Không bỏ được phần này.');
+          await this._reloadMeetingsFromServer();
+          this.closeModal();
+          this.navigate(`meeting/${meetingId}`, { force: true });
+        } catch (error) {
+          this.toast(error.message, 'error');
+        }
+      });
+    }));
+
+    document.querySelectorAll('[data-action="retry-part-other-provider"]').forEach(btn => btn.addEventListener('click', async () => {
+      let providers = [];
+      try {
+        const response = await fetch('/api/stt/providers', { cache: 'no-store' });
+        const data = await response.json();
+        providers = data.providers || [];
+      } catch { /* modal still opens, just with no options */ }
+      this.showModal(`
+        <div class="modal-header"><h3>Thử nhà cung cấp khác</h3><button class="btn btn-ghost btn-icon" onclick="App.closeModal()">✕</button></div>
+        <p class="text-sm text-secondary">Nhãn người nói và văn phong của phần này có thể lệch so với các phần còn lại nếu đổi nhà cung cấp.</p>
+        <div class="input-group">
+          <label>Nhà cung cấp</label>
+          <select class="input" id="retry-other-provider">${providers.map(p => `<option value="${Utils.escapeHtml(p.id)}">${Utils.escapeHtml(p.name)}</option>`).join('')}</select>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" onclick="App.closeModal()">Hủy</button>
+          <button class="btn btn-primary" id="confirm-retry-other">Thử lại với nhà cung cấp này</button>
+        </div>
+      `);
+      document.getElementById('confirm-retry-other')?.addEventListener('click', async () => {
+        const provider = document.getElementById('retry-other-provider')?.value;
+        try {
+          const response = await fetch(`/api/meetings/${encodeURIComponent(meetingId)}/parts/${encodeURIComponent(btn.dataset.part)}/retry`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ provider })
+          });
+          const body = await response.json().catch(() => ({}));
+          if (!response.ok) throw new Error(body.error?.message || 'Không thử lại được phần này.');
+          await this._reloadMeetingsFromServer();
+          this.closeModal();
+          this._backgroundAudioTasks.set(meetingId, { filename: Storage.getMeeting(meetingId)?.title || meetingId, phase: 'transcribing' });
+          this._renderBackgroundTaskIndicator();
+          this._pollPartsStatus(meetingId);
+          this.navigate(`meeting/${meetingId}`, { force: true });
+        } catch (error) {
+          this.toast(error.message, 'error');
+        }
+      });
+    }));
+
+    // TV18 (BR-121) — ▲▼ reorder, never touches provider/summary.
+    document.querySelectorAll('[data-action="part-move-up"]').forEach(btn => btn.addEventListener('click', () => this._movePart(meetingId, btn.dataset.part, -1)));
+    document.querySelectorAll('[data-action="part-move-down"]').forEach(btn => btn.addEventListener('click', () => this._movePart(meetingId, btn.dataset.part, 1)));
+
+    // TV18 (Q9) — add a part to an already-completed merged meeting.
+    document.getElementById('add-part')?.addEventListener('click', () => Import.open({ attachMeetingId: meetingId, mode: 'appendPart' }));
+  },
+
+  // TV18 (BR-121) — computes the full permutation client-side (js/parts.js,
+  // must include every part id regardless of status — the server rejects
+  // anything short of a full permutation) and posts it; never calls a
+  // provider, never touches summary/summaryPreset (server-side, tested in
+  // test/parts-routes.test.js).
+  async _movePart(meetingId, partId, delta) {
+    const meeting = Storage.getMeeting(meetingId);
+    if (!meeting) return;
+    const order = Parts.computeReorderedPartIds(meeting.parts || [], partId, delta);
+    if (!order) return; // already at that edge — no-op, matches the disabled button
+    try {
+      const response = await fetch(`/api/meetings/${encodeURIComponent(meetingId)}/parts/reorder`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ order })
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.error?.message || 'Không sắp xếp lại được thứ tự các phần.');
+      await this._reloadMeetingsFromServer();
+      this.navigate(`meeting/${meetingId}`, { force: true });
+    } catch (error) {
+      this.toast(error.message, 'error');
+    }
+  },
+
+  // E-V1/PRG-13: a part still queued/processing must disable Generate
+  // Summary outright (same as "no transcript yet" today); a FAILED/DROPPED
+  // part does NOT disable it — that case goes through the BR-135 confirm
+  // dialog instead (capabilities.summaryNeedsMissingPartConfirm).
+  _anyPartRunning(meeting) {
+    return (meeting.parts || []).some(p => p.status === 'queued' || p.status === 'processing');
+  },
+
+  // BR-135 (E-V1, Q10): summarizing a recording with a missing part is
+  // allowed, but must be confirmed and must name which part(s) are missing.
+  // New copy — Architecture.md §V15 E-V1 flags this exact confirmation as
+  // not yet in UX §6's microcopy table; see Dev report to PM/UX.
+  _confirmMissingPartsSummary(missingParts) {
+    return new Promise(resolve => {
+      const list = missingParts.join(', ');
+      this.showModal(`
+        <div class="modal-header"><h3>Tóm tắt khi bản ghi còn thiếu phần?</h3><button class="btn btn-ghost btn-icon" onclick="App.closeModal()">✕</button></div>
+        <p class="text-sm text-secondary">Bản ghi này đang thiếu phần ${Utils.escapeHtml(list)} (chưa có transcript). Bản tóm tắt sẽ không có nội dung của phần đó.</p>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" id="missing-parts-cancel">Hủy</button>
+          <button class="btn btn-primary" id="missing-parts-confirm">Vẫn tóm tắt</button>
+        </div>
+      `);
+      const finish = value => { this.closeModal(); resolve(value); };
+      document.getElementById('missing-parts-cancel').addEventListener('click', () => finish(false));
+      document.getElementById('missing-parts-confirm').addEventListener('click', () => finish(true));
+    });
+  },
+
   _LLM_PROVIDER_NAMES: { codex: 'Codex', deepseek: 'DeepSeek', gemini: 'Google Gemini' },
 
   _llmProviderName(id) {
@@ -1475,6 +1858,643 @@ const App = {
       options.push(`<option value="${id}">${Utils.escapeHtml(this._LLM_PROVIDER_NAMES[id])}</option>`);
     }
     return options.join('');
+  },
+
+  // Generic per-section summary renderer (C2, BR-20). Works for both a
+  // freshly generated preset summary and legacy summaries with no stored
+  // snapshot — the latter renders as the current General Meeting shape.
+  _renderSummaryContent(meeting) {
+    const snapshot = Summary.virtualSnapshotForLegacy(meeting);
+    if (!snapshot) return '<span class="text-tertiary">No summary yet. Click "Generate Summary" to create one.</span>';
+    const details = meeting.summaryDetails || {};
+    return snapshot.sections.map(section => this._renderSummarySection(section, details[section.key])).join('');
+  },
+
+  // Every label/hint is user-entered and every value may come from the LLM —
+  // both must go through Utils.escapeHtml (T12 acceptance criteria).
+  _renderSummarySection(section, value) {
+    const label = Utils.escapeHtml(section.label);
+    const empty = `<div class="summary-section" style="margin-bottom:var(--space-4);"><h4 style="margin-bottom:var(--space-1);">${label}</h4><p class="text-tertiary text-sm">Không có nội dung</p></div>`;
+
+    if (section.type === 'paragraph') {
+      const text = String(value || '').trim();
+      if (!text) return empty;
+      return `<div class="summary-section" style="margin-bottom:var(--space-4);"><h4 style="margin-bottom:var(--space-1);">${label}</h4><p style="white-space:pre-wrap;">${Utils.escapeHtml(text)}</p></div>`;
+    }
+
+    if (section.type === 'bulletList') {
+      const items = Array.isArray(value) ? value.map(String).filter(Boolean) : [];
+      if (!items.length) return empty;
+      const list = items.map(item => `<li>${Utils.escapeHtml(item)}</li>`).join('');
+      return `<div class="summary-section" style="margin-bottom:var(--space-4);"><h4 style="margin-bottom:var(--space-1);">${label}</h4><ul style="margin:0; padding-left:var(--space-5);">${list}</ul></div>`;
+    }
+
+    if (section.type === 'actionList') {
+      const items = Array.isArray(value) ? value.filter(item => item && item.text) : [];
+      if (!items.length) return empty;
+      const list = items.map(item => {
+        const meta = [item.assignee, item.dueDate].filter(Boolean).map(v => Utils.escapeHtml(v)).join(' · ');
+        return `<li>${Utils.escapeHtml(item.text)}${meta ? ` <span class="text-tertiary">(${meta})</span>` : ''}</li>`;
+      }).join('');
+      return `<div class="summary-section" style="margin-bottom:var(--space-4);"><h4 style="margin-bottom:var(--space-1);">${label}</h4><ul style="margin:0; padding-left:var(--space-5);">${list}</ul></div>`;
+    }
+
+    return '';
+  },
+
+  // In-memory only, scoped to the current session (BR-56.1) — "the user
+  // already changed the preset for this meeting in the current session".
+  _manualPresetByMeeting: {},
+
+  // BR-55..BR-58 — thứ tự chọn preset mặc định (Architecture §8).
+  // Returns { presetId, suggested } — `suggested` drives the "Gợi ý cho …"
+  // label (BR-55), only true for branches 2a/2b.
+  async _chooseDefaultPresetId(presets, meeting) {
+    const exists = id => presets.some(p => p.id === id);
+
+    // 1. Manual override for this meeting in the current session.
+    const manual = this._manualPresetByMeeting[meeting.id];
+    if (manual && exists(manual)) return { presetId: manual, suggested: false };
+
+    if (meeting.meetingType) {
+      const typeEntry = typeof meetingTypeByCode === 'function' ? meetingTypeByCode(meeting.meetingType) : null;
+      const settings = Storage.getSettings();
+      const remembered = settings.presetByMeetingType?.[meeting.meetingType];
+
+      // 2a. Preset last used for this meetingType on this machine (BR-57.1).
+      if (remembered) {
+        if (exists(remembered)) return { presetId: remembered, suggested: true };
+        // BR-58: stale entry — prune it and fall through to name matching.
+        const pruned = { ...settings.presetByMeetingType };
+        delete pruned[meeting.meetingType];
+        Storage.saveSettings({ presetByMeetingType: pruned });
+      }
+
+      // 2b. Preset whose name matches the meetingType's default name (BR-57.2).
+      if (typeEntry) {
+        const match = presets.find(p => p.name.trim().toLowerCase() === typeEntry.presetName.trim().toLowerCase());
+        if (match) return { presetId: match.id, suggested: true };
+      }
+    }
+
+    // 3. lastSummaryPresetId (BR-10 of summary-presets, unchanged for meetings without meetingType).
+    const lastId = Storage.getSettings().lastSummaryPresetId || '';
+    if (lastId && exists(lastId)) return { presetId: lastId, suggested: false };
+
+    // 4. "General Meeting" if present.
+    const general = presets.find(p => p.name === 'General Meeting');
+    if (general) return { presetId: general.id, suggested: false };
+
+    // 5. First preset in the list.
+    if (presets[0]) return { presetId: presets[0].id, suggested: false };
+
+    // 6. No preset at all — legacy path, Generate still works.
+    return { presetId: '', suggested: false };
+  },
+
+  // Populate the preset dropdown and the "Preset đã bị xóa" badge (T13,
+  // BR-10, BR-18). Runs async because presets are fetched over HTTP.
+  async _populateSummaryPresetSelect(meetingId) {
+    const select = document.getElementById('summary-preset');
+    if (!select) return;
+    let presets = [];
+    try {
+      presets = await Presets.list();
+    } catch (error) {
+      select.innerHTML = '<option value="">Default (General Meeting)</option>';
+      return;
+    }
+
+    const meeting = Storage.getMeeting(meetingId);
+    if (!meeting) return;
+
+    const { presetId: defaultId, suggested } = await this._chooseDefaultPresetId(presets, meeting);
+    select.innerHTML = presets.map(p =>
+      `<option value="${Utils.escapeHtml(p.id)}">${Utils.escapeHtml(p.name)}${p.isBuiltIn ? ' (mẫu)' : ''}</option>`
+    ).join('');
+    if (defaultId) select.value = defaultId;
+
+    const suggestionEl = document.getElementById('summary-preset-suggestion');
+    if (suggestionEl) {
+      const typeEntry = suggested && meeting.meetingType && typeof meetingTypeByCode === 'function'
+        ? meetingTypeByCode(meeting.meetingType) : null;
+      suggestionEl.textContent = typeEntry ? `Gợi ý cho ${typeEntry.label}` : '';
+    }
+    select.addEventListener('change', () => {
+      this._manualPresetByMeeting[meetingId] = select.value;
+      if (suggestionEl) suggestionEl.textContent = '';
+    });
+
+    const badge = document.getElementById('summary-preset-badge');
+    if (!badge) return;
+    const usedPresetId = meeting.summaryPreset?.presetId;
+    if (usedPresetId && !presets.some(p => p.id === usedPresetId)) {
+      const presetName = meeting.summaryPreset?.name ? `: ${Utils.escapeHtml(meeting.summaryPreset.name)}` : '';
+      badge.innerHTML = `<span class="badge badge-warning">Preset đã bị xóa${presetName}</span> ` +
+        `<button class="btn btn-ghost btn-sm" id="restore-preset-from-snapshot" type="button">Khôi phục thành preset mới</button>`;
+      document.getElementById('restore-preset-from-snapshot')?.addEventListener('click', () => this._restorePresetFromSnapshot(meetingId));
+    } else {
+      badge.innerHTML = '';
+    }
+  },
+
+  // BR-15: a single confirmation before Generate replaces the current
+  // summary. Deviation note: the app has no summary-editing UI today, so
+  // there is no signal to detect "edited by hand" for the stronger warning
+  // BR-15 also calls for — see docs/CHANGELOG.md.
+  _confirmRegenerateSummary() {
+    return new Promise(resolve => {
+      this.showModal(`
+        <div class="modal-header">
+          <h3>Tạo lại bản tóm tắt?</h3>
+          <button class="btn btn-ghost btn-icon" id="regen-cancel-x">✕</button>
+        </div>
+        <p class="text-sm text-secondary">Bản tóm tắt hiện tại sẽ bị thay thế hoàn toàn và không thể khôi phục.</p>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" id="regen-cancel">Hủy</button>
+          <button class="btn btn-primary" id="regen-confirm">Tạo lại</button>
+        </div>
+      `);
+      const finish = value => { this.closeModal(); resolve(value); };
+      document.getElementById('regen-cancel-x')?.addEventListener('click', () => finish(false));
+      document.getElementById('regen-cancel')?.addEventListener('click', () => finish(false));
+      document.getElementById('regen-confirm')?.addEventListener('click', () => finish(true));
+    });
+  },
+
+  /* ══════════════════════════════════════════
+     Export .md (T13, BR-41..BR-54)
+     ══════════════════════════════════════════ */
+
+  _openExportModal(meetingId) {
+    const meeting = Storage.getMeeting(meetingId);
+    if (!meeting) return;
+    const hasSummary = Boolean(meeting.summary || meeting.summaryDetails);
+
+    this.showModal(`
+      <div class="modal-header">
+        <h3>Export .md</h3>
+        <button class="btn btn-ghost btn-icon" id="export-modal-close" type="button">✕</button>
+      </div>
+      ${!hasSummary ? '<p class="text-sm" style="color:var(--color-warning); margin-bottom: var(--space-3);">⚠️ Cuộc họp này chưa có bản tóm tắt — vẫn export được, chỉ gồm thông tin cuộc họp, notes và transcript (BR-53).</p>' : ''}
+      ${(meeting.missingParts || []).length > 0 ? `<p class="text-sm" style="color:var(--color-warning); margin-bottom: var(--space-3);">⚠️ Bản ghi này còn thiếu phần ${(meeting.missingParts || []).join(', ')}.</p>` : ''}
+      <label class="checkbox">
+        <input type="checkbox" id="export-include-transcript" checked>
+        <span class="checkbox-label">Kèm theo Transcript</span>
+      </label>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" id="export-modal-cancel" type="button">Hủy</button>
+        <button class="btn btn-primary" id="export-modal-confirm" type="button">Export</button>
+      </div>
+    `);
+
+    document.getElementById('export-modal-close')?.addEventListener('click', () => this.closeModal());
+    document.getElementById('export-modal-cancel')?.addEventListener('click', () => this.closeModal());
+    document.getElementById('export-modal-confirm')?.addEventListener('click', async event => {
+      const includeTranscript = document.getElementById('export-include-transcript')?.checked !== false;
+      // BR-54: a soft, non-blocking size warning shown before sending.
+      if (includeTranscript && (meeting.transcript || []).length > 20000) {
+        this.toast('Transcript khá lớn — export có thể mất một lúc.', 'warning');
+      }
+      const button = event.currentTarget;
+      button.disabled = true;
+      button.textContent = 'Đang export…';
+      await this._runExport(meetingId, includeTranscript);
+      this.closeModal();
+    });
+  },
+
+  async _runExport(meetingId, includeTranscript) {
+    const meeting = Storage.getMeeting(meetingId);
+    if (!meeting) return;
+
+    let settings;
+    try {
+      settings = await Exporter.getSettings();
+    } catch (error) {
+      this.toast(error.message || 'Không thể đọc cấu hình xuất file.', 'error');
+      return;
+    }
+    if (!settings.configured) {
+      this.toast('Chưa cấu hình thư mục xuất file — mở Cài đặt để chọn thư mục (BR-44).', 'warning');
+      this.navigate('settings');
+      return;
+    }
+
+    // BR-52: only relevant when the summary actually used a preset — a
+    // best-effort check against the live preset list, non-fatal on failure.
+    let presetDeleted = false;
+    const usedPresetId = meeting.summaryPreset?.presetId;
+    if (usedPresetId) {
+      try {
+        const presets = await Presets.list();
+        presetDeleted = !presets.some(p => p.id === usedPresetId);
+      } catch { /* best-effort — export still proceeds */ }
+    }
+
+    const content = Export.toMarkdown(meeting, { includeTranscript, presetDeleted });
+    try {
+      const result = await Exporter.exportMarkdown(meetingId, content, includeTranscript);
+      this._showExportResult(result);
+    } catch (error) {
+      if (error.code === 'EXPORT_DIR_NOT_CONFIGURED') {
+        this.toast('Chưa cấu hình thư mục xuất file — mở Cài đặt để chọn thư mục.', 'warning');
+        this.navigate('settings');
+        return;
+      }
+      this.toast(error.message || 'Export thất bại', 'error');
+    }
+  },
+
+  _EXPORT_WARNING_MESSAGES: {
+    EXPORT_NO_SUMMARY: 'Cuộc họp này chưa có bản tóm tắt.',
+    EXPORT_LARGE_TRANSCRIPT: 'Transcript khá lớn — quá trình ghi file có thể mất nhiều thời gian hơn bình thường.'
+  },
+
+  // BR-48: shows the full path + "Mở thư mục" (macOS, hidden reactively on a
+  // 501) + "Copy đường dẫn" (always present — WHY-10).
+  _showExportResult(result) {
+    const warningsHtml = (result.warnings || [])
+      .map(code => this._EXPORT_WARNING_MESSAGES[code] || code)
+      .map(message => `<p class="text-xs" style="color:var(--color-warning);">⚠️ ${Utils.escapeHtml(message)}</p>`)
+      .join('');
+
+    this.showModal(`
+      <div class="modal-header">
+        <h3>Đã export thành công</h3>
+        <button class="btn btn-ghost btn-icon" id="export-result-close" type="button">✕</button>
+      </div>
+      ${warningsHtml}
+      <p class="text-sm" style="word-break: break-all;">${Utils.escapeHtml(result.path)}</p>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" id="export-result-copy" type="button">Copy đường dẫn</button>
+        <button class="btn btn-primary" id="export-result-open-folder" type="button">Mở thư mục</button>
+      </div>
+    `);
+
+    document.getElementById('export-result-close')?.addEventListener('click', () => this.closeModal());
+    document.getElementById('export-result-copy')?.addEventListener('click', async () => {
+      const copied = await Exporter.copyPath(result.path);
+      this.toast(copied ? 'Đã copy đường dẫn' : 'Không thể copy đường dẫn', copied ? 'success' : 'error');
+    });
+    document.getElementById('export-result-open-folder')?.addEventListener('click', async event => {
+      try {
+        await Exporter.openFolder();
+      } catch (error) {
+        if (error.statusCode === 501) {
+          // §5.3: the server just told us this OS/branch is unsupported —
+          // shrink the UI reactively to the fallback that always works.
+          event.currentTarget.remove();
+          this.toast('Mở thư mục tự động chưa hỗ trợ trên hệ điều hành này. Dùng nút Copy đường dẫn.', 'info');
+        } else {
+          this.toast(error.message || 'Không thể mở thư mục', 'error');
+        }
+      }
+    });
+  },
+
+  // T15: turn a deleted preset's stored snapshot into a brand-new preset
+  // (BR-19 — never silently re-select the old, now-nonexistent, preset id).
+  async _restorePresetFromSnapshot(meetingId) {
+    const meeting = Storage.getMeeting(meetingId);
+    const snapshot = meeting?.summaryPreset;
+    if (!snapshot) return;
+    try {
+      const name = `${snapshot.name || 'Restored preset'} (khôi phục)`.slice(0, 60);
+      const payload = {
+        name,
+        description: '',
+        instruction: '',
+        sections: snapshot.sections.map(s => ({ label: s.label, type: s.type, hint: s.hint || '' }))
+      };
+      const { preset } = await Presets.create(payload);
+      this.toast(`Đã tạo preset mới "${preset.name}" từ bản tóm tắt cũ`, 'success');
+      await this._populateSummaryPresetSelect(meetingId);
+      const select = document.getElementById('summary-preset');
+      if (select) select.value = preset.id;
+    } catch (error) {
+      this.toast(error.message || 'Không thể khôi phục preset', 'error');
+    }
+  },
+
+  // In-memory only (not persisted) — mirrors the "current session" scope
+  // BR-28/§8 already use for manual preset overrides. A reload resets it,
+  // which is acceptable: the nudge is low-stakes and shows again at most
+  // once per fresh page load, never repeatedly within one.
+  _leadBySuggestionDismissed: new Set(),
+
+  // BR-70 last sentence: meetingId -> Set of lowercase tag labels the user
+  // explicitly removed after auto-add, so it is not re-added within "cùng
+  // một lần chỉnh sửa" (this session's view of the meeting). Not persisted.
+  _autoTagSuppressed: {},
+
+  /* ══════════════════════════════════════════
+     Tags (T14, BR-68..BR-71)
+     ══════════════════════════════════════════ */
+
+  _renderTagChips(tags, options = {}) {
+    const removable = Boolean(options.removable);
+    return (tags || []).map(tag => `
+      <span class="tag-chip" style="${tagStyle(tag)}" data-tag="${Utils.escapeHtml(tag)}">
+        ${Utils.escapeHtml(tag)}
+        ${removable ? `<button type="button" class="tag-chip-remove" data-tag="${Utils.escapeHtml(tag)}" aria-label="Xóa tag ${Utils.escapeHtml(tag)}">×</button>` : ''}
+      </span>
+    `).join('');
+  },
+
+  _isAutoTag(meeting, tag) {
+    const entry = meeting.meetingType && typeof meetingTypeByCode === 'function'
+      ? meetingTypeByCode(meeting.meetingType) : null;
+    return Boolean(entry) && entry.label.trim().toLowerCase() === String(tag).trim().toLowerCase();
+  },
+
+  // Idempotent: replaces the chip row's innerHTML and rebinds remove
+  // handlers on the fresh elements — safe to call repeatedly (unlike
+  // re-running _bindTagEditor, which would stack duplicate input listeners).
+  _renderTagChipsInto(meetingId) {
+    const list = document.getElementById('detail-tags-list');
+    if (!list) return;
+    const meeting = Storage.getMeeting(meetingId);
+    list.innerHTML = this._renderTagChips(meeting?.tags || [], { removable: true });
+    list.querySelectorAll('.tag-chip-remove').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const tag = btn.dataset.tag;
+        const current = Storage.getMeeting(meetingId);
+        if (!current) return;
+        if (this._isAutoTag(current, tag)) {
+          this._autoTagSuppressed[meetingId] = this._autoTagSuppressed[meetingId] || new Set();
+          this._autoTagSuppressed[meetingId].add(tag.trim().toLowerCase());
+        }
+        current.tags = (current.tags || []).filter(t => t.trim().toLowerCase() !== tag.trim().toLowerCase());
+        Storage.saveMeeting(current);
+        this._renderTagChipsInto(meetingId);
+      });
+    });
+  },
+
+  _bindTagEditor(meetingId) {
+    const input = document.getElementById('detail-tag-input');
+    const suggestionsBox = document.getElementById('detail-tag-suggestions');
+    if (!input) return;
+
+    const addTag = (rawTag) => {
+      const current = Storage.getMeeting(meetingId);
+      if (!current) return;
+      const result = canAddTag(current.tags || [], rawTag);
+      if (!result.ok) {
+        const messages = {
+          TAG_DUPLICATE: 'Tag này đã có rồi.',
+          TAG_LIMIT_REACHED: 'Mỗi cuộc họp tối đa 10 tag.'
+        };
+        if (messages[result.code]) this.toast(messages[result.code], 'warning');
+        return;
+      }
+      current.tags = [...(current.tags || []), normalizeTag(rawTag)];
+      Storage.saveMeeting(current);
+      this._renderTagChipsInto(meetingId);
+    };
+
+    input.addEventListener('input', () => {
+      if (!suggestionsBox) return;
+      const all = collectTags(Storage.getAllMeetings());
+      const matches = suggestTags(all, input.value);
+      if (!input.value.trim() || matches.length === 0) {
+        suggestionsBox.style.display = 'none';
+        return;
+      }
+      suggestionsBox.innerHTML = matches.map(tag =>
+        `<div class="tag-suggestion-item" data-tag="${Utils.escapeHtml(tag)}">${Utils.escapeHtml(tag)}</div>`
+      ).join('');
+      suggestionsBox.style.display = 'block';
+      suggestionsBox.querySelectorAll('.tag-suggestion-item').forEach(item => {
+        // mousedown (not click) fires before the input's blur hides the box.
+        item.addEventListener('mousedown', event => {
+          event.preventDefault();
+          addTag(item.dataset.tag);
+          input.value = '';
+          suggestionsBox.style.display = 'none';
+        });
+      });
+    });
+
+    input.addEventListener('keydown', event => {
+      if (event.key !== 'Enter') return;
+      event.preventDefault();
+      const value = input.value.trim();
+      if (value) addTag(value);
+      input.value = '';
+      if (suggestionsBox) suggestionsBox.style.display = 'none';
+    });
+
+    input.addEventListener('blur', () => {
+      setTimeout(() => { if (suggestionsBox) suggestionsBox.style.display = 'none'; }, 150);
+    });
+  },
+
+  // BR-70: called whenever the meetingType dropdown changes (New Meeting's
+  // initial creation is handled separately by _initialTagsForMeetingType,
+  // since that form has no tag editor of its own yet to update live).
+  _autoAddMeetingTypeTag(meetingId, code) {
+    if (!code) return;
+    const entry = typeof meetingTypeByCode === 'function' ? meetingTypeByCode(code) : null;
+    if (!entry) return;
+    const meeting = Storage.getMeeting(meetingId);
+    if (!meeting) return;
+    const label = entry.label;
+    const suppressed = this._autoTagSuppressed[meetingId];
+    if (suppressed && suppressed.has(label.toLowerCase())) return;
+    const already = (meeting.tags || []).some(t => t.trim().toLowerCase() === label.toLowerCase());
+    if (already || (meeting.tags || []).length >= 10) return;
+    meeting.tags = [...(meeting.tags || []), label];
+    Storage.saveMeeting(meeting);
+    this._renderTagChipsInto(meetingId);
+  },
+
+  // BR-144/145, DAT-01: "ngày nhập vào máy" line — only when `date` differs
+  // from `createdAt` by more than 1 day, in either direction (5.9.3).
+  _dateVsCreatedAtHint(meeting) {
+    if (!meeting.date || !meeting.createdAt) return '';
+    const deltaMs = Math.abs(new Date(meeting.date).getTime() - new Date(meeting.createdAt).getTime());
+    if (!Number.isFinite(deltaMs) || deltaMs <= 24 * 3600 * 1000) return '';
+    return `Nhập vào MeetNote ngày ${Parts.formatDDMM(meeting.createdAt)}.`;
+  },
+
+  // BR-144, U-V6: <input type="datetime-local"> when the browser supports
+  // it; a compact date+time pair otherwise (feature-detected at runtime,
+  // same spirit as js/import.js's audio-preview detection — never a
+  // hardcoded browser list).
+  _supportsDateTimeLocal() {
+    if (this.__dtLocalSupport !== undefined) return this.__dtLocalSupport;
+    const probe = document.createElement('input');
+    probe.setAttribute('type', 'datetime-local');
+    this.__dtLocalSupport = probe.type === 'datetime-local';
+    return this.__dtLocalSupport;
+  },
+
+  _isoToLocalInputValue(iso) {
+    const date = new Date(iso);
+    const pad = n => String(n).padStart(2, '0');
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  },
+
+  _dateEditorHtml(meeting) {
+    if (this._supportsDateTimeLocal()) {
+      return `<input type="datetime-local" class="input" id="detail-date" value="${this._isoToLocalInputValue(meeting.date)}">`;
+    }
+    const date = new Date(meeting.date);
+    const pad = n => String(n).padStart(2, '0');
+    const d = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+    const t = `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+    return `<div class="flex gap-2">
+      <input type="date" class="input" id="detail-date-day" value="${d}">
+      <input type="time" class="input" id="detail-date-time" value="${t}">
+    </div>`;
+  },
+
+  // Reads the date editor(s) back into an ISO string, or null if the user
+  // left it blank (caller must restore the previous value on blur, never
+  // fall through to "now" — BR-144's "xoá trắng -> khôi phục giá trị cũ").
+  _readDateEditor() {
+    if (this._supportsDateTimeLocal()) {
+      const el = document.getElementById('detail-date');
+      if (!el || !el.value) return null;
+      return new Date(el.value).toISOString();
+    }
+    const dayEl = document.getElementById('detail-date-day');
+    const timeEl = document.getElementById('detail-date-time');
+    if (!dayEl || !dayEl.value) return null;
+    return new Date(`${dayEl.value}T${timeEl?.value || '00:00'}`).toISOString();
+  },
+
+  /* ── Participants editor (T13, BR-144) — same chip pattern as Tags ── */
+
+  _renderParticipantChips(participants) {
+    return (participants || []).map(name => `
+      <span class="chip" data-participant="${Utils.escapeHtml(name)}">
+        ${Utils.escapeHtml(name)}
+        <span class="chip-remove" data-action="remove-participant" data-participant="${Utils.escapeHtml(name)}" role="button" aria-label="Bỏ ${Utils.escapeHtml(name)}">×</span>
+      </span>
+    `).join('');
+  },
+
+  _renderParticipantChipsInto(meetingId) {
+    const list = document.getElementById('detail-participants-list');
+    if (!list) return;
+    const meeting = Storage.getMeeting(meetingId);
+    list.innerHTML = this._renderParticipantChips(meeting?.participants || []);
+    list.querySelectorAll('[data-action="remove-participant"]').forEach(el => {
+      el.addEventListener('click', () => {
+        const current = Storage.getMeeting(meetingId);
+        if (!current) return;
+        current.participants = (current.participants || []).filter(p => p !== el.dataset.participant);
+        Storage.saveMeeting(current);
+        this._renderParticipantChipsInto(meetingId);
+      });
+    });
+  },
+
+  _bindParticipantEditor(meetingId) {
+    const input = document.getElementById('detail-participant-input');
+    if (!input) return;
+    input.addEventListener('keydown', event => {
+      if (event.key !== 'Enter') return;
+      event.preventDefault();
+      const name = input.value.trim();
+      input.value = '';
+      if (!name) return;
+      const current = Storage.getMeeting(meetingId);
+      if (!current) return;
+      if ((current.participants || []).some(p => p.toLowerCase() === name.toLowerCase())) return;
+      current.participants = [...(current.participants || []), name];
+      Storage.saveMeeting(current);
+      this._renderParticipantChipsInto(meetingId);
+    });
+  },
+
+  // BR-29: nudge when pre-meeting info may be newer than the last Generate.
+  // No dedicated "pre-meeting edited at" timestamp exists on the meeting
+  // object, so this compares the meeting's own updatedAt against the last
+  // summaryGeneration timestamp — the closest available signal.
+  _preMeetingStaleHint(meeting) {
+    const generatedAt = meeting.summaryGeneration?.generatedAt;
+    if (!generatedAt || !meeting.updatedAt) return '';
+    if (new Date(meeting.updatedAt).getTime() <= new Date(generatedAt).getTime()) return '';
+    return '<p class="text-xs text-tertiary" style="margin-bottom: var(--space-3);">ℹ️ Thông tin cuộc họp có thể mới hơn lần tạo tóm tắt gần nhất — Generate lại nếu muốn AI dùng thông tin mới.</p>';
+  },
+
+  _bindPreMeetingInfo(meetingId) {
+    const suggestionEl = document.getElementById('lead-by-suggestion');
+    const updateLeadBySuggestion = () => {
+      if (!suggestionEl || this._leadBySuggestionDismissed.has(meetingId)) return;
+      const leadBy = document.getElementById('detail-lead-by')?.value.trim() || '';
+      const meeting = Storage.getMeeting(meetingId);
+      if (!leadBy || !meeting) { suggestionEl.innerHTML = ''; return; }
+      const already = (meeting.participants || []).some(p => p.trim().toLowerCase() === leadBy.toLowerCase());
+      if (already) { suggestionEl.innerHTML = ''; return; }
+      suggestionEl.innerHTML = `Thêm "${Utils.escapeHtml(leadBy)}" vào danh sách người tham dự? ` +
+        `<button class="btn btn-ghost btn-sm" id="add-leadby-to-participants" type="button">Thêm</button> ` +
+        `<button class="btn btn-ghost btn-sm" id="dismiss-leadby-suggestion" type="button">Bỏ qua</button>`;
+      document.getElementById('add-leadby-to-participants')?.addEventListener('click', () => {
+        const m = Storage.getMeeting(meetingId);
+        if (m) {
+          m.participants = [...m.participants, leadBy];
+          Storage.saveMeeting(m);
+        }
+        this._leadBySuggestionDismissed.add(meetingId);
+        suggestionEl.innerHTML = '';
+      });
+      document.getElementById('dismiss-leadby-suggestion')?.addEventListener('click', () => {
+        this._leadBySuggestionDismissed.add(meetingId);
+        suggestionEl.innerHTML = '';
+      });
+    };
+    document.getElementById('detail-lead-by')?.addEventListener('blur', updateLeadBySuggestion);
+
+    // BR-144: leaving the date field blank must restore the saved value,
+    // never fall through to "now".
+    const restoreDateIfBlank = () => {
+      const current = Storage.getMeeting(meetingId);
+      if (!current) return;
+      if (this._supportsDateTimeLocal()) {
+        const el = document.getElementById('detail-date');
+        if (el && !el.value) el.value = this._isoToLocalInputValue(current.date);
+      } else {
+        const dayEl = document.getElementById('detail-date-day');
+        if (dayEl && !dayEl.value) {
+          const date = new Date(current.date);
+          const pad = n => String(n).padStart(2, '0');
+          dayEl.value = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+        }
+      }
+    };
+    document.getElementById('detail-date')?.addEventListener('blur', restoreDateIfBlank);
+    document.getElementById('detail-date-day')?.addEventListener('blur', restoreDateIfBlank);
+
+    this._renderParticipantChipsInto(meetingId);
+    this._bindParticipantEditor(meetingId);
+
+    document.getElementById('save-premeeting')?.addEventListener('click', () => {
+      const m = Storage.getMeeting(meetingId);
+      if (!m) return;
+      m.meetingType = Storage.normalizeMeetingType(document.getElementById('detail-meeting-type')?.value);
+      m.topic = Storage.normalizeShortText(document.getElementById('detail-topic')?.value);
+      m.leadBy = Storage.normalizeShortText(document.getElementById('detail-lead-by')?.value);
+      const previousDayKey = new Date(m.date).toDateString();
+      const newDateIso = this._readDateEditor();
+      if (newDateIso) m.date = newDateIso;
+      Storage.saveMeeting(m);
+      this.toast('Đã lưu thông tin cuộc họp', 'success');
+      // DAT-03: only when the CALENDAR DAY changed, not just the time —
+      // this is the one action that can move the meeting elsewhere in the
+      // date-sorted All Meetings list (§5.9.2).
+      if (newDateIso && new Date(newDateIso).toDateString() !== previousDayKey) {
+        this.toast(`Đã chuyển bản ghi này sang ngày ${Parts.formatDDMM(newDateIso)} — trong danh sách nó sẽ nằm ở vị trí của ngày đó.`, 'info');
+      }
+      updateLeadBySuggestion();
+      this.navigate(`meeting/${meetingId}`, { force: true });
+    });
+
+    document.getElementById('attach-recording')?.addEventListener('click', () => Import.open({ attachMeetingId: meetingId }));
   },
 
   // Short provenance line for the current stored summary.
@@ -1532,8 +2552,34 @@ const App = {
       this.toast(copied ? 'Summary copied to clipboard' : 'Could not copy summary', copied ? 'success' : 'error');
     });
 
+    // Pre-meeting info (T3, BR-23..BR-29; date+participants T13, BR-144)
+    this._bindPreMeetingInfo(meetingId);
+
+    // Multi-part progress/error card actions (TV12)
+    this._bindMultiPartActions(meetingId);
+
+    // Tags (T14, BR-68..BR-70)
+    this._bindTagEditor(meetingId);
+    document.getElementById('detail-meeting-type')?.addEventListener('change', event => {
+      this._autoAddMeetingTypeTag(meetingId, event.target.value);
+    });
+
+    // Preset dropdown (T13, BR-10)
+    this._populateSummaryPresetSelect(meetingId);
+
     // Generate summary
     document.getElementById('generate-summary')?.addEventListener('click', async () => {
+      const before = Storage.getMeeting(meetingId);
+      if (before?.summary) {
+        const confirmed = await this._confirmRegenerateSummary();
+        if (!confirmed) return;
+      }
+      const caps = Parts.meetingCapabilities(before || {});
+      if (caps.summaryNeedsMissingPartConfirm) {
+        const confirmed = await this._confirmMissingPartsSummary(before.missingParts);
+        if (!confirmed) return;
+      }
+
       const btn = document.getElementById('generate-summary');
       const content = document.getElementById('summary-content');
       btn.disabled = true;
@@ -1543,21 +2589,32 @@ const App = {
       try {
         const provider = document.getElementById('summary-provider')?.value || '';
         const language = document.getElementById('summary-language')?.value || '';
-        const result = await Summary.generate(meeting, { provider, language });
+        const presetId = document.getElementById('summary-preset')?.value || '';
+        const result = await Summary.generate(before, { provider, language, presetId });
         const m = Storage.getMeeting(meetingId);
         if (m) {
           m.summary = result.summary;
           m.summaryDetails = result.details;
+          m.summaryPreset = result.summaryPreset;
           if (result.generation) m.summaryGeneration = result.generation;
-          // Never overwrite action items the user already curated (plan §7).
+          // Never overwrite action items the user already curated (BR-15/E3).
           if (result.actionItems.length > 0 && m.actionItems.length === 0) {
             m.actionItems = result.actionItems;
           }
           Storage.saveMeeting(m);
+          if (presetId) {
+            Storage.saveSettings({ lastSummaryPresetId: presetId });
+            // BR-57.1: remember this choice for the meeting's type, on this machine.
+            if (m.meetingType) {
+              const presetByMeetingType = { ...Storage.getSettings().presetByMeetingType, [m.meetingType]: presetId };
+              Storage.saveSettings({ presetByMeetingType });
+            }
+          }
           const provenance = document.getElementById('summary-provenance');
           if (provenance) provenance.textContent = this._summaryProvenance(m);
+          content.innerHTML = this._renderSummaryContent(m);
+          this._populateSummaryPresetSelect(meetingId);
         }
-        content.textContent = result.summary;
         const copyButton = document.getElementById('copy-summary');
         if (copyButton) copyButton.disabled = false;
         this.toast('Summary generated!', 'success');
@@ -1634,10 +2691,9 @@ const App = {
       }
     });
 
-    // Export
+    // Export (T13)
     document.getElementById('detail-export-md')?.addEventListener('click', () => {
-      Export.downloadMarkdown(meeting);
-      this.toast('Exported as Markdown', 'success');
+      this._openExportModal(meetingId);
     });
 
     // Delete
@@ -1654,9 +2710,9 @@ const App = {
         </div>
       `);
       document.getElementById('confirm-delete-meeting').addEventListener('click', async () => {
-        await AudioStorage.delete(meetingId).catch(error => {
+        await Promise.allSettled(this._audioIdsForMeeting(meeting).map(id => AudioStorage.delete(id).catch(error => {
           console.warn('Could not remove recording audio:', error);
-        });
+        })));
         Storage.deleteMeeting(meetingId);
         await Storage.flush();
         this.closeModal();
@@ -1729,25 +2785,126 @@ const App = {
      VIEW: All Meetings
      ══════════════════════════════════════════ */
 
+  // §10.3/WHY-8: filter+group state lives here, not in the DOM. A reload
+  // resets it (in-memory only), same scope as the other App._* view state.
+  _meetingsView: { mode: 'list', text: '', tags: new Set() },
+
+  // AND between the text filter and the tag filter; OR between selected
+  // tags (BR-72). `matchText` keeps the exact same semantics the old
+  // show/hide-DOM filter had — matches against the title only.
+  _visibleMeetings(meetings) {
+    const view = this._meetingsView;
+    const text = (view.text || '').toLowerCase().trim();
+    return meetings.filter(meeting => {
+      const matchesText = !text || (meeting.title || '').toLowerCase().includes(text);
+      const matchesTags = view.tags.size === 0 ||
+        (meeting.tags || []).some(tag => view.tags.has(tag.toLowerCase()));
+      return matchesText && matchesTags;
+    });
+  },
+
+  _tagFilterBarHtml(meetings) {
+    const entries = collectTags(meetings);
+    if (entries.length === 0) return '';
+    const chips = entries.map(entry => {
+      const key = entry.tag.toLowerCase();
+      const active = this._meetingsView.tags.has(key);
+      return `<button type="button" class="tag-filter-chip ${active ? 'is-active' : ''}" style="${tagStyle(entry.tag)}" data-tag="${Utils.escapeHtml(key)}">${Utils.escapeHtml(entry.tag)} <span class="tag-filter-count">${entry.count}</span></button>`;
+    }).join('');
+    return `<div class="tag-filter-bar" id="tag-filter-bar" style="margin-bottom: var(--space-4);">${chips}</div>`;
+  },
+
+  // BR-74: 1 meeting with N tags appears in N blocks, block order follows
+  // collectTags' recency/frequency ranking, "Chưa gắn tag" always last.
+  _renderMeetingsByTag(meetings, allMeetingsForOrder) {
+    const groups = new Map();
+    const untagged = [];
+    for (const meeting of meetings) {
+      const tags = meeting.tags || [];
+      if (tags.length === 0) { untagged.push(meeting); continue; }
+      for (const tag of tags) {
+        const key = tag.toLowerCase();
+        if (!groups.has(key)) groups.set(key, { label: tag, items: [] });
+        groups.get(key).items.push(meeting);
+      }
+    }
+    const blocks = [];
+    for (const entry of collectTags(allMeetingsForOrder)) {
+      const group = groups.get(entry.tag.toLowerCase());
+      if (!group || group.items.length === 0) continue;
+      blocks.push(`
+        <div class="meeting-tag-group">
+          <h4 class="meeting-tag-group-heading" style="${tagStyle(group.label)}">${Utils.escapeHtml(group.label)}</h4>
+          <div>${group.items.map(m => this._renderMeetingItem(m, { selectable: true })).join('')}</div>
+        </div>
+      `);
+    }
+    if (untagged.length > 0) {
+      blocks.push(`
+        <div class="meeting-tag-group">
+          <h4 class="meeting-tag-group-heading">Chưa gắn tag</h4>
+          <div>${untagged.map(m => this._renderMeetingItem(m, { selectable: true })).join('')}</div>
+        </div>
+      `);
+    }
+    return blocks.join('');
+  },
+
+  // The inner content of #meetings-list-container — split out so re-filtering
+  // can replace just this node without recreating the search input (which
+  // would drop keyboard focus on every keystroke).
+  _meetingsListInnerHtml(allMeetings) {
+    if (allMeetings.length === 0) {
+      return `
+        <div class="empty-state">
+          <div class="empty-icon">📋</div>
+          <h3>No meetings yet</h3>
+          <p>Create your first meeting to get started.</p>
+          <button class="btn btn-primary" style="margin-top: var(--space-4);" onclick="App.navigate('new')">Create Meeting</button>
+        </div>
+      `;
+    }
+    const visible = this._visibleMeetings(allMeetings);
+    if (visible.length === 0) {
+      return `
+        <div class="empty-state">
+          <div class="empty-icon">🔍</div>
+          <h3>No meetings match this filter</h3>
+        </div>
+      `;
+    }
+    if (this._meetingsView.mode === 'byTag') {
+      return this._renderMeetingsByTag(visible, allMeetings);
+    }
+    return `<div id="meetings-list">${visible.map(m => this._renderMeetingItem(m, { selectable: true })).join('')}</div>`;
+  },
+
   _renderAllMeetings() {
     const meetings = Storage.getAllMeetings();
     const selectableIds = new Set(
       meetings.filter(meeting => !['recording', 'processing'].includes(meeting.status)).map(meeting => meeting.id)
     );
     this._selectedMeetingIds = new Set([...this._selectedMeetingIds].filter(id => selectableIds.has(id)));
+    const view = this._meetingsView;
 
     return `
       <div class="view-enter">
         <div class="meetings-list-header" style="margin-bottom: var(--space-4);">
           <div class="search-box" style="width: 320px;">
             <svg class="search-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-            <input type="text" class="input" id="meetings-filter" placeholder="Filter meetings...">
+            <input type="text" class="input" id="meetings-filter" placeholder="Filter meetings..." value="${Utils.escapeHtml(view.text)}">
+          </div>
+          <div class="flex gap-2" id="meetings-view-toggle">
+            <button class="btn btn-secondary btn-sm ${view.mode === 'list' ? 'is-active' : ''}" id="meetings-view-list" type="button">Danh sách</button>
+            <button class="btn btn-secondary btn-sm ${view.mode === 'byTag' ? 'is-active' : ''}" id="meetings-view-byTag" type="button">Theo tag</button>
           </div>
           <button class="btn btn-primary btn-sm" onclick="App.navigate('new')">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
             New Meeting
           </button>
         </div>
+
+        ${this._tagFilterBarHtml(meetings)}
 
         ${meetings.length > 0 ? `
           <div class="meeting-selection-toolbar" id="meeting-selection-toolbar">
@@ -1764,26 +2921,77 @@ const App = {
         ` : ''}
 
         <div class="card" style="padding: 0;" id="meetings-list-container">
-          ${meetings.length > 0 ? `
-            <div id="meetings-list">
-              ${meetings.map(m => this._renderMeetingItem(m, { selectable: true })).join('')}
-            </div>
-          ` : `
-            <div class="empty-state">
-              <div class="empty-icon">📋</div>
-              <h3>No meetings yet</h3>
-              <p>Create your first meeting to get started.</p>
-              <button class="btn btn-primary" style="margin-top: var(--space-4);" onclick="App.navigate('new')">Create Meeting</button>
-            </div>
-          `}
+          ${this._meetingsListInnerHtml(meetings)}
         </div>
       </div>
     `;
   },
 
+  // Re-renders just the list container + tag bar from current state, without
+  // touching the search input (keeps keyboard focus while typing).
+  _refreshMeetingsList() {
+    const meetings = Storage.getAllMeetings();
+    const selectableIds = new Set(
+      meetings.filter(meeting => !['recording', 'processing'].includes(meeting.status)).map(meeting => meeting.id)
+    );
+    this._selectedMeetingIds = new Set([...this._selectedMeetingIds].filter(id => selectableIds.has(id)));
+
+    const container = document.getElementById('meetings-list-container');
+    if (container) container.innerHTML = this._meetingsListInnerHtml(meetings);
+
+    const oldTagBar = document.getElementById('tag-filter-bar');
+    const newTagBarHtml = this._tagFilterBarHtml(meetings);
+    if (oldTagBar) {
+      if (newTagBarHtml) oldTagBar.outerHTML = newTagBarHtml;
+      else oldTagBar.remove();
+    }
+
+    document.getElementById('meetings-view-list')?.classList.toggle('is-active', this._meetingsView.mode === 'list');
+    document.getElementById('meetings-view-byTag')?.classList.toggle('is-active', this._meetingsView.mode === 'byTag');
+
+    this._bindMeetingItemClicks();
+    this._bindMeetingSelectionHandlers();
+  },
+
   _bindAllMeetings() {
     this._bindMeetingItemClicks();
+    this._bindMeetingSelectionHandlers();
 
+    // Text filter (BR-30's counterpart in the library — not the global
+    // search). Debounced re-render from data, not DOM show/hide (WHY-8).
+    const filterInput = document.getElementById('meetings-filter');
+    filterInput?.addEventListener('input', Utils.debounce(() => {
+      this._meetingsView.text = filterInput.value;
+      this._refreshMeetingsList();
+    }, 200));
+
+    // Tag filter chips — click toggles membership in the OR-set (BR-72).
+    document.getElementById('tag-filter-bar')?.addEventListener('click', event => {
+      const chip = event.target.closest('.tag-filter-chip');
+      if (!chip) return;
+      const tag = chip.dataset.tag;
+      if (this._meetingsView.tags.has(tag)) this._meetingsView.tags.delete(tag);
+      else this._meetingsView.tags.add(tag);
+      this._refreshMeetingsList();
+    });
+
+    // View mode toggle (BR-74).
+    document.getElementById('meetings-view-list')?.addEventListener('click', () => {
+      this._meetingsView.mode = 'list';
+      this._refreshMeetingsList();
+    });
+    document.getElementById('meetings-view-byTag')?.addEventListener('click', () => {
+      this._meetingsView.mode = 'byTag';
+      this._refreshMeetingsList();
+    });
+  },
+
+  // Selection checkboxes + bulk delete. Re-bound after every
+  // _refreshMeetingsList() call since the list container's innerHTML (and
+  // therefore its checkboxes) is replaced on every filter/tag/mode change —
+  // `_selectedMeetingIds` itself is the source of truth and survives that,
+  // per Architecture §10.3's "chọn nhiều + đổi bộ lọc vẫn đúng" requirement.
+  _bindMeetingSelectionHandlers() {
     const updateSelectionUi = () => {
       const selectedCount = this._selectedMeetingIds.size;
       const count = document.getElementById('meeting-selection-count');
@@ -1791,7 +2999,7 @@ const App = {
       if (count) count.textContent = `${selectedCount} selected`;
       if (deleteButton) deleteButton.disabled = selectedCount === 0;
 
-      const visibleCheckboxes = [...document.querySelectorAll('.meeting-item:not([style*="display: none"]) .meeting-select-checkbox:not(:disabled)')];
+      const visibleCheckboxes = [...document.querySelectorAll('.meeting-select-checkbox:not(:disabled)')];
       const selectedVisible = visibleCheckboxes.filter(checkbox => checkbox.checked).length;
       const selectAll = document.getElementById('select-all-meetings');
       if (selectAll) {
@@ -1800,6 +3008,12 @@ const App = {
         selectAll.disabled = visibleCheckboxes.length === 0;
       }
     };
+
+    document.querySelectorAll('.meeting-item').forEach(item => {
+      const checkbox = item.querySelector('.meeting-select-checkbox');
+      if (checkbox) checkbox.checked = this._selectedMeetingIds.has(item.dataset.meetingId);
+      item.classList.toggle('is-selected', this._selectedMeetingIds.has(item.dataset.meetingId));
+    });
 
     document.querySelectorAll('.meeting-select-checkbox').forEach(checkbox => {
       checkbox.addEventListener('change', event => {
@@ -1814,7 +3028,6 @@ const App = {
 
     document.getElementById('select-all-meetings')?.addEventListener('change', event => {
       document.querySelectorAll('.meeting-item').forEach(item => {
-        if (item.style.display === 'none') return;
         const checkbox = item.querySelector('.meeting-select-checkbox:not(:disabled)');
         if (!checkbox) return;
         checkbox.checked = event.currentTarget.checked;
@@ -1845,7 +3058,8 @@ const App = {
         const button = event.currentTarget;
         button.disabled = true;
         button.textContent = 'Deleting…';
-        const audioResults = await Promise.allSettled(ids.map(id => AudioStorage.delete(id)));
+        const audioIds = ids.flatMap(id => this._audioIdsForMeeting(Storage.getMeeting(id) || { id }));
+        const audioResults = await Promise.allSettled(audioIds.map(id => AudioStorage.delete(id)));
         Storage.deleteMultipleMeetings(ids);
         try {
           await Storage.flush();
@@ -1866,16 +3080,6 @@ const App = {
       });
     });
 
-    // Filter
-    const filterInput = document.getElementById('meetings-filter');
-    filterInput?.addEventListener('input', Utils.debounce(() => {
-      const q = filterInput.value.toLowerCase().trim();
-      document.querySelectorAll('.meeting-item').forEach(el => {
-        const title = el.querySelector('.meeting-title')?.textContent.toLowerCase() || '';
-        el.style.display = title.includes(q) || !q ? '' : 'none';
-      });
-      updateSelectionUi();
-    }, 200));
     updateSelectionUi();
   },
 
@@ -2215,6 +3419,32 @@ const App = {
           </div>
         </div>
 
+        <!-- Summary Presets -->
+        <div class="settings-section">
+          <h3 style="margin-bottom: var(--space-2);">Summary Presets</h3>
+          <p class="text-sm text-secondary" style="margin-bottom: var(--space-1);">Preset tóm tắt được lưu chung cho mọi người dùng trên máy này — không có tài khoản hay phân quyền riêng (BR-21).</p>
+          <p class="text-xs text-tertiary" style="margin-bottom: var(--space-4);">Không nhập thông tin bí mật vào hướng dẫn cho AI — nội dung này được gửi tới nhà cung cấp AI đã chọn (BR-22).</p>
+          <div id="presets-list" class="flex flex-col gap-2" style="margin-bottom: var(--space-3);">Đang tải…</div>
+          <button class="btn btn-secondary btn-sm" id="preset-create-new" type="button">+ Tạo preset mới</button>
+        </div>
+
+        <!-- Export (T13, BR-42..BR-44) -->
+        <div class="settings-section">
+          <h3 style="margin-bottom: var(--space-2);">Xuất file</h3>
+          <p class="text-sm text-secondary" style="margin-bottom: var(--space-4);">Thư mục lưu file .md khi export cuộc họp. Đường dẫn phải tuyệt đối và nằm ngoài thư mục dữ liệu/cài đặt của MeetNote.</p>
+          <div class="settings-row">
+            <div class="settings-row-info">
+              <h4>Thư mục lưu file .md</h4>
+              <p id="export-dir-status">Đang tải…</p>
+            </div>
+            <input type="text" class="input" id="export-dir-input" placeholder="/Users/ban/Documents/MeetNote" style="width: 320px;">
+          </div>
+          <div class="flex gap-2">
+            <button class="btn btn-secondary btn-sm" id="export-dir-check" type="button">Kiểm tra thư mục</button>
+            <button class="btn btn-primary btn-sm" id="export-dir-save" type="button">Lưu thư mục</button>
+          </div>
+        </div>
+
         <!-- Data -->
         <div class="settings-section">
           <h3 style="margin-bottom: var(--space-4);">Data Management</h3>
@@ -2286,6 +3516,266 @@ const App = {
     `;
   },
 
+  /* ══════════════════════════════════════════
+     Summary Presets management (T14)
+     ══════════════════════════════════════════ */
+
+  async _loadPresetsSettings() {
+    const container = document.getElementById('presets-list');
+    if (!container) return;
+    try {
+      const presets = await Presets.list({ force: true });
+      container.innerHTML = presets.map(preset => `
+        <div class="settings-row" data-preset-id="${Utils.escapeHtml(preset.id)}">
+          <div class="settings-row-info">
+            <h4>${Utils.escapeHtml(preset.name)} ${preset.isBuiltIn ? '<span class="badge badge-primary">Mẫu</span>' : ''}</h4>
+            <p>${preset.sections.length} mục${preset.description ? ` · ${Utils.escapeHtml(preset.description)}` : ''}</p>
+          </div>
+          <div class="flex gap-2">
+            <button class="btn btn-secondary btn-sm preset-edit" data-preset-id="${Utils.escapeHtml(preset.id)}" type="button">Sửa</button>
+            <button class="btn btn-danger btn-sm preset-delete" data-preset-id="${Utils.escapeHtml(preset.id)}" type="button">Xóa</button>
+          </div>
+        </div>
+      `).join('') || '<p class="text-sm text-tertiary">Chưa có preset nào.</p>';
+
+      container.querySelectorAll('.preset-edit').forEach(btn => {
+        btn.addEventListener('click', () => this._openPresetEditor(btn.dataset.presetId));
+      });
+      container.querySelectorAll('.preset-delete').forEach(btn => {
+        btn.addEventListener('click', () => this._deletePreset(btn.dataset.presetId));
+      });
+    } catch (error) {
+      container.innerHTML = `<p class="text-sm" style="color:var(--color-warning);">Không thể tải danh sách preset: ${Utils.escapeHtml(error.message)}</p>`;
+    }
+  },
+
+  async _deletePreset(id) {
+    if (!confirm('Xóa preset này? Các bản tóm tắt đã tạo bằng preset này vẫn giữ nguyên nội dung (BR-17, BR-18).')) return;
+    try {
+      await Presets.remove(id);
+      this.toast('Đã xóa preset', 'success');
+      this._loadPresetsSettings();
+    } catch (error) {
+      this.toast(error.message || 'Không thể xóa preset', 'error');
+    }
+  },
+
+  async _openPresetEditor(id) {
+    let preset = null;
+    if (id) {
+      const presets = await Presets.list().catch(() => []);
+      preset = presets.find(p => p.id === id) || null;
+    }
+    this._presetEditorState = {
+      id: preset?.id || null,
+      name: preset?.name || '',
+      description: preset?.description || '',
+      instruction: preset?.instruction || '',
+      sections: preset
+        ? preset.sections.map(s => ({ key: s.key, label: s.label, type: s.type, hint: s.hint || '' }))
+        : [{ key: null, label: '', type: 'paragraph', hint: '' }]
+    };
+    this._renderPresetEditorModal();
+  },
+
+  _renderPresetEditorModal() {
+    const state = this._presetEditorState;
+    this.showModal(`
+      <div class="modal-header">
+        <h3>${state.id ? 'Sửa preset' : 'Tạo preset mới'}</h3>
+        <button class="btn btn-ghost btn-icon" onclick="App.closeModal()">✕</button>
+      </div>
+      <div class="modal-body" style="max-height:60vh; overflow-y:auto;">
+        <p class="text-xs" style="color:var(--color-warning); margin-bottom:var(--space-3);">Preset được lưu chung cho mọi người dùng máy này. Không nhập thông tin bí mật vào hướng dẫn — nội dung này được gửi tới nhà cung cấp AI.</p>
+        <div class="input-group">
+          <label>Tên preset</label>
+          <input type="text" class="input" id="preset-name" value="${Utils.escapeHtml(state.name)}" maxlength="60">
+        </div>
+        <div class="input-group">
+          <label>Mô tả <span class="text-tertiary">(tùy chọn)</span></label>
+          <input type="text" class="input" id="preset-description" value="${Utils.escapeHtml(state.description)}" maxlength="300">
+        </div>
+        <div class="input-group">
+          <label>Hướng dẫn cho AI <span class="text-tertiary">(tùy chọn)</span></label>
+          <textarea class="input" id="preset-instruction" maxlength="2000" style="min-height:80px;">${Utils.escapeHtml(state.instruction)}</textarea>
+        </div>
+        <div class="input-group">
+          <label>Các mục (section)</label>
+          <div id="preset-sections">${this._renderPresetSectionsEditor()}</div>
+          <button class="btn btn-secondary btn-sm" id="preset-add-section" type="button" style="margin-top:var(--space-2);">+ Thêm mục</button>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="App.closeModal()">Hủy</button>
+        <button class="btn btn-primary" id="preset-save" type="button">Lưu</button>
+      </div>
+    `);
+    this._bindPresetEditorModal();
+  },
+
+  _renderPresetSectionsEditor() {
+    const state = this._presetEditorState;
+    return state.sections.map((section, index) => `
+      <div class="card" style="margin-bottom:var(--space-2);" data-section-index="${index}">
+        <div class="flex gap-2" style="align-items:flex-end; flex-wrap:wrap;">
+          <div class="input-group" style="flex:1; min-width:160px;">
+            <label>Tên mục</label>
+            <input type="text" class="input input-sm preset-section-label" data-index="${index}" value="${Utils.escapeHtml(section.label)}" maxlength="60">
+          </div>
+          <div class="input-group" style="width:170px;">
+            <label>Kiểu</label>
+            <select class="input input-sm preset-section-type" data-index="${index}">
+              <option value="paragraph" ${section.type === 'paragraph' ? 'selected' : ''}>Đoạn văn</option>
+              <option value="bulletList" ${section.type === 'bulletList' ? 'selected' : ''}>Danh sách</option>
+              <option value="actionList" ${section.type === 'actionList' ? 'selected' : ''}>Việc cần làm</option>
+            </select>
+          </div>
+          <div class="flex gap-1">
+            <button class="btn btn-ghost btn-icon btn-sm preset-section-up" data-index="${index}" type="button" title="Move up" ${index === 0 ? 'disabled' : ''}>↑</button>
+            <button class="btn btn-ghost btn-icon btn-sm preset-section-down" data-index="${index}" type="button" title="Move down" ${index === state.sections.length - 1 ? 'disabled' : ''}>↓</button>
+            <button class="btn btn-ghost btn-icon btn-sm preset-section-remove" data-index="${index}" type="button" title="Remove" ${state.sections.length <= 1 ? 'disabled' : ''}>✕</button>
+          </div>
+        </div>
+        <div class="input-group" style="margin-top:var(--space-2);">
+          <label>Gợi ý cho AI <span class="text-tertiary">(tùy chọn)</span></label>
+          <input type="text" class="input input-sm preset-section-hint" data-index="${index}" value="${Utils.escapeHtml(section.hint)}" maxlength="300">
+        </div>
+      </div>
+    `).join('');
+  },
+
+  _syncPresetEditorFields() {
+    const state = this._presetEditorState;
+    state.name = document.getElementById('preset-name')?.value ?? state.name;
+    state.description = document.getElementById('preset-description')?.value ?? state.description;
+    state.instruction = document.getElementById('preset-instruction')?.value ?? state.instruction;
+  },
+
+  // Bound once per modal render — add-section/save must not accumulate
+  // duplicate listeners across _refreshPresetSectionsEditor() calls.
+  _bindPresetEditorModal() {
+    document.getElementById('preset-add-section')?.addEventListener('click', () => {
+      this._syncPresetEditorFields();
+      this._presetEditorState.sections.push({ key: null, label: '', type: 'paragraph', hint: '' });
+      this._refreshPresetSectionsEditor();
+    });
+
+    document.getElementById('preset-save')?.addEventListener('click', async () => {
+      this._syncPresetEditorFields();
+      const state = this._presetEditorState;
+      const payload = {
+        name: state.name,
+        description: state.description,
+        instruction: state.instruction,
+        sections: state.sections.map(s => ({ key: s.key || undefined, label: s.label, type: s.type, hint: s.hint }))
+      };
+      try {
+        const result = state.id ? await Presets.update(state.id, payload) : await Presets.create(payload);
+        (result.warnings || []).forEach(warning => this.toast(warning.message, 'info'));
+        this.toast('Đã lưu preset', 'success');
+        this.closeModal();
+        this._loadPresetsSettings();
+      } catch (error) {
+        this.toast(error.message || 'Không thể lưu preset', 'error');
+      }
+    });
+
+    this._bindPresetSectionItems();
+  },
+
+  // Re-bound after every section list change (rows are recreated).
+  _bindPresetSectionItems() {
+    const state = this._presetEditorState;
+    document.querySelectorAll('.preset-section-label').forEach(el => {
+      el.addEventListener('input', () => { state.sections[Number(el.dataset.index)].label = el.value; });
+    });
+    document.querySelectorAll('.preset-section-hint').forEach(el => {
+      el.addEventListener('input', () => { state.sections[Number(el.dataset.index)].hint = el.value; });
+    });
+    document.querySelectorAll('.preset-section-type').forEach(el => {
+      el.addEventListener('change', () => { state.sections[Number(el.dataset.index)].type = el.value; });
+    });
+    document.querySelectorAll('.preset-section-remove').forEach(el => {
+      el.addEventListener('click', () => {
+        this._syncPresetEditorFields();
+        state.sections.splice(Number(el.dataset.index), 1);
+        this._refreshPresetSectionsEditor();
+      });
+    });
+    document.querySelectorAll('.preset-section-up').forEach(el => {
+      el.addEventListener('click', () => {
+        this._syncPresetEditorFields();
+        const i = Number(el.dataset.index);
+        if (i > 0) [state.sections[i - 1], state.sections[i]] = [state.sections[i], state.sections[i - 1]];
+        this._refreshPresetSectionsEditor();
+      });
+    });
+    document.querySelectorAll('.preset-section-down').forEach(el => {
+      el.addEventListener('click', () => {
+        this._syncPresetEditorFields();
+        const i = Number(el.dataset.index);
+        if (i < state.sections.length - 1) [state.sections[i + 1], state.sections[i]] = [state.sections[i], state.sections[i + 1]];
+        this._refreshPresetSectionsEditor();
+      });
+    });
+  },
+
+  _refreshPresetSectionsEditor() {
+    const container = document.getElementById('preset-sections');
+    if (container) container.innerHTML = this._renderPresetSectionsEditor();
+    this._bindPresetSectionItems();
+  },
+
+  /* ══════════════════════════════════════════
+     Export settings (T11/T13, BR-42..BR-44)
+     ══════════════════════════════════════════ */
+
+  async _loadExportSettings() {
+    const input = document.getElementById('export-dir-input');
+    const status = document.getElementById('export-dir-status');
+    if (!input || !status) return;
+    try {
+      const settings = await Exporter.getSettings();
+      input.value = settings.markdownDir || settings.suggestedDir || '';
+      status.textContent = settings.configured
+        ? 'Đã cấu hình — bấm Export .md ở một cuộc họp bất kỳ để dùng.'
+        : `Chưa cấu hình. Gợi ý: ${settings.suggestedDir}`;
+    } catch (error) {
+      status.textContent = `Không thể tải cấu hình: ${error.message}`;
+    }
+  },
+
+  _bindExportSettings() {
+    document.getElementById('export-dir-check')?.addEventListener('click', async event => {
+      const value = document.getElementById('export-dir-input')?.value || '';
+      const button = event.currentTarget;
+      button.disabled = true;
+      try {
+        await Exporter.checkDirectory(value);
+        this.toast('Thư mục hợp lệ và ghi được.', 'success');
+      } catch (error) {
+        this.toast(error.message || 'Thư mục không hợp lệ.', 'error');
+      }
+      button.disabled = false;
+    });
+
+    document.getElementById('export-dir-save')?.addEventListener('click', async event => {
+      const value = document.getElementById('export-dir-input')?.value || '';
+      const button = event.currentTarget;
+      button.disabled = true;
+      try {
+        const result = await Exporter.saveSettings(value);
+        document.getElementById('export-dir-input').value = result.markdownDir;
+        const status = document.getElementById('export-dir-status');
+        if (status) status.textContent = 'Đã cấu hình — bấm Export .md ở một cuộc họp bất kỳ để dùng.';
+        this.toast('Đã lưu thư mục xuất file.', 'success');
+      } catch (error) {
+        this.toast(error.message || 'Không thể lưu thư mục.', 'error');
+      }
+      button.disabled = false;
+    });
+  },
+
   _bindSettings() {
     document.getElementById('setting-theme')?.addEventListener('change', event => {
       this._applyTheme(event.target.value);
@@ -2295,6 +3785,12 @@ const App = {
     this._bindProviderControls('stt');
     this._refreshProviders('llm');
     this._bindProviderControls('llm');
+
+    this._loadPresetsSettings();
+    document.getElementById('preset-create-new')?.addEventListener('click', () => this._openPresetEditor(null));
+
+    this._loadExportSettings();
+    this._bindExportSettings();
 
     // Resolve a provider/model selection, blocking a not-ready default. Returns
     // { provider, models } or null if the chosen provider cannot be the default.
@@ -2618,6 +4114,7 @@ const App = {
             <span>${Utils.formatDurationHuman(meeting.duration)}</span>
             ${pendingActions > 0 ? `<span class="dot"></span><span>${pendingActions} action${pendingActions > 1 ? 's' : ''}</span>` : ''}
           </div>
+          ${(meeting.tags || []).length > 0 ? `<div class="tag-chip-row meeting-tag-row">${this._renderTagChips(meeting.tags)}</div>` : ''}
         </div>
         <div class="meeting-actions">
           ${hasTemporaryTitle ? `
@@ -2630,8 +4127,20 @@ const App = {
           </button>
         </div>
         ${statusBadges[meeting.status] || ''}
+        ${this._isRecentlyImportedPastDate(meeting) ? '<span class="badge badge-primary">Mới nhập</span>' : ''}
       </div>
     `;
+  },
+
+  // DAT-07 (§5.9.3): a meeting whose `date` was just set to a day far in the
+  // past would otherwise vanish from the top of a date-sorted list right
+  // after import — this badge is the only way to still find it there.
+  _isRecentlyImportedPastDate(meeting) {
+    if (!meeting.date || !meeting.createdAt) return false;
+    const createdAgoMs = Date.now() - new Date(meeting.createdAt).getTime();
+    if (!Number.isFinite(createdAgoMs) || createdAgoMs > 24 * 3600 * 1000) return false;
+    const deltaMs = Math.abs(new Date(meeting.date).getTime() - new Date(meeting.createdAt).getTime());
+    return Number.isFinite(deltaMs) && deltaMs > 24 * 3600 * 1000;
   },
 
   _bindMeetingItemClicks() {
@@ -2741,64 +4250,11 @@ const App = {
     `;
   },
 
-  _handleUpload() {
-    const input = document.createElement('input');
-    input.type = 'file';
-    input.accept = '.aac,.aiff,.amr,.asf,.flac,.mp3,.ogg,.wav,.webm,.m4a,.mp4,audio/*,video/mp4';
-    input.addEventListener('change', async (e) => {
-      const file = e.target.files[0];
-      if (!file) return;
-
-      const extension = file.name.split('.').pop()?.toLowerCase() || '';
-      const supported = ['aac', 'aiff', 'amr', 'asf', 'flac', 'mp3', 'ogg', 'wav', 'webm', 'm4a', 'mp4'];
-      if (!supported.includes(extension)) {
-        this.toast('Unsupported audio format. Please choose AAC, M4A, MP3, WAV, WebM, FLAC, OGG, AMR, ASF, AIFF, or MP4.', 'error');
-        return;
-      }
-
-      const settings = Storage.getSettings();
-      const startedAt = new Date().toISOString();
-
-      const meeting = Storage.saveMeeting({
-        title: file.name.replace(/\.[^.]+$/, ''),
-        status: 'processing',
-        participants: [],
-        duration: 0,
-        transcript: [],
-        translations: [],
-        language: settings.language,
-        translationLanguage: settings.translationLanguage,
-        sourceFilename: file.name
-      });
-
-      try {
-        this._backgroundAudioTasks.set(meeting.id, { filename: file.name, phase: 'saving' });
-        this._updateMeetingsCount();
-        this._renderBackgroundTaskIndicator();
-        await AudioStorage.save(meeting.id, file);
-        meeting.audioId = meeting.id;
-        Storage.saveMeeting(meeting);
-        await Storage.flush();
-        this._backgroundAudioTasks.set(meeting.id, { filename: file.name, phase: 'transcribing' });
-        this._renderBackgroundTaskIndicator();
-        this.toast(`${file.name} is processing in the background.`, 'info');
-        this._refreshMeetingView(meeting.id);
-        this._processUploadedRecording(meeting, startedAt, file.name);
-      } catch (error) {
-        this._backgroundAudioTasks.delete(meeting.id);
-        meeting.status = 'failed';
-        meeting.processingError = error.message || 'Could not save this audio file.';
-        Storage.saveMeeting(meeting);
-        await Storage.flush();
-        this._renderBackgroundTaskIndicator();
-        this.toast(`Upload failed: ${meeting.processingError}`, 'error');
-        this._refreshMeetingView(meeting.id);
-      }
-    });
-    input.click();
-  },
-
-  async _processUploadedRecording(meeting, startedAt, filename) {
+  // `sttOverride` (BR-87): { provider, model } chosen for THIS import only —
+  // the import modal (js/import.js) passes this; the old direct-upload path
+  // and job resume/retry paths omit it and fall back to the server's
+  // default provider, exactly as before.
+  async _processUploadedRecording(meeting, startedAt, filename, sttOverride = {}) {
     try {
       const response = await fetch('/api/import-transcription', {
           method: 'POST',
@@ -2806,7 +4262,9 @@ const App = {
           body: JSON.stringify({
             meetingId: meeting.id,
             language: meeting.language,
-            translationLanguage: meeting.translationLanguage
+            translationLanguage: meeting.translationLanguage,
+            ...(sttOverride.provider ? { provider: sttOverride.provider } : {}),
+            ...(sttOverride.model ? { model: sttOverride.model } : {})
           })
       });
       const result = await response.json().catch(() => ({}));
@@ -2901,6 +4359,55 @@ const App = {
     this._activePollers.set(meetingId, setTimeout(poll, delay));
   },
 
+  // Multi-part equivalent of _pollJobStatus (V11#24) — one poller per MEETING
+  // (not per part/job), reading the compact GET /parts poll shape so N parts
+  // still count as exactly 1 background task and fire exactly 1 completion
+  // toast (V11#25, UX §5.5), never N.
+  _pollPartsStatus(meetingId) {
+    if (this._activePollers.has(meetingId)) clearTimeout(this._activePollers.get(meetingId));
+    let delay = 3000;
+    const maxDelay = 10000;
+    const startedAt = Date.now();
+
+    const poll = async () => {
+      try {
+        const response = await fetch(`/api/meetings/${encodeURIComponent(meetingId)}/parts`);
+        if (response.status === 404) { this._activePollers.delete(meetingId); this._backgroundAudioTasks.delete(meetingId); this._renderBackgroundTaskIndicator(); return; }
+        const data = await response.json();
+        const total = data.parts.length;
+        const done = data.parts.filter(p => p.status === 'completed' || p.status === 'failed' || p.status === 'dropped').length;
+        const elapsedMin = Math.round((Date.now() - startedAt) / 60000);
+        const meeting = Storage.getMeeting(meetingId);
+        this._backgroundAudioTasks.set(meetingId, { filename: meeting?.title || meetingId, phase: 'transcribing', progress: `${done}/${total} phần xong · đã ${elapsedMin} phút` });
+        this._renderBackgroundTaskIndicator();
+
+        if (data.status === 'processing') {
+          delay = Math.min(delay * 1.5, maxDelay);
+          this._activePollers.set(meetingId, setTimeout(poll, delay));
+          return;
+        }
+
+        // Terminal (completed — possibly with missingParts — or failed).
+        await this._reloadMeetingsFromServer();
+        this._activePollers.delete(meetingId);
+        this._backgroundAudioTasks.delete(meetingId);
+        this._renderBackgroundTaskIndicator();
+        const finished = Storage.getMeeting(meetingId);
+        if (data.status === 'failed') {
+          this.toast(`Không tạo được transcript cho "${finished?.title || meetingId}".`, 'error');
+        } else {
+          this.toast(`Transcript đã xong — ${finished?.title || meetingId}`, 'success');
+        }
+        this._refreshMeetingView(meetingId);
+      } catch {
+        delay = Math.min(delay * 2, maxDelay);
+        this._activePollers.set(meetingId, setTimeout(poll, delay));
+      }
+    };
+
+    this._activePollers.set(meetingId, setTimeout(poll, delay));
+  },
+
   async _reloadMeetingsFromServer() {
     try {
       const response = await fetch('/api/data', { cache: 'no-store' });
@@ -2918,6 +4425,13 @@ const App = {
       if (meeting.status !== 'processing') continue;
       // Already polling this meeting.
       if (this._activePollers.has(meeting.id)) continue;
+
+      if (Array.isArray(meeting.parts) && meeting.parts.length > 0) {
+        this._backgroundAudioTasks.set(meeting.id, { filename: meeting.title, phase: 'transcribing' });
+        this._renderBackgroundTaskIndicator();
+        this._pollPartsStatus(meeting.id);
+        continue;
+      }
 
       const jobId = meeting._activeJobId;
       if (jobId) {

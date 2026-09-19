@@ -1,0 +1,31 @@
+{
+  "_capturedAt": "2026-09-18",
+  "_capturedBy": "Dev, import-phone-recording batch 2, TV16 (Protocol 5.3/5.4)",
+  "_method": "Real Deepgram API key already present in this dev machine's macOS Keychain (account deepgram-api-key, never read/printed by this process). Same real ~4.93s Vietnamese speech WAV as tests/fixtures/soniox/real-transcribe-vi.json (generated on-device via macOS `say`), fed through the real MeetNote server (PUT /api/audio/:id, POST /api/import-transcription provider=deepgram, polled to completion). `raw` below is the exact object server/stt/providers/deepgram.js's transcribe() returned (captured with a temporary one-line console dump inside server/stt/index.js's transcribe(), immediately reverted after capture — git diff confirmed clean).",
+  "input": {
+    "text": "Xin chào các bạn, hôm nay chúng ta họp để bàn về báo giá quý bốn.",
+    "voice": "Linh (vi_VN, macOS `say`)",
+    "sampleRateHz": 16000,
+    "durationSecondsApprox": 4.93,
+    "format": "wav"
+  },
+  "raw": {
+    "transcript": [
+      { "text": "Xin chào các bạn, hôm nay chúng ta họp để bàn về báo giá quý bốn", "time": 0, "speaker": "Speaker 1", "language": "vi" }
+    ],
+    "translations": [],
+    "duration": 4.9255624,
+    "durationKind": "audio-length",
+    "model": "nova-3"
+  },
+  "expectedNormalized": {
+    "transcript": [
+      { "text": "Xin chào các bạn, hôm nay chúng ta họp để bàn về báo giá quý bốn", "time": 0, "speaker": "Speaker 1", "language": "vi" }
+    ],
+    "translations": [],
+    "duration": 5,
+    "durationKind": "audio-length",
+    "model": "nova-3",
+    "provider": "deepgram"
+  }
+}

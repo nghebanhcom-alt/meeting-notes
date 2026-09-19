@@ -203,6 +203,8 @@ module.exports = {
   llmError,
   tagProvider,
   parseJsonLoose,
+  cleanString,
+  cleanStringList,
   normalizeSummary,
   normalizeTitle,
   withRepair,

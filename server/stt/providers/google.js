@@ -9,24 +9,24 @@
 
 const { STT_ERROR, sttError, groupWordsIntoSegments } = require('../contracts');
 const { fetchWithTimeout, httpErrorFor } = require('./http');
+const { encodingForMime, PROVIDER_FORMATS } = require('../formats');
 
 const API_HOST = 'https://speech.googleapis.com/v1';
 const MAX_INLINE_BYTES = 10 * 1024 * 1024;
-const POLL_TIMEOUT_MS = 15 * 60 * 1000;
+// Was 15 minutes; BR-102 needs headroom for a 3-hour merged-part recording.
+const POLL_TIMEOUT_MS = 3 * 60 * 60 * 1000;
 
 const MODELS = [
   { id: 'latest_long', label: 'Latest (long-form)' },
   { id: 'latest_short', label: 'Latest (short)' }
 ];
 
-// Map the recorded container to a Google encoding, or null if unsupported.
-function encodingForMime(mimeType) {
-  const type = String(mimeType || '').toLowerCase();
-  if (type.includes('webm')) return 'WEBM_OPUS';
-  if (type.includes('ogg')) return 'OGG_OPUS';
-  if (type.includes('mp3') || type.includes('mpeg')) return 'MP3';
-  if (type.includes('wav') || type.includes('flac')) return type.includes('flac') ? 'FLAC' : 'LINEAR16';
-  return null; // m4a/mp4/aac are not accepted by Google STT directly
+// "1234.500s" (Google's duration string format) → 1234.5. Exported so its
+// arithmetic can be unit-tested without a real API response (Protocol 5.3 —
+// no golden Google fixture exists yet, see docs/test-report.md).
+function parseGoogleSeconds(value) {
+  const num = parseFloat(String(value || '0').replace('s', ''));
+  return Number.isFinite(num) ? num : 0;
 }
 
 function primaryLanguage(value) {
@@ -142,26 +142,52 @@ function createGoogleAdapter(deps) {
     // Diarized word tags land on the final result; fall back to per-result words.
     const results = job?.response?.results || [];
     const words = [];
+    let maxWordEnd = 0;
     for (const result of results) {
       for (const word of result?.alternatives?.[0]?.words || []) {
         words.push({
           text: word.word || '',
-          start: parseFloat(String(word.startTime || '0').replace('s', '')) || 0,
+          start: parseGoogleSeconds(word.startTime),
           speaker: word.speakerTag ? `Speaker ${word.speakerTag}` : '',
           language: config.languageCode
         });
+        maxWordEnd = Math.max(maxWordEnd, parseGoogleSeconds(word.endTime));
       }
     }
+
+    // R-AB: the old formula used the START of the last word — the audio's
+    // actual end, not the moment speech stopped. `resultEndTime`/`endTime`
+    // are the fields Google's own docs point to for "end of audio" (Architecture
+    // §V9/§V12.2). Neither field is populated → keep the old (wrong but at
+    // least non-crashing) fallback rather than reporting a false 0.
+    const maxResultEnd = results.reduce((max, result) => Math.max(max, parseGoogleSeconds(result?.resultEndTime)), 0);
+    const bestEnd = Math.max(maxResultEnd, maxWordEnd);
+    const duration = bestEnd > 0
+      ? Math.round(bestEnd)
+      : (words.length ? Math.round(words[words.length - 1].start) : 0);
 
     return {
       transcript: groupWordsIntoSegments(words, false),
       translations: [],
-      duration: words.length ? Math.round(words[words.length - 1].start) : 0,
+      duration,
+      // Always the end of the last detected word, never audio-file length
+      // (Google's inline API does not return that) — BR-126 must never treat
+      // this as an exact duration.
+      durationKind: 'speech-end',
       model: modelId(model)
     };
   }
 
-  return { id, name: 'Google Speech-to-Text', kind: 'api', needsKey: true, supportsTranslation: false, maxUploadBytes: MAX_INLINE_BYTES, getStatus, listModels, testConnection, transcribe };
+  // Every model uses the same end-of-speech approximation (Architecture §V9).
+  function durationKindFor() {
+    return 'speech-end';
+  }
+
+  return {
+    id, name: 'Google Speech-to-Text', kind: 'api', needsKey: true, supportsTranslation: false,
+    maxUploadBytes: MAX_INLINE_BYTES, formats: PROVIDER_FORMATS.google,
+    getStatus, listModels, testConnection, transcribe, durationKindFor
+  };
 }
 
-module.exports = { createGoogleAdapter, MODELS };
+module.exports = { createGoogleAdapter, MODELS, parseGoogleSeconds };

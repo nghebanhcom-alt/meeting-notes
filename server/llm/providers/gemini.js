@@ -88,7 +88,13 @@ function createGeminiAdapter(deps) {
   }
 
   // Runs an already-built prompt. Budget is enforced by the service.
-  async function run({ prompt, model, normalize, responseSchema }) {
+  // `format` (when present) carries a preset's dynamic schema + normalizer
+  // (§6.2) in place of the static 5-field SUMMARY_SCHEMA/normalizeSummary.
+  async function run({ prompt, model, normalize, responseSchema, format }) {
+    if (format) {
+      normalize = format.normalize;
+      responseSchema = format.geminiSchema;
+    }
     const key = await requireKey();
     const spec = modelSpec(model);
 
@@ -150,9 +156,9 @@ function createGeminiAdapter(deps) {
     listModels,
     getModelSpec,
     testConnection,
-    summarize: ({ prompt, model }) => run({ prompt, model, normalize: normalizeSummary, responseSchema: SUMMARY_SCHEMA }),
+    summarize: ({ prompt, model, format }) => run({ prompt, model, normalize: normalizeSummary, responseSchema: SUMMARY_SCHEMA, format }),
     title: ({ prompt, model }) => run({ prompt, model, normalize: normalizeTitle, responseSchema: TITLE_SCHEMA })
   };
 }
 
-module.exports = { createGeminiAdapter, MODELS };
+module.exports = { createGeminiAdapter, MODELS, SUMMARY_SCHEMA };

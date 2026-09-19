@@ -18,12 +18,46 @@ const Storage = {
     llmProvider: 'codex',
     llmModels: {},
     sttProvider: 'soniox',
-    sttModels: {}
+    sttModels: {},
+    lastSummaryPresetId: '',
+    // BR-57.1: meetingType -> presetId last used for that type, on this machine.
+    presetByMeetingType: {}
   },
   _meetings: [],
   _settings: {},
   _pendingWrite: Promise.resolve(),
   _fileStorageAvailable: false,
+
+  /* ── Pre-meeting info normalization (BR-23..BR-27, BR-68) ──
+     Same rule table as server.js `sanitizePreMeetingFields` — kept as 2
+     independent implementations per Architecture §3.1, not a shared
+     module, so each side stays enforceable even if the other is bypassed. */
+
+  normalizeMeetingType(value) {
+    const code = typeof value === 'string' ? value.trim() : '';
+    if (!code) return '';
+    return (typeof isKnownMeetingTypeCode === 'function' && isKnownMeetingTypeCode(code)) ? code : '';
+  },
+
+  normalizeShortText(value, maxLength = 200) {
+    return typeof value === 'string' ? value.trim().slice(0, maxLength) : '';
+  },
+
+  normalizeTagList(value) {
+    if (!Array.isArray(value)) return [];
+    const seen = new Set();
+    const result = [];
+    for (const raw of value) {
+      const tag = typeof raw === 'string' ? raw.trim().slice(0, 30) : '';
+      if (!tag) continue;
+      const key = tag.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      result.push(tag);
+      if (result.length >= 10) break;
+    }
+    return result;
+  },
 
   async init() {
     const response = await fetch('/api/data', { cache: 'no-store' });
@@ -144,12 +178,28 @@ const Storage = {
     return meetings.find(m => m.id === id) || null;
   },
 
+  // BR-146 — the 8 fields whose value actually reaches the summary prompt
+  // (title/date/duration/participants/meetingType/topic/leadBy/notes).
+  // Anything else changing (tags, status, transcript, summary...) must NOT
+  // bump the reminder — this is the ONE place that decides, so every save
+  // path (manual edit, import, tag picker) gets the same rule for free.
+  PROMPT_CONTEXT_FIELDS: ['title', 'date', 'duration', 'participants', 'meetingType', 'topic', 'leadBy', 'notes'],
+
+  _promptContextFieldsChanged(previous, next) {
+    return this.PROMPT_CONTEXT_FIELDS.some(field => JSON.stringify(previous[field]) !== JSON.stringify(next[field]));
+  },
+
   saveMeeting(meeting) {
     const meetings = this.getAllMeetings();
     const index = meetings.findIndex(m => m.id === meeting.id);
 
     if (index >= 0) {
-      meetings[index] = { ...meetings[index], ...meeting, updatedAt: new Date().toISOString() };
+      const previous = meetings[index];
+      const updated = { ...previous, ...meeting, updatedAt: new Date().toISOString() };
+      if (this._promptContextFieldsChanged(previous, updated)) {
+        updated.promptContextUpdatedAt = new Date().toISOString();
+      }
+      meetings[index] = updated;
     } else {
       meetings.unshift({
         id: Utils.uuid(),
@@ -163,8 +213,13 @@ const Storage = {
         sonioxUsage: null,
         summary: '',
         summaryDetails: null,
+        summaryPreset: null,
         actionItems: [],
         notes: '',
+        meetingType: '',
+        topic: '',
+        leadBy: '',
+        tags: [],
         audioBlob: null,
         language: this.getSettings().language,
         createdAt: new Date().toISOString(),
@@ -295,6 +350,35 @@ const Storage = {
           if (seg.text.toLowerCase().includes(lq)) {
             score += 5;
             snippets.push({ field: 'transcript', text: seg.text, time: seg.time, speaker: seg.speaker });
+          }
+        });
+
+        // Search in topic (BR-30)
+        if (m.topic && m.topic.toLowerCase().includes(lq)) {
+          score += 4;
+          snippets.push({ field: 'topic', text: m.topic });
+        }
+
+        // Search in leadBy (BR-30)
+        if (m.leadBy && m.leadBy.toLowerCase().includes(lq)) {
+          score += 3;
+          snippets.push({ field: 'leadBy', text: m.leadBy });
+        }
+
+        // Search in meetingType label (BR-30)
+        if (m.meetingType) {
+          const typeEntry = typeof meetingTypeByCode === 'function' ? meetingTypeByCode(m.meetingType) : null;
+          if (typeEntry && typeEntry.label.toLowerCase().includes(lq)) {
+            score += 2;
+            snippets.push({ field: 'meetingType', text: typeEntry.label });
+          }
+        }
+
+        // Search in tags (BR-73)
+        (m.tags || []).forEach(tag => {
+          if (tag.toLowerCase().includes(lq)) {
+            score += 3;
+            snippets.push({ field: 'tags', text: tag });
           }
         });
 
@@ -436,14 +520,111 @@ const Storage = {
       summaryGeneration: meeting.summaryGeneration && typeof meeting.summaryGeneration === 'object' && !Array.isArray(meeting.summaryGeneration)
         ? meeting.summaryGeneration
         : null,
+      summaryPreset: this._sanitizeSummaryPreset(meeting.summaryPreset),
       actionItems,
       notes: string(meeting.notes, '', 200000),
+      // BR-31/BR-76: missing field in an older backup defaults quietly, no error.
+      meetingType: this.normalizeMeetingType(meeting.meetingType),
+      topic: this.normalizeShortText(meeting.topic),
+      leadBy: this.normalizeShortText(meeting.leadBy),
+      tags: this.normalizeTagList(meeting.tags),
       audioId: null,
       audioBlob: null,
       language: string(meeting.language, this.DEFAULT_SETTINGS.language, 20),
       translationLanguage: string(meeting.translationLanguage, '', 20),
       createdAt: string(meeting.createdAt, new Date().toISOString(), 64),
-      updatedAt: string(meeting.updatedAt, new Date().toISOString(), 64)
+      updatedAt: string(meeting.updatedAt, new Date().toISOString(), 64),
+      // R-Z/BR-112/BR-137 — a backup of a merged (multi-part) meeting used to
+      // lose `parts` entirely (this whitelist didn't know the field existed),
+      // silently turning it back into an apparently-empty recording on
+      // restore. `sourceFilename` had the exact same bug (it was simply
+      // absent from this object) — both are fixed here, together, since they
+      // are the same class of omission.
+      source: ['live', 'import'].includes(meeting.source) ? meeting.source : '',
+      sourceFilename: string(meeting.sourceFilename, '', 255),
+      sourceSizeBytes: Number.isFinite(Number(meeting.sourceSizeBytes)) ? Math.max(0, Number(meeting.sourceSizeBytes)) : 0,
+      durationEstimated: Boolean(meeting.durationEstimated),
+      missingParts: Array.isArray(meeting.missingParts)
+        ? meeting.missingParts.filter(n => Number.isFinite(Number(n))).map(Number).slice(0, 10)
+        : [],
+      promptContextUpdatedAt: string(meeting.promptContextUpdatedAt, '', 64),
+      parts: Array.isArray(meeting.parts)
+        ? meeting.parts.slice(0, 10).map(part => this._sanitizeImportedPart(part)).filter(Boolean)
+        : []
+    };
+  },
+
+  // Mirrors server/meeting-parts.js `normalizePart` (§V3.2) — an independent
+  // client-side implementation, same reasoning as normalizeMeetingType/etc
+  // above: a malformed backup must default quietly, never crash the import.
+  _sanitizeImportedPart(part) {
+    if (!part || typeof part !== 'object' || Array.isArray(part)) return null;
+    const string = (value, fallback = '', maxLength = 10000) =>
+      typeof value === 'string' ? value.slice(0, maxLength) : fallback;
+    const partId = string(part.partId, '', 128);
+    if (!partId) return null;
+    const segment = (raw, speakerFallback) => ({
+      text: string(raw?.text, '', 20000),
+      speaker: string(raw?.speaker, speakerFallback, 200),
+      time: Number.isFinite(Number(raw?.time)) ? Math.max(0, Number(raw.time)) : 0,
+      language: string(raw?.language, '', 20)
+    });
+    return {
+      partId,
+      order: Number.isFinite(Number(part.order)) ? Math.max(1, Math.round(Number(part.order))) : 1,
+      filename: string(part.filename, '', 255),
+      sizeBytes: Number.isFinite(Number(part.sizeBytes)) ? Math.max(0, Number(part.sizeBytes)) : 0,
+      // null/undefined must stay null, not become Number(null) === 0 —
+      // restoring a backup twice must be idempotent (mirrors the same fix in
+      // server/meeting-parts.js normalizePart).
+      clientDurationSeconds: (part.clientDurationSeconds === null || part.clientDurationSeconds === undefined)
+        ? null
+        : (Number.isFinite(Number(part.clientDurationSeconds)) && Number(part.clientDurationSeconds) >= 0 ? Number(part.clientDurationSeconds) : null),
+      status: ['queued', 'processing', 'completed', 'failed', 'dropped'].includes(part.status) ? part.status : 'completed',
+      jobId: string(part.jobId, '', 128),
+      error: part.error && typeof part.error === 'object'
+        ? { code: string(part.error.code, '', 100), message: string(part.error.message, '', 2000) }
+        : null,
+      provider: string(part.provider, '', 40),
+      model: string(part.model, '', 100),
+      language: string(part.language, 'auto', 20),
+      translationLanguage: string(part.translationLanguage, '', 20),
+      transcript: Array.isArray(part.transcript) ? part.transcript.slice(0, 50000).map(seg => segment(seg, 'Speaker')) : [],
+      translations: Array.isArray(part.translations) ? part.translations.slice(0, 50000).map(seg => segment(seg, '')) : [],
+      duration: Number.isFinite(Number(part.duration)) ? Math.max(0, Number(part.duration)) : 0,
+      durationKind: ['audio-length', 'speech-end', 'none'].includes(part.durationKind) ? part.durationKind : 'unknown',
+      spanSeconds: Number.isFinite(Number(part.spanSeconds)) ? Math.max(0, Number(part.spanSeconds)) : 0,
+      offsetSeconds: Number.isFinite(Number(part.offsetSeconds)) ? Math.max(0, Number(part.offsetSeconds)) : 0,
+      usage: part.usage && typeof part.usage === 'object' ? part.usage : null,
+      addedAt: string(part.addedAt, new Date().toISOString(), 64)
+    };
+  },
+
+  // C6: an imported summaryPreset must be a well-formed snapshot (§3.3) or
+  // it is dropped entirely — BR-20's virtual-snapshot fallback then takes
+  // over at render time, so a malformed backup never crashes the app.
+  _sanitizeSummaryPreset(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    if (!Array.isArray(value.sections) || value.sections.length === 0) return null;
+
+    const string = (v, fallback = '', maxLength = 2000) => (typeof v === 'string' ? v.slice(0, maxLength) : fallback);
+    const sections = value.sections.slice(0, 10).map(section => {
+      if (!section || typeof section !== 'object') return null;
+      if (!['paragraph', 'bulletList', 'actionList'].includes(section.type)) return null;
+      return {
+        key: string(section.key, '', 40),
+        label: string(section.label, '', 60),
+        type: section.type,
+        hint: string(section.hint, '', 300)
+      };
+    }).filter(Boolean);
+    if (!sections.length) return null;
+
+    return {
+      presetId: typeof value.presetId === 'string' ? value.presetId.slice(0, 128) : null,
+      name: string(value.name, 'Preset', 60),
+      sections,
+      capturedAt: string(value.capturedAt, new Date().toISOString(), 64)
     };
   },
 
@@ -480,8 +661,25 @@ const Storage = {
         : this.DEFAULT_SETTINGS.sttProvider,
       sttModels: source.sttModels && typeof source.sttModels === 'object' && !Array.isArray(source.sttModels)
         ? source.sttModels
-        : {}
+        : {},
+      lastSummaryPresetId: typeof source.lastSummaryPresetId === 'string'
+        ? source.lastSummaryPresetId.slice(0, 128)
+        : '',
+      presetByMeetingType: this._sanitizePresetByMeetingType(source.presetByMeetingType)
     };
+  },
+
+  // BR-57.1 map: key must be a known meetingType code, value a preset id
+  // string. Malformed/unknown entries are dropped silently (§3.3).
+  _sanitizePresetByMeetingType(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+    const result = {};
+    for (const [code, presetId] of Object.entries(value)) {
+      if (typeof isKnownMeetingTypeCode === 'function' && !isKnownMeetingTypeCode(code)) continue;
+      if (code === '' || typeof presetId !== 'string' || !presetId) continue;
+      result[code] = presetId.slice(0, 128);
+    }
+    return result;
   },
 
   async clearAll() {

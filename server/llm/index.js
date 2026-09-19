@@ -8,9 +8,10 @@
 
 const { LLM_ERROR, llmError, tagProvider, withRetry } = require('./contracts');
 const {
-  PROMPT_VERSION, languageName,
-  buildSummaryPrompt, buildTitlePrompt, buildChunkPrompt, buildSynthesisPrompt
+  PROMPT_VERSION, languageName, CHUNK_PRINCIPLES,
+  buildContextBlock, buildSummaryPrompt, buildTitlePrompt, buildChunkPrompt, buildSynthesisPrompt
 } = require('./prompts');
+const { buildSummaryFormat } = require('./preset-schema');
 const { estimateTokens, inputBudget, chunkTranscript } = require('./transcript-budget');
 const { createCodexAdapter } = require('./providers/codex');
 const { createDeepSeekAdapter } = require('./providers/deepseek');
@@ -27,7 +28,11 @@ const SECRET_CONFIG = {
 // Long-transcript chunking guard rails.
 const MAX_CHUNKS = 40;            // beyond this, reduce step won't fit — fail clearly
 const MIN_CHUNK_TOKENS = 2000;    // floor so tiny budgets still make progress
-const CHUNK_SCAFFOLD_TOKENS = 2000; // reserve for chunk prompt template + output
+// Reserve for chunk prompt template + output. A preset's sections/instruction
+// grow the template itself, so the scaffold must grow with it (Architecture
+// §5.3 Protocol 8 audit — this constant was the one step that did NOT
+// generalize safely as-is for the preset variant).
+const CHUNK_SCAFFOLD_BASE_TOKENS = 2000;
 
 /**
  * @param {object} deps
@@ -35,6 +40,7 @@ const CHUNK_SCAFFOLD_TOKENS = 2000; // reserve for chunk prompt template + outpu
  * @param {Function} deps.resolveCodexBinary
  * @param {string} deps.summarySchemaFile
  * @param {string} deps.titleSchemaFile
+ * @param {string} [deps.tmpSchemaDir] absolute dir for per-request preset schema files (§6.1)
  * @param {number} deps.apiTimeoutMs
  * @param {number} deps.codexTimeoutMs
  * @param {{read:Function, write:Function, remove:Function}} deps.secretStore Keychain access
@@ -42,7 +48,7 @@ const CHUNK_SCAFFOLD_TOKENS = 2000; // reserve for chunk prompt template + outpu
  */
 function createLlmService(deps) {
   const {
-    runProcess, resolveCodexBinary, summarySchemaFile, titleSchemaFile,
+    runProcess, resolveCodexBinary, summarySchemaFile, titleSchemaFile, tmpSchemaDir,
     apiTimeoutMs, codexTimeoutMs, secretStore, getSettings
   } = deps;
 
@@ -56,7 +62,7 @@ function createLlmService(deps) {
   };
 
   const adapters = {
-    codex: createCodexAdapter({ runProcess, resolveCodexBinary, summarySchemaFile, titleSchemaFile, timeoutMs: codexTimeoutMs }),
+    codex: createCodexAdapter({ runProcess, resolveCodexBinary, summarySchemaFile, titleSchemaFile, tmpSchemaDir, timeoutMs: codexTimeoutMs }),
     deepseek: createDeepSeekAdapter({ getKey: makeGetKey('deepseek'), timeoutMs: apiTimeoutMs }),
     gemini: createGeminiAdapter({ getKey: makeGetKey('gemini'), timeoutMs: apiTimeoutMs })
   };
@@ -105,7 +111,7 @@ function createLlmService(deps) {
     return candidate && adapters[candidate] ? candidate : DEFAULT_PROVIDER;
   }
 
-  function buildGeneration(providerId, model, usage) {
+  function buildGeneration(providerId, model, usage, contextUsed) {
     return {
       provider: providerId,
       model,
@@ -113,21 +119,38 @@ function createLlmService(deps) {
       generatedAt: new Date().toISOString(),
       inputTokens: Number(usage?.inputTokens) || 0,
       outputTokens: Number(usage?.outputTokens) || 0,
-      estimatedCostUsd: null
+      estimatedCostUsd: null,
+      ...(contextUsed ? { contextUsed } : {})
     };
   }
 
   // Single-pass when the transcript fits the model budget, otherwise a
-  // map→reduce over time-ordered chunks. Returns { data, usage, model }.
+  // map→reduce over time-ordered chunks. Returns { data, usage, model, contextUsed }.
   // `outputLanguage` forces the summary language ('' = the meeting's language).
-  async function summarizeMeeting(adapter, model, meeting, outputLanguage) {
+  // `preset` is the full preset definition (§3.1) or null for the legacy
+  // static 5-field path (§4.2 backward compatibility).
+  async function summarizeMeeting(adapter, model, meeting, outputLanguage, preset = null) {
+    // G3 (Architecture §4.1): computed exactly ONCE per Generate call, then
+    // threaded into every prompt builder AND into contextUsed (BR-39) below —
+    // never recomputed inside a builder (WHY-6), so the provenance flag
+    // always matches what was actually sent.
+    const context = buildContextBlock(meeting);
+    const format = preset ? buildSummaryFormat(preset) : null;
+    // BR-38: the context block + mandatory principles are template text
+    // present in EVERY chunk prompt, same reasoning as `sectionsBlock`.
+    const scaffoldTokens = CHUNK_SCAFFOLD_BASE_TOKENS
+      + (format ? estimateTokens(format.sectionsBlock) : 0)
+      + estimateTokens(context.text)
+      + estimateTokens(CHUNK_PRINCIPLES);
+
     const budget = inputBudget(adapter.getModelSpec(model).contextWindow);
-    const fullPrompt = buildSummaryPrompt(meeting, outputLanguage);
+    const fullPrompt = buildSummaryPrompt(meeting, outputLanguage, preset, context);
     if (!budget || estimateTokens(fullPrompt) <= budget) {
-      return callAdapter(adapter, () => adapter.summarize({ prompt: fullPrompt, model }));
+      const result = await callAdapter(adapter, () => adapter.summarize({ prompt: fullPrompt, model, format }));
+      return { ...result, contextUsed: context.contextUsed };
     }
 
-    const maxChunkTokens = Math.max(MIN_CHUNK_TOKENS, budget - CHUNK_SCAFFOLD_TOKENS);
+    const maxChunkTokens = Math.max(MIN_CHUNK_TOKENS, budget - scaffoldTokens);
     const chunks = chunkTranscript(meeting.transcript, maxChunkTokens);
     if (chunks.length > MAX_CHUNKS) {
       throw llmError(LLM_ERROR.CONTEXT_TOO_LARGE, 'This transcript is too long for the selected model even after splitting. Choose a model with a larger context window.', { provider: adapter.id });
@@ -141,19 +164,19 @@ function createLlmService(deps) {
 
     const partials = [];
     for (let i = 0; i < chunks.length; i += 1) {
-      const prompt = buildChunkPrompt(meeting, chunks[i], i + 1, chunks.length, outputLanguage);
-      const result = await callAdapter(adapter, () => adapter.summarize({ prompt, model }));
+      const prompt = buildChunkPrompt(meeting, chunks[i], i + 1, chunks.length, outputLanguage, preset, context);
+      const result = await callAdapter(adapter, () => adapter.summarize({ prompt, model, format }));
       partials.push(result.data);
       addUsage(result);
     }
 
-    const synthesisPrompt = buildSynthesisPrompt(meeting, partials, outputLanguage);
+    const synthesisPrompt = buildSynthesisPrompt(meeting, partials, outputLanguage, preset, context);
     if (estimateTokens(synthesisPrompt) > budget) {
       throw llmError(LLM_ERROR.CONTEXT_TOO_LARGE, 'The meeting produced too many notes to consolidate for this model. Choose a model with a larger context window.', { provider: adapter.id });
     }
-    const finalResult = await callAdapter(adapter, () => adapter.summarize({ prompt: synthesisPrompt, model }));
+    const finalResult = await callAdapter(adapter, () => adapter.summarize({ prompt: synthesisPrompt, model, format }));
     addUsage(finalResult);
-    return { data: finalResult.data, usage, model };
+    return { data: finalResult.data, usage, model, contextUsed: context.contextUsed };
   }
 
   async function titleMeeting(adapter, model, meeting) {
@@ -173,12 +196,12 @@ function createLlmService(deps) {
     return { adapter, model };
   }
 
-  async function generateSummary({ providerId, modelId, meeting, language }) {
+  async function generateSummary({ providerId, modelId, meeting, language, preset = null }) {
     const { adapter, model } = await selection({ providerId, modelId });
     const outputLanguage = languageName(language);
     const result = await enqueue(adapter.id, () =>
-      summarizeMeeting(adapter, model, meeting, outputLanguage).catch(error => { throw tagProvider(error, adapter.id); }));
-    const generation = buildGeneration(adapter.id, model, result.usage);
+      summarizeMeeting(adapter, model, meeting, outputLanguage, preset).catch(error => { throw tagProvider(error, adapter.id); }));
+    const generation = buildGeneration(adapter.id, model, result.usage, result.contextUsed);
     generation.language = outputLanguage || 'auto';
     return { data: result.data, generation };
   }

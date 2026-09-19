@@ -264,3 +264,47 @@ test('startup recovery marks stuck processing jobs as failed', async () => {
     await cleanup();
   }
 });
+
+// TV15 (BR-98) — a meeting that already has a real transcript must reject a
+// fresh single-part "attach a file" submission instead of silently
+// overwriting it; a meeting that never succeeded (empty transcript, e.g. a
+// draft or a previously FAILED run) must still be resubmittable ("Thử lại").
+test('POST /api/import-transcription rejects a meeting that already has a transcript (BR-98), but allows retrying a meeting whose transcript is still empty', async () => {
+  await startServer();
+  try {
+    const withTranscriptId = 'test-has-transcript-' + Date.now();
+    const meetings = [{
+      id: withTranscriptId, title: 'Already done', status: 'completed',
+      transcript: [{ time: 0, speaker: 'Speaker 1', text: 'Already transcribed.' }],
+      translations: [], language: 'en',
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
+    }];
+    await fetch(`${BASE}/api/meetings`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(meetings) });
+    await fetch(`${BASE}/api/audio/${withTranscriptId}`, {
+      method: 'PUT', headers: { 'Content-Type': 'audio/webm' }, body: Buffer.from('fake-audio-data')
+    });
+
+    const rejected = await fetch(`${BASE}/api/import-transcription`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ meetingId: withTranscriptId })
+    });
+    assert.strictEqual(rejected.status, 409);
+    const rejectedBody = await rejected.json();
+    assert.strictEqual(rejectedBody.error.code, 'MEETING_ALREADY_HAS_TRANSCRIPT');
+
+    // Confirm nothing was mutated: transcript is exactly what it was before.
+    const afterR = await fetch(`${BASE}/api/data`);
+    const afterData = await afterR.json();
+    const afterMeeting = afterData.meetings.find(m => m.id === withTranscriptId);
+    assert.deepStrictEqual(afterMeeting.transcript, meetings[0].transcript);
+
+    // A draft/never-succeeded meeting (empty transcript) is unaffected.
+    const emptyTranscriptId = 'test-empty-transcript-' + Date.now();
+    await seedMeeting(emptyTranscriptId);
+    const allowed = await fetch(`${BASE}/api/import-transcription`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ meetingId: emptyTranscriptId })
+    });
+    assert.strictEqual(allowed.status, 201);
+  } finally {
+    await cleanup();
+  }
+});

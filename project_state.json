@@ -1,0 +1,86 @@
+{
+  "project_name": "MeetNote",
+  "phase": "development",
+  "team": [
+    "pm",
+    "ba",
+    "tech-lead",
+    "dev",
+    "reviewer",
+    "qa"
+  ],
+  "documents": {
+    "prd": "docs/PRD.md",
+    "architecture": "docs/Architecture.md",
+    "changelog": "docs/CHANGELOG.md",
+    "ux_import": "docs/ux-import-phone-recording.md",
+    "architecture_v3": "docs/Architecture.md §V (660-1443)"
+  },
+  "iterations": {
+    "dev_reviewer": 0,
+    "dev_qa": 0
+  },
+  "status": "in_progress",
+  "blockers": [],
+  "backlog": [
+    "T7-gate-smoke-test-codex-blocked-cli-not-installed-on-dev-machine",
+    "T8-gate-smoke-test-gemini-blocked-no-api-key-on-dev-machine",
+    "BR-15-stronger-warning-for-manually-edited-summary-no-edit-ui-exists-see-CHANGELOG-T13",
+    "BR-29-staleness-check-uses-meeting.updatedAt-not-a-dedicated-pre-meeting-edited-at-field-see-CHANGELOG-T3",
+    "U1-verify-tmp-rename-atomic-write-on-OneDrive-Windows-blocked-no-Windows-machine",
+    "U2-verify-explorer.exe-spawn-shell-false-on-Windows-blocks-T12-win32-branch",
+    "U3-verify-BR-63-notes-override-behavior-on-all-3-LLM-providers-QA-task",
+    "U4-measure-real-world-BR-35-notes-4000-char-and-BR-54-20000-segment-thresholds-QA-task",
+    "U5-measure-how-often-notes-push-a-single-pass-summary-into-map-reduce-QA-task",
+    "review-medium-1-toMarkdown-does-not-escape-title-notes-tags-that-contain-markdown-syntax-see-review-report-part-2",
+    "review-medium-2-and-low-see-review-report-part-2-for-details",
+    "US7-US12-dropdown-US13-tag-UI-verified-by-code-trace-only-no-browser-in-QA-env-recommend-re-verify-with-real-browser",
+    "incident-2026-09-18-qa-permanently-deleted-2-pre-existing-custom-presets-demo-thu-nghiem-and-rd-san-pham-during-BR-57-3-testing-no-backup-taken-storage-is-gitignored-so-unrecoverable-no-meeting-summary-was-affected-see-test-report-part-2",
+    "TV17-enable-opus-deepgram-blocked-U-V1-chua-chay-thu-that-can-key-deepgram",
+    "U-V7-blocks-closing-TV2-TV3-chua-co-API-key-that-de-chay-smoke-test-4-STT-provider-trong-moi-truong-dev-nay",
+    "TV5-deviation-POST-import-transcription-khong-them-R-S-whitelist-de-khong-vo-test-jobs.test.js-dung-invalid-test-provider-can-Tech-Lead-xac-nhan",
+    "TV6-deviation-POST-parts-provider-la-tra-404-thay-vi-400-nhu-Architecture-V6.2-de-dong-bo-voi-STATUS_BY_CODE-hien-co-can-Tech-Lead-xac-nhan",
+    "TV3-decision-FAI-10-gap-text-dung-elapsed-time-khong-phai-wall-clock-vi-buildMergedTranscript-chi-nhan-parts-khong-nhan-meeting.date-can-Tech-Lead-UX-xac-nhan-truoc-TV12-TV14",
+    "batch-1-TV1-TV8-cho-Reviewer-Protocol-7-chua-co-review-report-cho-batch-nay",
+    "batch-2-TV9-TV16-cho-Reviewer-Protocol-7-chua-co-review-report-cho-batch-nay-se-review-gop-ca-2-batch",
+    "TV16-U-V7-mot-phan-go-duoc-cho-soniox-deepgram-that-su-chay-that-tren-may-Dev-bang-key-that-tu-macOS-Keychain-con-whisper-google-van-chua-co-key-xem-CHANGELOG",
+    "E-V1-microcopy-hop-xac-nhan-tom-tat-khi-thieu-phan-la-text-Dev-tu-viet-chua-co-trong-UX-6-can-PM-UX-duyet-xem-CHANGELOG",
+    "E-V2-microcopy-ERR-02-app-limit-cho-3-provider-ngoai-Whisper-la-text-Dev-tu-viet-chua-co-trong-UX-6-can-PM-UX-duyet-xem-CHANGELOG",
+    "TV15-quyet-dinh-Dev-tu-dua-ra-server-chan-409-MEETING_ALREADY_HAS_TRANSCRIPT-khi-attach-vao-meeting-da-co-transcript-Architecture-khong-noi-ro-co-can-server-guard-hay-khong-xem-CHANGELOG",
+    "BR-106-quality-warning-chi-implement-o-muc-toan-bo-meeting-QLT-01-khong-lam-bien-the-per-part-QLT-02-do-gioi-han-thoi-gian-xem-CHANGELOG",
+    "TV18-review-reject-2-High-BR-121-Q9-thieu-UI-va-thieu-xac-nhan-bo-phan-giua-cum-la-gap-Architecture-Task-Breakdown-khong-tinh-Protocol-3-quota-da-fix-xem-CHANGELOG-TV18-cho-Reviewer-chay-lai",
+    "TV18-tu-quyet-Meeting-Detail-reorder-chi-co-nut-len-xuong-khong-co-keo-tha-appendPart-modal-header-tong-X-chi-tinh-file-moi-khong-tinh-ca-ban-ghi-IMP-27-hien-bang-toast-khong-phai-dong-goi-y-co-dinh-can-PM-UX-xac-nhan-xem-CHANGELOG"
+  ],
+  "current_feature": "import-phone-recording",
+  "prd_version": "3.0",
+  "architecture_version": "3.0",
+  "decisions_import_phone_recording": [
+    "transport: chi cai tien upload tren may, KHONG LAN/QR/watch-folder, giu baseline 127.0.0.1-only",
+    "scope: full pipeline BA -> Tech Lead -> Dev -> Reviewer -> QA, dung o 2 checkpoint Protocol 2",
+    "multi-file: ho tro ca 2 che do — nhieu ban ghi rieng (mac dinh) va ghep nhieu phan thanh 1 ban ghi",
+    "UI language: text moi cua luong import viet tieng Viet",
+    "pre-flight check dung luong/dinh dang truoc khi upload: IN SCOPE, duoc sua /api/stt/providers tra maxUploadBytes + mime list",
+    "sua date + participants o Meeting Detail card Pre-meeting info: IN SCOPE cho moi ban ghi",
+    "CHECKPOINT-1 PASSED 2026-09-18: user duyet PRD v3.0 + UX rev2, Tech Lead bat dau Architecture",
+    "R-AB: sua kem bug Google duration (dang tinh = start cua tu cuoi, khong phai thoi luong audio)",
+    "formats: duoc mo rong .opus/.3gp NEU Tech Lead verify that theo Protocol 5, khong hua truoc tren UI",
+    "Q9: cho phep them phan vao ban ghi ghep DA XONG, chen dung thu tu, summary cu khong tu sinh lai",
+    "OQ-10 PM resolved: giu BR-123 N phan = N job, 1 ban ghi hien ra ngay; KHONG ghep audio roi 1 job",
+    "Q10/Q11 dung mac dinh BA: cho tom tat ban ghi thieu phan (co xac nhan + provenance); toi da 10 phan, canh bao tu phan 6",
+    "CHECKPOINT-2 PASSED 2026-09-18: user duyet Architecture v3.0, Dev bat dau",
+    "E-V1: theo BR-135 — phan dang chay thi khoa Generate Summary; phan da loi/da bo thi cho tom tat kem xac nhan + provenance",
+    "E-V7: thu tu phan mac dinh = natural sort ten file (BR-119), lastModified chi la goi y phu",
+    "E-V3: KHONG bat .opus o v1 (chua chay thu that, Protocol 5) -> backlog TV17",
+    "E-V6 PM accepted: ban ghi Google cu giu duration sai, ghi Known issues, khong migrate",
+    "Bug co san sua kem: R-AB Google duration; LLM_API_TIMEOUT_MS 2 phut dung cho STT HTTP call; _sanitizeImportedMeeting lam roi sourceFilename"
+  ],
+  "side_fixes": [
+    {
+      "date": "2026-09-18",
+      "title": "stale-meeting-snapshot-breaks-BR-63-notes-override",
+      "file": "js/app.js",
+      "status": "fixed_and_reviewed",
+      "review": "APPROVE, docs/review-report.md"
+    }
+  ]
+}

@@ -32,6 +32,11 @@ const STATUS_BY_CODE = {
   [STT_ERROR.PROVIDER_UNAVAILABLE]: 502
 };
 
+// R-AC: distinguishes "this provider told us the real audio length" from
+// "we genuinely don't know" (gpt-4o-* always returns duration=0). Consumers
+// must never treat a missing/invalid value as 'audio-length'.
+const DURATION_KINDS = new Set(['audio-length', 'speech-end', 'none']);
+
 const RETRYABLE_CODES = new Set([
   STT_ERROR.RATE_LIMITED,
   STT_ERROR.TIMEOUT,
@@ -86,6 +91,7 @@ function normalizeResult(raw, provider) {
     transcript,
     translations: normalizeSegments(raw?.translations, 'Translation'),
     duration: Number.isFinite(Number(raw?.duration)) ? Math.max(0, Math.round(Number(raw.duration))) : 0,
+    durationKind: DURATION_KINDS.has(raw?.durationKind) ? raw.durationKind : 'unknown',
     model: typeof raw?.model === 'string' ? raw.model.slice(0, 100) : '',
     provider
   };
@@ -128,6 +134,7 @@ function groupWordsIntoSegments(words, translation = false) {
 module.exports = {
   STT_ERROR,
   RETRYABLE_CODES,
+  DURATION_KINDS,
   sttError,
   tagProvider,
   normalizeResult,

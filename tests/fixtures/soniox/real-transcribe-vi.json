@@ -1,0 +1,31 @@
+{
+  "_capturedAt": "2026-09-18",
+  "_capturedBy": "Dev, import-phone-recording batch 2, TV16 (Protocol 5.3/5.4)",
+  "_method": "Real Soniox API key already present in this dev machine's macOS Keychain (account soniox-api-key, never read/printed by this process). Generated a real ~4.93s Vietnamese speech WAV on-device via `say -v Linh -o sample.wav --data-format=LEI16@16000 \"Xin chao cac ban, hom nay chung ta hop de ban ve bao gia quy bon.\"`, started the real MeetNote server against a throwaway storage dir, PUT the wav to /api/audio/:id, POST /api/import-transcription with provider=soniox, polled /api/jobs/:id to completion. `raw` below is the exact object server/stt/providers/soniox.js's transcribe() returned (captured with a temporary one-line console dump inside server/stt/index.js's transcribe(), immediately reverted after capture — git diff confirmed clean).",
+  "input": {
+    "text": "Xin chào các bạn, hôm nay chúng ta họp để bàn về báo giá quý bốn.",
+    "voice": "Linh (vi_VN, macOS `say`)",
+    "sampleRateHz": 16000,
+    "durationSecondsApprox": 4.93,
+    "format": "wav"
+  },
+  "raw": {
+    "transcript": [
+      { "text": "Xin chào các bạn, hôm nay chúng ta họp để bàn về báo giá quý 4.", "time": 0.27, "speaker": "Speaker 1", "language": "vi" }
+    ],
+    "translations": [],
+    "duration": 5,
+    "durationKind": "audio-length",
+    "model": "stt-async-v5"
+  },
+  "expectedNormalized": {
+    "transcript": [
+      { "text": "Xin chào các bạn, hôm nay chúng ta họp để bàn về báo giá quý 4.", "time": 0.27, "speaker": "Speaker 1", "language": "vi" }
+    ],
+    "translations": [],
+    "duration": 5,
+    "durationKind": "audio-length",
+    "model": "stt-async-v5",
+    "provider": "soniox"
+  }
+}

@@ -21,6 +21,9 @@ dist/
 storage/*
 !storage/README.md
 
+# Per-request preset schema files for the Codex CLI (§6.1, WHY-7).
+schemas/.tmp/
+
 # Secrets and local configuration
 .env
 .env.*

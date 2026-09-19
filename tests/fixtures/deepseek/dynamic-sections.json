@@ -1,0 +1,22 @@
+{
+  "_source": "Real HTTP 200 response from POST /api/summary (this MeetNote server), provider=deepseek, model=deepseek-chat, captured 2026-09-17T21:11:43.888Z by PM. Preset used had 3 sections (context/paragraph, risks/bulletList, followUps/actionList). See docs/CHANGELOG.md for the full replacement note (Protocol 5.3 fix, 2026-09-18).",
+  "_rawDerivation": "`/api/summary` returns the already-normalized {context, risks, followUps} object, not DeepSeek's raw HTTP bytes (the raw response text lives only inside the provider adapter, not in the API response). Because DeepSeek is called with response_format=json_object, its raw response text is exactly the JSON object of the 3 section values with no wrapper — so `raw` below is JSON.stringify of the real captured {context, risks, followUps} values, byte-identical in content to what DeepSeek returned. No field value was invented or altered.",
+  "preset": {
+    "id": "615f2eab-6ddb-4183-8d62-51431101a19d",
+    "instruction": "",
+    "sections": [
+      { "key": "context", "label": "Context", "type": "paragraph", "hint": "Brief context of the discussion" },
+      { "key": "risks", "label": "Risks", "type": "bulletList", "hint": "Key risks mentioned" },
+      { "key": "followUps", "label": "Follow ups", "type": "actionList", "hint": "Concrete follow-up tasks with owner if mentioned" }
+    ]
+  },
+  "raw": "{\"context\":\"Alex and Jamie met to decide on the pilot rollout timeline for the new client dashboard. They agreed to push the pilot start to Friday, September 25th to allow time for load testing of the staging environment.\",\"risks\":[\"The staging environment has not been load tested yet, which could cause downtime during the pilot.\"],\"followUps\":[{\"text\":\"Own the load testing task and report back\",\"assignee\":\"Jamie\",\"dueDate\":\"Wednesday\"},{\"text\":\"Draft the rollback plan in case something goes wrong during the pilot\",\"assignee\":\"Alex\",\"dueDate\":\"\"}]}",
+  "expected": {
+    "context": "Alex and Jamie met to decide on the pilot rollout timeline for the new client dashboard. They agreed to push the pilot start to Friday, September 25th to allow time for load testing of the staging environment.",
+    "risks": ["The staging environment has not been load tested yet, which could cause downtime during the pilot."],
+    "followUps": [
+      { "text": "Own the load testing task and report back", "assignee": "Jamie", "dueDate": "Wednesday" },
+      { "text": "Draft the rollback plan in case something goes wrong during the pilot", "assignee": "Alex", "dueDate": "" }
+    ]
+  }
+}

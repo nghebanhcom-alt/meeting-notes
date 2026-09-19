@@ -56,7 +56,10 @@ function createDeepSeekAdapter(deps) {
 
   // Shared call path for summary + title on an already-built prompt.
   // Returns { data, usage, model }. Budget is enforced by the service.
-  async function run({ prompt, model, normalize }) {
+  // DeepSeek never enforces a schema (§6.3) — `format.normalize` (when
+  // present) is the entire structural contract for a preset's sections.
+  async function run({ prompt, model, normalize, format }) {
+    if (format) normalize = format.normalize;
     const key = await requireKey();
     const spec = modelSpec(model);
 
@@ -116,7 +119,7 @@ function createDeepSeekAdapter(deps) {
     listModels,
     getModelSpec,
     testConnection,
-    summarize: ({ prompt, model }) => run({ prompt, model, normalize: normalizeSummary }),
+    summarize: ({ prompt, model, format }) => run({ prompt, model, normalize: normalizeSummary, format }),
     title: ({ prompt, model }) => run({ prompt, model, normalize: normalizeTitle })
   };
 }

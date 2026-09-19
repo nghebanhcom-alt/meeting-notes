@@ -8,6 +8,7 @@
 
 const { STT_ERROR, sttError } = require('../contracts');
 const { fetchWithTimeout, httpErrorFor } = require('./http');
+const { PROVIDER_FORMATS } = require('../formats');
 
 const ENDPOINT = 'https://api.openai.com/v1/audio/transcriptions';
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024; // OpenAI hard limit
@@ -118,11 +119,23 @@ function createWhisperAdapter(deps) {
       transcript,
       translations: [],
       duration: Number(body?.duration) || 0,
+      // whisper-1 returns verbose_json with a real `duration` (audio length).
+      // gpt-4o-*  return plain text, `duration` is always 0 — that 0 must never
+      // be read as "silent audio" (R-AC), only as "we don't know".
+      durationKind: spec.verbose ? 'audio-length' : 'none',
       model: spec.id
     };
   }
 
-  return { id, name: 'OpenAI Whisper', kind: 'api', needsKey: true, supportsTranslation: false, maxUploadBytes: MAX_UPLOAD_BYTES, getStatus, listModels, testConnection, transcribe };
+  function durationKindFor(model) {
+    return modelSpec(model).verbose ? 'audio-length' : 'none';
+  }
+
+  return {
+    id, name: 'OpenAI Whisper', kind: 'api', needsKey: true, supportsTranslation: false,
+    maxUploadBytes: MAX_UPLOAD_BYTES, formats: PROVIDER_FORMATS.whisper,
+    getStatus, listModels, testConnection, transcribe, durationKindFor
+  };
 }
 
 module.exports = { createWhisperAdapter, MODELS };

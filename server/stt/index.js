@@ -5,7 +5,7 @@
    (Live streaming stays in the browser transcriber.)
    ============================================ */
 
-const { STT_ERROR, sttError, tagProvider, normalizeResult } = require('./contracts');
+const { STT_ERROR, sttError, tagProvider, normalizeResult, DURATION_KINDS } = require('./contracts');
 const { createSonioxAdapter } = require('./providers/soniox');
 const { createDeepgramAdapter } = require('./providers/deepgram');
 const { createWhisperAdapter } = require('./providers/whisper');
@@ -56,6 +56,20 @@ function createSttService(deps) {
     return job;
   }
 
+  // R-S: server-side whitelist check used by routes that create a job
+  // (POST /api/meetings/:id/parts) so a client can never queue work against an
+  // unknown provider/model. Synchronous and side-effect free — no key lookup.
+  function validateSelection(providerId, modelId) {
+    const adapter = getAdapter(providerId);
+    if (modelId) {
+      const ids = adapter.listModels().map(model => model.id);
+      if (!ids.includes(modelId)) {
+        throw sttError(STT_ERROR.MODEL_NOT_SUPPORTED, `Model "${modelId}" is not supported for ${adapter.name}.`, { provider: adapter.id });
+      }
+    }
+    return adapter;
+  }
+
   function getAdapter(providerId) {
     const adapter = adapters[providerId];
     if (!adapter) {
@@ -103,7 +117,16 @@ function createSttService(deps) {
       adapter.transcribe({ audio, language, translationLanguage, model })
         .catch(error => { throw tagProvider(error, adapter.id); }));
 
-    return normalizeResult(raw, adapter.id);
+    const normalized = normalizeResult(raw, adapter.id);
+    // Protocol 8.3: ask the adapter's own declared capability rather than
+    // trusting every adapter to echo `durationKind` correctly in its raw
+    // result — one place decides, adapters just answer "what kind of number
+    // is this for this model" (R-AC/WHY-V5).
+    if (typeof adapter.durationKindFor === 'function') {
+      const kind = adapter.durationKindFor(model);
+      if (DURATION_KINDS.has(kind)) normalized.durationKind = kind;
+    }
+    return normalized;
   }
 
   async function listProviders() {
@@ -124,7 +147,16 @@ function createSttService(deps) {
         configured: Boolean(status.configured),
         available: Boolean(status.available),
         state: status.state || (status.available ? 'ready' : 'setup_required'),
+        // R-AE: built from an explicit field whitelist, same as every other
+        // field here — never spread `status`/`adapter` (that would leak
+        // whatever a future adapter change puts on those objects, keys
+        // included). Test asserts the body never contains a live API key.
         message: status.message || '',
+        // BR-141: read straight off the adapter — the exact value
+        // `stt.transcribe` enforces (server/stt/index.js above) and the exact
+        // table `server/stt/providers/*.js` declare via `../formats`.
+        maxUploadBytes: Number(adapter.maxUploadBytes) || 0,
+        formats: adapter.formats || { accepted: [], legacy: [], rejected: [], sourceVerified: false },
         models: adapter.listModels(),
         selectedModel: resolveModel(adapter, settings?.sttModels?.[adapter.id], settings)
       };
@@ -170,7 +202,7 @@ function createSttService(deps) {
     }
   }
 
-  return { transcribe, listProviders, saveKey, removeKey, testConnection, temporaryKey };
+  return { transcribe, listProviders, saveKey, removeKey, testConnection, temporaryKey, validateSelection };
 }
 
 module.exports = { createSttService, DEFAULT_PROVIDER, SECRET_CONFIG };

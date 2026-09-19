@@ -143,9 +143,15 @@ const Recorder = {
         'audio/mp4'
       ].find(type => MediaRecorder.isTypeSupported(type));
 
-      this.mediaRecorder = supportedMimeType
-        ? new MediaRecorder(recordingStream, { mimeType: supportedMimeType })
-        : new MediaRecorder(recordingStream);
+      // Speech-only content: Opus stays fully intelligible far below the
+      // browser's ~128kbps default (VoIP calls run at 16-32kbps). Cuts
+      // storage ~4x. [CHƯA VERIFY — Protocol 5]: chưa đo tác động thật lên
+      // độ chính xác của 4 STT provider ở bitrate này, cần chạy thử trước
+      // khi coi đây là mặc định chính thức.
+      const recorderOptions = { audioBitsPerSecond: 32000 };
+      if (supportedMimeType) recorderOptions.mimeType = supportedMimeType;
+
+      this.mediaRecorder = new MediaRecorder(recordingStream, recorderOptions);
 
       this.mediaRecorder.ondataavailable = (e) => {
         if (e.data.size > 0) {

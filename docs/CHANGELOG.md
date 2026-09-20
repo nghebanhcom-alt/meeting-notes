@@ -1449,3 +1449,136 @@ touched by this round.
   point.
 - Not re-claiming "fixed"/"done" for the feature as a whole — Reviewer and QA still need to run
   their own passes per Protocol 7.
+
+## 2026-09-20 — Fix DeepSeek summary generation failing with "unreadable summary" on long/preset-heavy meetings
+
+Bug report (user): `POST /api/summary` with provider=DeepSeek and the built-in "Brainstorming"
+preset failed with `Failed to generate summary: The provider returned an unreadable summary.`
+on the user's real "University dashboard" meeting (955 transcript segments).
+
+### Root cause (verified against the real DeepSeek API, Protocol 5.1/5.3 — not guessed)
+- Re-built the exact prompt this app sends (real preset + real transcript, via
+  `buildSummaryPrompt`/`buildContextBlock`/`instantiateBuiltIns`) and POSTed it directly to
+  `https://api.deepseek.com/chat/completions` with this dev machine's real DeepSeek key
+  (macOS Keychain, `meetnote-local`/`deepseek-api-key`) — same request shape
+  `server/llm/providers/deepseek.js` sends, `max_tokens` omitted (pre-fix code).
+- Result: `finish_reason: "length"`, `completion_tokens: 8192` exactly — DeepSeek's documented
+  default `max_tokens` for non-thinking mode (verified via `api-docs.deepseek.com`,
+  2026-09-20: "When not set, the default is 8K in non-thinking mode"). The response body was
+  valid JSON syntax cut off mid-string, so `parseJsonLoose` (server/llm/contracts.js) correctly
+  returned `null` and `preset-schema.js`/`contracts.js` correctly reported
+  `LLM_INVALID_OUTPUT` — the error code path was working as designed, the request just never
+  asked DeepSeek for enough output.
+- Confirmed the fix by re-running the same real request with an explicit higher `max_tokens`:
+  the Brainstorming preset's "toàn bộ ý tưởng" (preserve every idea) instruction on this
+  meeting genuinely needed ~26-27K completion tokens (`finish_reason: "stop"`, valid JSON, all
+  6 preset sections populated, one run captured 398 ideas in `toanBoYTuong`) — far above
+  DeepSeek's 8192-token default, so this was never going to self-resolve via the existing
+  one-shot repair retry in `withRepair` (server/llm/contracts.js), which reuses the same
+  (unset) `max_tokens` and would hit the identical cap again.
+- `transcript-budget.js` already reserves ~30% of a model's context window for "prompt
+  scaffolding + output" (`INPUT_BUDGET_RATIO`) when deciding single-pass vs. map-reduce, but
+  that reserved headroom was never actually communicated to the DeepSeek HTTP request — the
+  adapter had no `max_tokens` in its request body at all (Codex/Gemini adapters weren't
+  checked/touched; this fix is scoped to the reported DeepSeek bug only — see Known issues).
+
+### Fixed — `server/llm/providers/deepseek.js`
+- The real summarize/title call (`run()`) now sends an explicit `max_tokens: Math.floor(spec.contextWindow / 2)`
+  (32768 for both `deepseek-chat` and `deepseek-reasoner`, whose declared `contextWindow` is
+  65536) instead of relying on DeepSeek's own low default. Verified real: after this change,
+  the same real "University dashboard" + Brainstorming request that previously truncated at
+  8192 tokens completed normally (`finish_reason: "stop"`) using ~25-27K tokens, comfortably
+  under the new 32768 cap and under `LLM_API_TIMEOUT_MS` (2 min; the real call took ~95s).
+  Verified separately that an intentionally oversized `max_tokens` (60000, i.e.
+  `prompt_tokens + max_tokens` exceeding the declared 65536 context window) does **not** error
+  — DeepSeek just stops naturally at `finish_reason: "stop"` — so this fixed value carries no
+  new risk of a spurious 400 for large prompts.
+- `finish_reason === 'length'` on any DeepSeek call (first attempt or the one repair retry) is
+  now detected explicitly and raised as its own `LLM_INVALID_OUTPUT` error with a message that
+  says the response was cut off and suggests Regenerate or a lighter preset — instead of
+  silently handing the truncated text to `normalize()`, which could only ever report the
+  generic "unreadable summary" message with no hint at the actual cause. Also logs
+  `[deepseek.output_truncated]` (model/maxTokens/completionTokens, no meeting content) via
+  `console.warn` for future diagnosis, matching the existing I/O-light logging convention in
+  `preset-schema.js` (§7) rather than wiring in file-backed `logEvent` from inside
+  `server/llm/providers/`.
+
+### Test suite — `test/deepseek-provider.test.js` (new)
+- This provider previously had **zero** automated tests (Codex/Gemini also have none — flagged
+  below, not fixed here). Added, using synthetic dummy meeting content only — the real
+  "University dashboard" meeting used for root-cause reproduction is the user's own private
+  data and was **not** committed to fixtures/tests:
+  - Mocked-`fetch` unit test: asserts the outgoing request body now carries
+    `max_tokens: 32768` for `deepseek-chat`.
+  - Mocked-`fetch` unit test: a `finish_reason: "length"` response (synthetic truncated JSON,
+    same shape as the real captured truncation, not the real content) raises the new
+    cut-off-specific error, not a generic one.
+  - Real smoke test (Protocol 5.4): a small synthetic 2-line meeting through the real DeepSeek
+    API, skipped with a clear reason when no key is available (same skip convention as
+    `test/stt-golden.test.js`).
+- `npm test`: 242 passing (239 pre-existing + 3 new), 2 skipped (pre-existing Whisper/Google,
+  unrelated to this fix), 0 failing.
+
+### Known issues / flagged, not fixed here (out of scope for this bug report)
+- **Gemini's adapter (`server/llm/providers/gemini.js`) has the same shape of gap**: its real
+  `generateContent` call sets `responseSchema` but no `generationConfig.maxOutputTokens`
+  (only the `testConnection` ping sets `maxOutputTokens: 1`). Not verified whether Gemini's
+  own default is generous enough to avoid the same failure mode — flagging per Protocol 8
+  ("bước cũ đã chạy ổn từ trước dễ bị bỏ qua audit hơn") rather than fixing on
+  the strength of an unverified guess.
+- `server/llm/transcript-budget.js`'s `estimateTokens` (3.5 chars/token) under-counted the real
+  DeepSeek `prompt_tokens` for the repro meeting by ~47% (24182 estimated vs. 35638 real,
+  per DeepSeek's own reported `usage.prompt_tokens`). This didn't cause today's bug (the
+  single-pass budget check still passed correctly either way for this meeting), but it means
+  `inputBudget()`'s single-pass/map-reduce threshold and the `MAX_CHUNKS` guard are working
+  off an optimistic estimate for Vietnamese-heavy transcripts on at least this provider —
+  worth a dedicated Tech Lead-verified pass across all 3 providers, not folded into this fix.
+- `MODELS` in `deepseek.js` lists `deepseek-chat`/`deepseek-reasoner`; a docs fetch today
+  (api-docs.deepseek.com, 2026-09-20) referenced `deepseek-flash`/`deepseek-v4-pro` in its
+  `max_tokens` parameter description, suggesting DeepSeek's public model lineup may have moved
+  on. Both `deepseek-chat` and `deepseek-reasoner` still answered real requests successfully
+  today, so this is not blocking, but the model allowlist should get a real Protocol 5
+  verification pass rather than being assumed current.
+
+### Reviewed (Protocol 7)
+- See `docs/review-report.md` (append below this entry).
+
+### Dev↔Reviewer round 1 fixes (Protocol 3, 1/3 rounds used)
+Reviewer returned REQUEST_CHANGES (no Critical, 3 High + 1 Medium). Addressed all 4 in this
+same session before re-requesting review:
+- **High — wasted repair retry on truncation**: the new truncation error used
+  `LLM_ERROR.INVALID_OUTPUT`, which `withRepair` (server/llm/contracts.js) always retries once
+  — for a real length-cutoff, the retry reuses the same `max_tokens` and would truncate again,
+  silently doubling latency/cost before the user ever sees the error. Added a generic
+  `skipRepair` flag to `llmError()`'s meta (contracts.js) — not DeepSeek-specific, any provider
+  can opt an INVALID_OUTPUT error out of the one-shot repair — and `withRepair` now rethrows
+  immediately when a caught error sets it. `deepseek.js`'s truncation error sets
+  `skipRepair: true`. New test asserts exactly 1 `fetch` call for a truncated response (was
+  unverified before — the 2 original unit tests never counted calls).
+- **High — `deepseek-reasoner` never verified**: the fix applied the same
+  `Math.floor(contextWindow / 2)` override to both models, but only `deepseek-chat` was ever
+  real-call-verified. Worse: `api-docs.deepseek.com`'s documented **default** for thinking mode
+  is 64K tokens — already *above* the 32768 half-window value this fix would have forced,
+  meaning the original fix could have made `deepseek-reasoner` strictly worse (a lower cap than
+  its own default) while fixing `deepseek-chat`. Scoped the override to
+  `spec.id === 'deepseek-chat'` only; `deepseek-reasoner` keeps requesting DeepSeek's own
+  default, unchanged from before this fix. New test asserts `max_tokens` is `undefined` in the
+  request body for `deepseek-reasoner`.
+- **High — ambiguous test placeholder string**: `test/deepseek-provider.test.js`'s
+  finish_reason test used the mock content `'{"summary":"ok","keyPoints":["a","b September lo'`
+  — Reviewer couldn't rule out from reading the code alone whether "September" was an
+  accidental leak of real meeting content. Confirmed directly: it was not (typed as filler,
+  not copied from any capture script or fixture) — but the string was a bad choice regardless,
+  since it's genuinely ambiguous to a reader with no more context than the diff. Replaced with
+  an unambiguous placeholder (`"placeholder-item-one"`, `"placeholder-item-tw` cut mid-word)
+  and a comment stating directly that this file contains no real meeting content anywhere.
+- **Medium — misleading comment**: the original comment claimed the `contextWindow / 2` value
+  "match[ed]" `transcript-budget.js`'s `INPUT_BUDGET_RATIO` (0.7 input / ~0.3 output), but 0.5
+  ≠ 0.3. Rewrote the comment to state the actual reasoning: the ~30% reserve implied by
+  `INPUT_BUDGET_RATIO` (~19.7K tokens for a 65536-token window) was itself measured as
+  insufficient during real-call verification (actual need was ~26-27K tokens), so half the
+  window was chosen deliberately as more generous than that reserve, not as an equal match to it.
+
+`npm test` after round 1 fixes: 245 total, 243 passing (241 pre-existing + 4 new in
+`test/deepseek-provider.test.js`, up from 3 — added the `deepseek-reasoner` non-override test
+and the fetch-call-count assertion), 2 skipped (pre-existing, unrelated), 0 failing.

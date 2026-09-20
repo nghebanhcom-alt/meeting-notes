@@ -1381,3 +1381,187 @@ N/A — cả 4 fix đều là logic thuần phía client (không gọi STT/LLM p
   tin cậy) — đã tự đọc kỹ dòng render, không chỉ tin lời Dev báo "đã sửa ở `_renderMultiPartSection`".
 - CHANGELOG minh bạch 2 điểm tự quyết (partial-save khi date invalid, tạo file mới thay vì inline)
   kèm lý do rõ ràng — giảm thời gian review vì không phải đoán Dev có cân nhắc case đó chưa.
+
+# Review Report — 2026-09-20 (DeepSeek "unreadable summary" on long/Brainstorming meetings)
+
+## Verdict: REQUEST_CHANGES
+
+Root cause verification (Protocol 5) đạt chuẩn — PM tái hiện bằng real call thật tới
+`api.deepseek.com`, bắt đúng `finish_reason: "length"` + `completion_tokens: 8192` khớp default
+docs, và verify lại fix bằng real call thứ hai (`finish_reason: "stop"`, đủ 6 section). Không có
+issue Critical (không đụng baseline bảo mật 4 mục — không có endpoint mới, không đụng key/keychain,
+không có filesystem path từ input client, không có `child_process`). Nhưng có 1 issue High về logic
+(đã trace bằng tay qua `contracts.js`, không suy đoán) và 1 issue High cần Dev xác nhận trực tiếp
+(không thể tự kết luận chỉ bằng đọc code) trước khi APPROVE.
+
+## Issues Found
+
+### High
+- [ ] `server/llm/providers/deepseek.js:110-117` + `server/llm/contracts.js:159-177` (`withRepair`) —
+  Lỗi truncation được throw bằng đúng `LLM_ERROR.INVALID_OUTPUT`. Nhưng `withRepair` bắt lỗi ở dòng
+  164-165: `if (error.llmCode && error.llmCode !== LLM_ERROR.INVALID_OUTPUT) throw error;` — nghĩa
+  là **mọi** lỗi mang code `INVALID_OUTPUT` (kể cả lỗi truncation mới thêm) đều rơi xuống nhánh
+  "repair" và kích hoạt gọi lại `callModel(repairHint)` — tức 1 lần gọi API thật thứ hai, với đúng
+  `max_tokens` cũ (không giảm nội dung cần sinh) và chỉ thêm prompt xin sửa JSON hợp lệ. Với 1 case
+  bị cắt do vượt token budget, repair hint hoàn toàn không có tác dụng khắc phục (không giảm được số
+  ý tưởng cần giữ) → gần như chắc chắn bị cắt lần 2, ném đúng lỗi "cut short" ra ngoài — kết quả cuối
+  đúng, nhưng người dùng phải chờ thêm 1 lượt gọi DeepSeek thật đầy đủ (case repro gốc mất ~95s/lượt
+  → gần gấp đôi latency) và tốn thêm ~đầy `max_tokens` token trả phí, một cách âm thầm, không log,
+  không có trong CHANGELOG. Điều này ngược lại đúng tinh thần entry CHANGELOG tự mô tả ("Surface
+  truncation as its own clear error instead of letting cut-off JSON fall through") — lỗi có "rõ" hơn
+  nhưng chưa "sớm" hơn ở case thực sự vượt 32768 token output.
+  2 unit test mới **không** phát hiện được gap này vì mock `global.fetch` không đếm số lần gọi (test
+  ở dòng 71-92 chỉ assert lỗi cuối cùng đúng code/message, không assert `fetch` được gọi bao nhiêu
+  lần) — nên test xanh dù có 1 hay 2 lượt gọi thật.
+  → **Gợi ý sửa**: cho lỗi truncation bỏ qua nhánh repair của `withRepair` — ví dụ thêm 1 field kiểu
+  `error.skipRepair = true` khi throw ở `deepseek.js`, và sửa điều kiện ở `contracts.js:165` thành
+  `if (error.llmCode && (error.llmCode !== LLM_ERROR.INVALID_OUTPUT || error.skipRepair)) throw
+  error;` (không cần thêm `LLM_ERROR` code mới, giữ nguyên status/retryable hiện có). Thêm 1 test
+  đếm số lần `fetch` được gọi cho case `finish_reason: 'length'` để khoá lại hành vi "chỉ 1 lượt gọi
+  thật khi chắc chắn không thể phục hồi bằng repair".
+
+- [ ] `server/llm/providers/deepseek.js:16-17` (MODELS, `deepseek-reasoner`) — Fix áp dụng
+  `max_tokens = Math.floor(spec.contextWindow / 2)` đồng nhất cho cả `deepseek-chat` và
+  `deepseek-reasoner`, nhưng theo đúng bối cảnh PM cung cấp, việc verify bằng real call **chỉ** chạy
+  trên `deepseek-chat` — `deepseek-reasoner` (thinking mode) chưa được verify riêng, kể cả smoke test
+  mới (`test/deepseek-provider.test.js:97-113`) cũng chỉ gọi `model: 'deepseek-chat'`. Các model dạng
+  "reasoning" ở nhiều provider khác (OpenAI o-series, v.v.) thường có ngân sách token riêng cho
+  reasoning/thinking tách khỏi `max_tokens` của phần completion hiển thị — chưa có nguồn xác thực nào
+  (đọc doc thật hoặc gọi thật) xác nhận DeepSeek Reasoner có cùng hành vi `max_tokens`/`finish_reason`
+  như `deepseek-chat` hay không. Đây không hẳn vi phạm Process gate (không có Architecture.md nào ghi
+  `[UNVERIFIED]` cho case này vì đây là bugfix, không qua bước Tech Lead), nhưng là 1 external-contract
+  claim chưa verify đang được áp dụng âm thầm vào code thật cho 1 model thật user có thể chọn — đúng
+  loại rủi ro Protocol 5 muốn chặn. Mục "Known issues" trong CHANGELOG entry hiện có ghi rõ gap tương
+  tự cho Gemini nhưng **không** ghi gap này cho `deepseek-reasoner`, dù nó nằm trong đúng phạm vi file
+  vừa sửa.
+  → **Gợi ý sửa**: tối thiểu thêm 1 dòng vào mục "Known issues" của CHANGENLOG entry này ghi rõ
+  `deepseek-reasoner` chưa được verify riêng cho hành vi `max_tokens`/`finish_reason`. Tốt hơn: chạy
+  1 real call thật với `model: 'deepseek-reasoner'` (có thể dùng lại API key hiện có) để xác nhận
+  cùng hành vi trước khi coi fix áp dụng an toàn cho cả 2 model.
+
+- [ ] `test/deepseek-provider.test.js:78` — Chuỗi mock dùng để giả lập JSON bị cắt cụt:
+  `'{"summary":"ok","keyPoints":["a","b September lo'` — comment ngay phía trên khẳng định "matching
+  the SHAPE of the real captured truncation... without reusing any real user content", nhưng cụm
+  `"b September lo"` không giống filler ngẫu nhiên thông thường (vd `"idea-1"`, `"idea-2"`) — nó đọc
+  như 1 mảnh câu tiếng Anh bị cắt giữa chừng, và "September" là loại từ dễ xuất hiện trong nội dung
+  cuộc họp thật (ngày tháng). Không thể tự kết luận đây có phải mảnh nội dung thật bị dán nhầm vào
+  hay không chỉ bằng cách đọc code — cần Dev xác nhận trực tiếp nguồn gốc chuỗi này. Rủi ro nếu đúng
+  là nội dung thật: vi phạm chính cam kết CHANGELOG tự đặt ra ("real meeting content... NOT committed
+  here") và commit dữ liệu riêng tư của user thật vào git.
+  → **Gợi ý sửa**: Dev xác nhận rõ chuỗi này là gõ tay 100% (không copy-paste từ output thật), và đổi
+  sang 1 placeholder rõ ràng là giả (vd `"idea one","idea two","unterminated str`) để không còn nghi
+  ngờ, dù giữ nguyên chức năng test (JSON cú pháp không hợp lệ, cắt giữa mảng).
+
+### Medium
+- [ ] `server/llm/providers/deepseek.js:74-77` (comment) — Comment giải thích lý do chọn
+  `Math.floor(spec.contextWindow / 2)` viết: "matching the output headroom transcript-budget.js
+  already reserves (INPUT_BUDGET_RATIO)". Đã đọc `server/llm/transcript-budget.js:14`:
+  `INPUT_BUDGET_RATIO = 0.7` — nghĩa là input được phép dùng tới 70% context window, output headroom
+  giả định bởi `inputBudget()` chỉ là ~30% (~19660 token cho model 65536), **không phải 50%** như
+  comment khẳng định "matching". Comment hiện tại gây hiểu lầm rằng 2 con số đến từ cùng 1 ngân sách
+  nhất quán trong khi thực tế không phải — dễ khiến người đọc sau này tưởng đã có 1 invariant được
+  giữ (`input + output <= contextWindow`) trong khi thực tế input tối đa (45875 token, ứng với 70%)
+  cộng output tối đa mới (32768 token, 50%) có thể cộng lại vượt `contextWindow` khai báo (65536) tới
+  ~13107 token trong trường hợp xấu nhất. PM đã verify thực tế 1 case (`prompt_tokens=35638` +
+  `max_tokens=60000`) không lỗi 400, nên rủi ro vận hành có vẻ thấp, nhưng đó là câu trả lời cho "có
+  lỗi không", không phải "comment có đúng không".
+  → **Gợi ý sửa**: sửa lại comment cho khớp thực tế (ví dụ: "chosen as a generous fixed fraction,
+  independent of transcript-budget.js's INPUT_BUDGET_RATIO — verified in practice not to trigger a
+  400 even when prompt + max_tokens exceeds the declared contextWindow, see CHANGELOG") thay vì dùng
+  từ "matching" cho 2 con số không khớp nhau.
+
+## External contract verification
+YES (nguồn: real call thật tới `https://api.deepseek.com/chat/completions` bằng key thật từ macOS
+Keychain, cả trước và sau fix, cho model `deepseek-chat` — xác nhận `finish_reason`/`completion_tokens`
+đúng như PM mô tả, đối chiếu thêm với `api-docs.deepseek.com` 2026-09-20 cho default `max_tokens`
+8K. Riêng `deepseek-reasoner`: NO — chưa có real call nào verify riêng, xem issue High ở trên.)
+
+## Positive Notes
+- Root cause được xác nhận bằng real call thật (đúng Protocol 5), không đoán từ tên field hay suy
+  luận lý thuyết — trích dẫn cụ thể `finish_reason`/`completion_tokens` khớp chính xác con số default
+  8192, là bằng chứng mạnh, không phải correlation ngẫu nhiên.
+- `console.warn('[deepseek.output_truncated] ...')` đã tự kiểm tra lại dòng code thật
+  (`server/llm/providers/deepseek.js:111`): chỉ log `model`/`maxTokens`/`completionTokens`, không có
+  biến nào chứa nội dung cuộc họp/transcript/prompt — xác nhận đúng như PM khẳng định, không phải tin
+  theo lời khai. Format cũng khớp đúng convention log hiện có (`[summary.unknown_key] ...` trong
+  `preset-schema.js` §7) — không tự chế 1 kiểu logging mới.
+- Giá trị `max_tokens` mới không gây lỗi 400 mới: PM đã tự verify bằng real call với `max_tokens`
+  lớn hơn nhiều headroom còn lại (60000) — đúng kỷ luật kiểm chứng thay vì để lại rủi ro tiềm ẩn chưa
+  biết.
+- CHANGENLOG entry rất đầy đủ: có "Known issues" chủ động flag gap chưa xử lý ở Gemini
+  (`server/llm/providers/gemini.js`) theo đúng tinh thần Protocol 8 thay vì im lặng bỏ qua — chỉ thiếu
+  đúng 1 gap tương tự cho `deepseek-reasoner` như đã nêu ở issue High.
+  Không đụng vào Codex/Gemini dù về mặt kỹ thuật có thể tiện tay sửa luôn — giữ đúng phạm vi bug report
+  gốc.
+- Test mới không viết mock tuỳ tiện: comment tự giải thích rõ mocked response shape dựa trên contract
+  OpenAI-compatible codebase đã dùng sẵn (`body?.choices?.[0]`), không phải claim mới về DeepSeek —
+  đúng tinh thần Protocol 5.3 (mock không tự bịa theo giả định riêng). Smoke test thật có skip rõ lý
+  do khi thiếu key, đúng convention đã có ở `test/stt-golden.test.js`.
+- `npm test` xanh toàn bộ (242 pass, 2 skip pre-existing, 0 fail) — đã tự chạy lại xác nhận không có
+  gì trong diff làm vỡ test khác ngoài phạm vi sửa.
+
+# Review Report — 2026-09-20 round 2 (DeepSeek fix, Dev↔Reviewer round 1/3 hoàn tất)
+
+## Verdict: APPROVE
+
+Đã đọc lại `git diff server/llm/contracts.js server/llm/providers/deepseek.js`, đọc lại toàn bộ
+`test/deepseek-provider.test.js`, và đọc đoạn CHANGENLOG "Dev↔Reviewer round 1 fixes" — trace bằng
+tay từng issue trước đó, không tin theo mô tả của Dev:
+
+1. **withRepair retry lãng phí** — đã fix đúng cơ chế, không phải patch cục bộ: `skipRepair` thêm
+   vào `llmError()` meta dùng chung cho mọi provider (`server/llm/contracts.js:52`), `withRepair`
+   rethrow ngay khi `error.skipRepair` true (`contracts.js:172`, đã đọc lại điều kiện mới:
+   `error.llmCode !== LLM_ERROR.INVALID_OUTPUT || error.skipRepair`) — đúng, không còn rơi vào nhánh
+   repair. `deepseek.js` set `skipRepair: true` khi throw lỗi truncation. Test mới đếm
+   `fetchCallCount`, assert đúng bằng 1 (`test/deepseek-provider.test.js:90-120`) — đã tự chạy
+   `npm test` độc lập (không chỉ tin số Dev báo): **245 total, 243 pass, 2 skip pre-existing, 0
+   fail** — khớp đúng claim.
+2. **`deepseek-reasoner` chưa verify** — cách sửa đúng tinh thần deny-by-default (Protocol 8):
+   không cố áp `max_tokens` mới lên 1 model chưa verify, mà **giữ nguyên hành vi cũ** (không set
+   `max_tokens`) cho `deepseek-reasoner`, chỉ scope override vào đúng
+   `spec.id === 'deepseek-chat'` (`deepseek.js:90`). Đã tự kiểm chứng: khi `maxTokens` là
+   `undefined`, `JSON.stringify` bỏ hẳn key `max_tokens` khỏi request body (không gửi
+   `"max_tokens":null`) → đúng như hành vi trước khi có fix, không thoái lui. Test mới
+   (`test/deepseek-provider.test.js:71-88`) assert đúng field này `undefined` cho reasoner. Claim
+   "default 64K" trong comment/CHANGENLOG có hedge rõ ràng "no real call... has been made to check"
+   — đúng disclosure Protocol 5, và quan trọng hơn: code không dựa vào con số 64K đó để quyết định
+   gì cả (chỉ dùng để giải thích lý do KHÔNG động vào), nên kể cả con số đó sai thì cũng không có
+   rủi ro hành vi mới. Không thấy Known-issues bullet riêng cho việc này trong CHANGELOG, nhưng
+   thông tin đã nằm đầy đủ, dễ tìm trong chính bullet "round 1 fixes" — đủ đáp ứng ý ban đầu, không
+   cần yêu cầu sửa thêm.
+3. **Chuỗi test mơ hồ** — đã thay bằng `"placeholder-item-one"`/`"placeholder-item-tw` (cắt giữa
+   từ, không còn đọc như mảnh câu tiếng Anh thật) kèm comment phủ định trực tiếp
+   ("NOT derived from any real meeting"). Dev cũng tự thừa nhận rõ ràng đây là lỗi chọn từ dở của
+   chính mình, không né tránh câu hỏi — chấp nhận được.
+4. **Comment sai lệch INPUT_BUDGET_RATIO** — đã đọc lại comment mới (`deepseek.js:67-80`): không
+   còn dùng từ "match", giải thích đúng: mức reserve ~30% (~19.7K) đã đo được là không đủ so với
+   nhu cầu thật (~26-27K), nên chọn half-window rộng rãi hơn có chủ đích — khớp đúng số liệu đã có
+   trong CHANGENLOG gốc, không có claim mới nào chưa verify.
+
+Không phát sinh issue mới khi đọc lại toàn bộ diff (kể cả phần không đổi) — `finish_reason ===
+'length'` check vẫn áp dụng cho cả 2 model (kể cả reasoner dùng default riêng của DeepSeek), nghĩa
+là nếu reasoner cũng bị cắt thì vẫn được báo lỗi rõ ràng thay vì rơi về generic — cải thiện thêm mà
+không cần ép `max_tokens`, hợp lý.
+
+## Issues Found
+Không còn issue Critical/High/Medium/Low nào mở từ 2 vòng review. 4/4 issue vòng 1 đã đóng, có bằng
+chứng cụ thể (diff + test + npm test tự chạy lại), không chỉ tin lời khai của Dev.
+
+## External contract verification
+YES (nguồn: real call thật của PM tới `api.deepseek.com` cho `deepseek-chat`, trước/sau fix, cộng
+`api-docs.deepseek.com` cho default 8K/64K) cho phần đã áp dụng vào code (`deepseek-chat`).
+`deepseek-reasoner`: N/A cho phần `max_tokens` — code cố tình không động vào (deny-by-default,
+không áp dụng contract chưa verify), nên không có claim chưa-verify nào đang chạy trong production
+path của model đó.
+
+## Positive Notes
+- Không có fix nào chỉ vá triệu chứng: `skipRepair` sửa đúng ở tầng `contracts.js` dùng chung, không
+  phải if-else riêng trong `deepseek.js` — sửa đúng root cause, tự động có lợi cho provider khác nếu
+  sau này gặp case tương tự.
+- Xử lý gap `deepseek-reasoner` bằng cách **không hành động** (giữ nguyên default) thay vì đoán 1 số
+  mới rồi áp đặt — đúng tinh thần "chưa rõ → SKIP" của Protocol 8, dù Protocol 8 vốn viết cho use
+  case nhiều biến thể pipeline, tinh thần áp dụng đúng ở đây.
+- Dev thừa nhận thẳng lỗi chọn từ filler dở ở vòng 1 thay vì biện minh, sửa nhanh gọn.
+- Vòng lặp Dev↔Reviewer dùng đúng 1/3 round theo Protocol 3, có ghi rõ trong CHANGENLOG
+  ("Protocol 3, 1/3 rounds used") — minh bạch, đúng quy trình Protocol 4 (state) lẫn Protocol 1
+  (structured handoff).

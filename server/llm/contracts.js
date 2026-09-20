@@ -41,7 +41,7 @@ const RETRYABLE_CODES = new Set([
  * Build a typed LLM error carrying the machine code, provider and HTTP status.
  * @param {string} code one of LLM_ERROR
  * @param {string} message human readable, safe to show the user
- * @param {{provider?: string, retryable?: boolean, statusCode?: number}} [meta]
+ * @param {{provider?: string, retryable?: boolean, statusCode?: number, skipRepair?: boolean}} [meta]
  */
 function llmError(code, message, meta = {}) {
   const error = new Error(message);
@@ -49,6 +49,13 @@ function llmError(code, message, meta = {}) {
   error.provider = meta.provider || '';
   error.retryable = meta.retryable ?? RETRYABLE_CODES.has(code);
   error.statusCode = meta.statusCode || STATUS_BY_CODE[code] || 502;
+  // INVALID_OUTPUT normally means "malformed JSON, worth one repair retry"
+  // (withRepair below). A provider can set this when the malformed output has
+  // a known, non-repairable cause (e.g. the response was truncated by an
+  // output-length cap) — asking the model to "return valid JSON" again won't
+  // fix a length problem, it'll just repeat the same truncation at the user's
+  // expense (double latency/cost for a retry that was never going to work).
+  error.skipRepair = Boolean(meta.skipRepair);
   return error;
 }
 
@@ -162,7 +169,7 @@ async function withRepair(callModel, normalize, provider) {
     lastRaw = await callModel();
     return normalize(lastRaw);
   } catch (error) {
-    if (error.llmCode && error.llmCode !== LLM_ERROR.INVALID_OUTPUT) throw error;
+    if (error.llmCode && (error.llmCode !== LLM_ERROR.INVALID_OUTPUT || error.skipRepair)) throw error;
   }
 
   const repairHint = [

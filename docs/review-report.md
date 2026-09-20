@@ -1382,6 +1382,162 @@ N/A — cả 4 fix đều là logic thuần phía client (không gọi STT/LLM p
 - CHANGELOG minh bạch 2 điểm tự quyết (partial-save khi date invalid, tạo file mới thay vì inline)
   kèm lý do rõ ràng — giảm thời gian review vì không phải đoán Dev có cân nhắc case đó chưa.
 
+---
+
+# Review — Add live Notes panel to Recording screen (js/app.js, css/layout.css)
+
+## Verdict: APPROVE
+
+Feature nhỏ, không chạm baseline bảo mật, không có Critical/High. Có 2 vấn đề Medium đáng sửa
+(1 bug CSS thật, 1 lỗ hổng "đúng nhờ may mắn" trong thứ tự sự kiện DOM) và vài Low — không chặn
+merge nhưng nên xử lý ở lượt sau.
+
+## Phạm vi đã đọc trực tiếp (không tin lời Dev thuật lại)
+- `js/app.js`: `_renderRecording` (885-986), `_bindRecording` (988-1348, đặc biệt khối notes
+  1007-1131 và `stopBtn`/`discardBtn` handlers 1306-1347), `_saveActiveRecording`/
+  `_discardActiveRecording`/`_cleanupRecordingCallbacks` (335-400), `Transcriber.onResult`
+  autosave transcript (1148-1169), nút "Save Notes" ở Meeting Detail (2753-2760).
+- `css/layout.css`: toàn bộ rule `.recording-streams*`, `.recording-notes-body`,
+  `.recording-notes-textarea`, `.panel-body`, media query `max-width:768px`.
+- `js/storage.js`: `getMeeting`/`getAllMeetings` (shallow clone), `saveMeeting` (merge
+  `{...previous, ...meeting}`), `PROMPT_CONTEXT_FIELDS`/`_promptContextFieldsChanged` (186-190).
+- `js/summary-staleness.js` (`isPreMeetingInfoStale`) — để trả lời câu hỏi data-lineage Dev nêu.
+- `git diff --stat` xác nhận đúng 2 file thay đổi (`css/layout.css`, `js/app.js`), không có gì
+  ngoài phạm vi khai báo.
+
+## Issues Found
+
+### Critical
+(none)
+
+### High
+(none)
+
+### Medium
+- [ ] `css/layout.css:465-474` — **Bug CSS thật do specificity, không đạt đúng thiết kế đã khai
+  báo ("textarea full-height, edge-to-edge")**. `<div class="panel-body recording-notes-body">`
+  khớp cả 2 rule: `.recording-transcript-panel .panel-body { padding: var(--space-4); }` (2 class
+  selector, specificity 0,2,0) và `.recording-notes-body { padding: 0; }` (1 class selector,
+  specificity 0,1,0). Rule có specificity cao hơn thắng bất kể thứ tự khai báo trong file — nghĩa
+  là `padding: var(--space-4)` từ rule đầu **vẫn áp dụng**, `padding: 0` không có tác dụng. Kết
+  quả: textarea notes có 2 lớp đệm cộng dồn (space-4 quanh container + space-4 riêng của
+  `.recording-notes-textarea`), không sát mép panel như mô tả trong log bàn giao. Không phải lỗi
+  nghiêm trọng (chỉ lệch UI, không vỡ layout/tràn chữ), nhưng là bug thật, đã verify bằng cách đọc
+  cả 2 rule và tính specificity tay, không suy đoán.
+  → **Gợi ý sửa**: tăng specificity cho rule override, ví dụ
+  `.recording-notes-panel .panel-body.recording-notes-body { padding: 0; }`, hoặc gộp thẳng vào
+  `.recording-notes-textarea` margin âm để bù trừ, hoặc đơn giản nhất: bỏ `padding: var(--space-4)`
+  khỏi textarea và giữ padding ở panel-body (chọn 1 lớp đệm duy nhất).
+- [ ] `js/app.js:347-400` (`_saveActiveRecording`, `_discardActiveRecording`) — không có bước
+  flush tường minh cho debounce 600ms của notes trước khi finalize/xoá meeting. Đã trace kỹ: hiện
+  tại vẫn ĐÚNG trong thực tế vì `stopBtn`/`discardBtn`/nút "Save & Leave" đều là click vào 1 phần
+  tử khác — theo hành vi chuẩn của mọi trình duyệt, `mousedown` trên phần tử khác sẽ `blur` phần tử
+  đang focus (`notesTextarea`) **trước khi** `click` handler chạy, và handler `blur` đã có sẵn
+  (`js/app.js:1128-1131`) gọi `clearTimeout` + `saveNotes()` ngay lập tức — nên trên thực tế dữ
+  liệu vẫn được lưu đúng trước khi finalize. Đã kiểm tra không có phím tắt bàn phím nào
+  (`grep keydown`) gọi thẳng `_saveActiveRecording`/`_discardActiveRecording` mà bỏ qua bước blur
+  này. Tuy nhiên đây là **đúng nhờ hành vi ngầm định của DOM, không phải do code chủ động đảm bảo**
+  — nếu sau này có ai thêm phím tắt "Stop recording" qua `document.addEventListener('keydown', ...)`
+  trong khi textarea đang focus, ký tự gõ trong 600ms cuối có thể bị bỏ lỡ khỏi bản snapshot cuối
+  cùng (vẫn tự lưu đúng vào storage sau đó qua timer cũ, nhưng trang Meeting Detail đã render trước
+  đó sẽ không tự cập nhật lại — người dùng phải reload mới thấy). → **Gợi ý sửa** (không chặn
+  merge): thêm 1 dòng flush tường minh ở đầu `_saveActiveRecording`/`_discardActiveRecording`
+  (`clearTimeout(...); ` gọi hàm save notes hiện tại nếu còn pending) thay vì dựa vào thứ tự
+  blur-trước-click, để đúng bất kể UI thay đổi sau này.
+
+### Low
+- [ ] `docs/CHANGELOG.md` — chưa có mục nào cho thay đổi này (Protocol 1 yêu cầu Dev cập nhật
+  CHANGELOG.md khi bàn giao code). `git diff --stat` xác nhận chỉ `css/layout.css`+`js/app.js` bị
+  sửa, không có CHANGELOG. → Gợi ý: thêm 1 mục trước khi coi feature này "xong".
+- [ ] DRY — pattern "fetch fresh `Storage.getMeeting`, gán 1-2 field, `Storage.saveMeeting`" giờ
+  lặp lại độc lập ở 3 nơi: notes-autosave mới (`js/app.js:1114-1120`), transcript-autosave có sẵn
+  (`js/app.js:1160-1165`), nút "Save Notes" ở Meeting Detail (`js/app.js:2753-2760`). Không chặn
+  merge — có thể cân nhắc 1 helper `Storage.updateMeeting(id, patch)` dùng chung để giảm nguy cơ 1
+  chỗ quên `if (!m) return` hay quên field nào đó khi sửa sau này.
+- [ ] `js/app.js:942` — class `transcript-only` giờ không còn được CSS nào tham chiếu (`grep` xác
+  nhận), vì `has-notes` luôn được thêm nên `.recording-streams` không bao giờ còn rơi về đúng 1
+  cột theo nhánh cũ. Đây là dead class có từ trước diff này (base `.recording-streams` vốn đã mặc
+  định 1 cột), không phải lỗi mới, nhưng nay càng rõ dư thừa — có thể dọn tiện thể.
+- [ ] Mobile viewport — Dev tự khai báo chưa verify bằng mắt do lỗi tool. Đã đọc lại media query
+  `max-width:768px` (`css/layout.css:665-670`) xác nhận đã liệt kê đủ cả 3 tổ hợp class
+  (`.has-translation`, `.has-notes`, `.has-translation.has-notes`) để collapse về 1 cột — logic
+  đúng theo pattern có sẵn. Khuyến nghị (không chặn merge): verify lại bằng mắt trên viewport hẹp
+  trước khi đóng hẳn task, vì bug Medium #1 ở trên (double padding) cũng ảnh hưởng cả ở mobile.
+
+## Data lineage: notes lúc recording vs notes ở tab Notes dùng chung field `meeting.notes` (câu hỏi Dev nêu)
+
+Đã tự trace, không tin lại giả thuyết Dev đưa ra:
+
+1. **Ghi đè giữa 2 nơi lưu (autosave debounce 600ms lúc recording vs nút "Save Notes" thủ công ở
+   Meeting Detail)**: không xảy ra trong 1 tab, vì cả hai đều theo đúng pattern
+   fetch-fresh-ngay-trước-khi-ghi (`Storage.getMeeting` rồi `Storage.saveMeeting` đồng bộ, không có
+   `await` xen giữa) — JS đơn luồng nên không có chuyện 2 lệnh này chạy xen kẽ giữa chừng của nhau.
+   Về lý thuyết 2 route (`recording/:id` và `meeting/:id`) không thể cùng mở trong 1 tab tại 1 thời
+   điểm (SPA, 1 view tại 1 lúc) nên đây không phải race trong thực tế sử dụng bình thường. Rủi ro
+   duy nhất còn lại là mở **2 tab trình duyệt khác nhau** cùng trỏ tới cùng 1 meeting — đây là rủi ro
+   đã có sẵn từ trước với MỌI field khác trong app (không riêng notes, không phải rủi ro mới do diff
+   này tạo ra), không cần xử lý riêng cho feature này.
+
+2. **`promptContextUpdatedAt`/"stale summary" (BR-146)** — đã đọc `js/summary-staleness.js`:
+   `isPreMeetingInfoStale` chỉ trả `true` khi **cả** `meeting.summaryGeneration.generatedAt` **và**
+   `meeting.promptContextUpdatedAt` đều tồn tại và `contextUpdatedAt > generatedAt` (deny-by-default
+   khi thiếu 1 trong 2 mốc — đúng như comment "R-AF" trong chính file). Ở lần ghi âm đầu tiên (case
+   phổ biến nhất mà bug gốc mô tả), `summaryGeneration.generatedAt` **chưa tồn tại** (summary chỉ
+   sinh sau khi ghi âm xong) → hàm này tự động trả `false`, nghĩa là gõ notes lúc đang ghi âm
+   **không** kích hoạt nhầm nudge "tóm tắt có thể đã cũ". Nếu (trường hợp hiếm, cần route
+   `recording/:id` mở lại cho 1 meeting đã có `summaryGeneration.generatedAt` từ trước — ví dụ
+   ghi đè lại 1 cuộc họp cũ) mà bump `promptContextUpdatedAt` xảy ra, hành vi kích hoạt nudge
+   **chính xác là điều mong muốn** (notes mới hơn summary → nên nhắc), giống hệt ngữ nghĩa nút "Save
+   Notes" thủ công hiện có. → **Kết luận: đây không phải bug, không cần loại trừ trường hợp
+   recording khỏi `PROMPT_CONTEXT_FIELDS`** — hành vi dùng chung field là đúng thiết kế BR-146, đã
+   verify bằng đọc code, không phải suy đoán.
+
+## Security / baseline check (theo persona Reviewer)
+- Không có endpoint `/api/*` mới — feature tái dùng đúng `PUT /api/meetings` sẵn có (đã tự verify
+  Dev không tự chế route riêng). Không có `child_process`, không đụng API key/keychain, không dùng
+  ID nào làm tên file trực tiếp trên filesystem (Storage ghi cả mảng `meetings.json`, không phải
+  file theo từng ID như audio) — 4 baseline bảo mật của project đều không bị chạm/nới lỏng.
+- XSS: nội dung `meeting.notes` được escape qua `Utils.escapeHtml` trước khi chèn vào template
+  string của textarea (`js/app.js:979`) — đã kiểm tra `Utils.escapeHtml` (`js/utils.js:123-127`)
+  dùng `div.textContent → div.innerHTML`, escape đúng cả `<`, `>`, `&`, nên chuỗi kiểu
+  `</textarea><script>...` sẽ bị escape thành `&lt;/textarea&gt;...`, không thể break ra khỏi thẻ
+  `<textarea>` — đúng pattern đã dùng ở ô notes cũ tại Meeting Detail (`js/app.js:1638`).
+
+## Correctness khác đã verify
+- Notes textarea + autosave được bind ngay khi vào route `recording/:id` (`_bindRecording` gọi
+  ngay khi `navigate()`, không phụ thuộc việc đã bấm nút Record hay chưa) — đúng yêu cầu gốc của
+  bug report ("cần note trực tiếp lúc đó", kể cả trước khi bấm Record). Đã đọc
+  `Recorder.getElapsedSeconds()` (`js/recorder.js:271-275`) xác nhận trả `0` an toàn khi
+  `startTime` chưa được set, không throw khi hiện text "Saved · 00:00" lúc chưa bắt đầu ghi âm.
+- Class `has-notes` gắn cứng (không điều kiện) đúng ý đồ "Notes panel luôn hiện", và rule CSS
+  3-cột `.recording-streams.has-translation.has-notes` (`css/layout.css:443-445`) dùng combined
+  class selector (specificity cao hơn 2 rule đơn lẻ) nên override đúng đắn theo specificity, không
+  phải "may nhờ thứ tự khai báo trong file" — cách làm đúng.
+
+## `npm test`
+Không có test nào cho `js/app.js` (project không có jsdom/browser harness theo CLAUDE.md) nên thay
+đổi thuần frontend này không thể được test tự động. Đã tự chạy `node --test test/*.test.js` để xác
+nhận không có regression phía server: PASS toàn bộ (không đụng file server nào trong diff nên đây
+chỉ là kiểm tra xác nhận không có tác dụng phụ ngoài ý muốn).
+
+## External contract verification
+N/A — không gọi API/CLI/thư viện bên thứ 3 nào, thuần thay đổi UI + dùng lại storage layer nội bộ
+sẵn có.
+
+## Positive Notes
+- Tái dùng đúng field `meeting.notes` sẵn có thay vì tạo field song song mới cho "notes lúc
+  recording" — tránh đúng kiểu lỗi fork dữ liệu (2 nguồn sự thật cho cùng 1 khái niệm).
+  `PROMPT_CONTEXT_FIELDS`/BR-146 tiếp tục hoạt động đúng mà không cần sửa gì thêm — đã verify, xem
+  mục Data lineage ở trên.
+- Dev tự đặt đúng câu hỏi mở (race condition, `promptContextUpdatedAt`) trong log bàn giao thay vì
+  im lặng giả định — giúp Reviewer tập trung đúng chỗ rủi ro thay vì phải tự mò từ đầu.
+- Test thủ công qua browser thật (không chỉ đọc code), có bằng chứng cụ thể (status text, HTTP
+  200, nội dung thật trong `storage/meetings.json`), và dọn dữ liệu test đúng quy trình (xin xác
+  nhận trước khi xoá) — đúng kỷ luật thao tác trên dữ liệu thật của project.
+- Escape XSS đúng ngay từ đầu, không phải điểm Reviewer phải yêu cầu sửa lại.
+- Phạm vi sửa đổi rất gọn (chỉ 2 file, đúng những gì cần cho feature), không tranh thủ sửa lan
+  sang chỗ khác — giảm rủi ro regression ngoài ý muốn.
+
 # Review Report — 2026-09-20 (DeepSeek "unreadable summary" on long/Brainstorming meetings)
 
 ## Verdict: REQUEST_CHANGES
@@ -1565,3 +1721,118 @@ path của model đó.
 - Vòng lặp Dev↔Reviewer dùng đúng 1/3 round theo Protocol 3, có ghi rõ trong CHANGENLOG
   ("Protocol 3, 1/3 rounds used") — minh bạch, đúng quy trình Protocol 4 (state) lẫn Protocol 1
   (structured handoff).
+
+---
+
+# Review — Independent hide/show toggle cho Live Transcript & Live Translation (recording screen)
+
+## Verdict: APPROVE
+
+## Phạm vi
+`git diff -- js/app.js js/storage.js css/layout.css` (uncommitted). Thêm `_eyeIcon()`, 2 nút
+toggle độc lập trên panel-header của Live Transcript/Live Translation, `data-cols` thay hệ class
+tĩnh `has-translation`/`has-notes`/`transcript-only` cũ, 2 field setting mới
+`recordingShowLiveTranscript`/`recordingShowLiveTranslation` (mặc định `true`, lưu qua
+`Storage.saveSettings()` — reuse `PUT /api/settings` có sẵn, không thêm endpoint).
+
+## Correctness & data lineage đã tự verify (đọc code thật, không tin lời báo cáo)
+
+1. **`data-cols` tính đúng trong mọi tổ hợp ẩn/hiện** — đã trace tay công thức tính
+   `initialCols` lúc render (`js/app.js` `_renderRecording`) và `updateStreamsLayout()` lúc bind
+   (`js/app.js` `_bindRecording`), đối chiếu với 2 CSS rule `[data-cols="2"]`/`[data-cols="3"]`
+   (`css/layout.css`):
+   - 3 panel hiện (transcript+translation+notes) → cols=3 → `1fr 1fr minmax(280px,0.8fr)` (Notes
+     hẹp hơn) — đúng thứ tự DOM (transcript, translation, notes render theo đúng thứ tự đó).
+   - Bất kỳ tổ hợp còn lại của 2 panel hiện (vd transcript ẩn + translation hiện + notes, hoặc
+     không có `translationLanguage`) → cols=2 → `repeat(2, minmax(0,1fr))` chia đều — đúng thiết
+     kế "2 cột đều" khi chỉ có 2 panel.
+   - Cả 2 panel Live ẩn (hoặc meeting không có `translationLanguage` và user ẩn Live Transcript)
+     → Notes luôn hiện (không có toggle) nên `visibleCount` tối thiểu là 1 → cols=1, rơi về base
+     rule `.recording-streams` (`minmax(0,1fr)`, không có `[data-cols="1"]` override) — 1 cột full
+     width, đúng ý muốn "panel còn lại tự giãn".
+   - `bindVisibilityToggle(button, section, ...)` có early-return `if (!button || !section) return;`
+     — khi meeting không có `translationLanguage`, `translationSection`/`translationVisToggle` đều
+     `null` (không render trong HTML) → hàm return ngay, không throw, không đăng ký listener chết.
+     Đã verify bằng cách đọc chính điều kiện render `${hasTranslation ? ... : ''}` — khớp.
+   - `updateStreamsLayout()` filter `section && section.style.display !== 'none'` nên
+     `translationSection === null` tự động bị loại khỏi đếm (falsy), không cần thêm check gì.
+   - `initialCols` (server-render) và `updateStreamsLayout()` (client, gọi ngay lúc bind) dùng 2
+     công thức độc lập nhưng luôn cho cùng kết quả vì cùng phản ánh đúng 1 nguồn sự thật
+     (`showTranscript`/`showTranslation`/`hasTranslation`) — không có race hay lệch pha giữa
+     server-render và client-hydrate.
+
+2. **Toggle không đụng logic đo lường/billing/waveform** — đã đọc trực tiếp
+   `addTranscriptSegment`/`updateInterim` (`js/app.js` quanh dòng 1085-1155): cả 2 hàm push vào
+   `this._transcriptSegments`/`this._translationSegments` và `appendChild` DOM **vô điều kiện**,
+   không có nhánh nào kiểm tra `section.style.display`. Ẩn panel chỉ là CSS `display:none` —
+   segment vẫn được ghi nhận đầy đủ khi panel bị ẩn, khớp đúng khai báo của Dev. Duy nhất tác
+   dụng phụ vô hại: `panelBody.scrollTop = panelBody.scrollHeight` là no-op khi panel ẩn
+   (`scrollHeight` = 0 lúc đó) — khi user bật lại panel, nội dung đã có sẵn nhưng không tự
+   scroll xuống cuối cho tới khi có segment mới tiếp theo trigger lại scroll. Không phải bug
+   chức năng (không mất dữ liệu, đúng yêu cầu), chỉ là UX nhỏ — xếp Low.
+   - `Recorder`/`Transcriber` không bị chạm — không có lời gọi `pause()`/`stop()` nào trong 2
+     hàm `bindVisibilityToggle`/toggle handler.
+   - `Storage.saveSettings({[settingKey]: nextVisible})` chỉ ghi 2 field boolean mới vào
+     `settings.json` qua route `PUT /api/settings` có sẵn — không tạo route mới, không ảnh
+     hưởng `meetings.json`/billing field nào.
+
+3. **Backward-compat default** — đã đọc `Storage.getSettings()` (`js/storage.js:291-296`):
+   `{...DEFAULT_SETTINGS, ...this._settings}` — user cũ chưa từng có 2 key mới trong
+   `settings.json` vẫn nhận `true` mặc định đúng ý (không bị `undefined` làm sai điều kiện
+   `!== false`).
+
+4. **CSS specificity** — `.recording-streams[data-cols="2"]`/`[data-cols="3"]` (class + attribute,
+   specificity cao hơn base `.recording-streams` 1 class) override đúng, không cần
+   `!important`. Grep xác nhận đã dọn sạch mọi tham chiếu `has-translation`/`has-notes`/
+   `transcript-only` cũ trong `css/`, `js/`, `index.html` — không còn dead selector. Media query
+   `max-width:768px` đã cập nhật đúng sang match `[data-cols="2"]`/`[data-cols="3"]`; cols=1 vốn
+   đã là 1 cột từ base rule nên không cần thêm entry mobile riêng.
+
+5. **Security/trust gate** — Không có endpoint mới. `PUT /api/settings` là route sẵn có, đã nằm
+   dưới `hasTrustedHost`/`isTrustedApiRequest` (baseline đã xác nhận từ review trước, không đổi
+   trong diff này). Payload gửi lên chỉ là boolean literal do client tự set qua click, không có
+   input tự do nào của user chạm route này trong diff. Không có `child_process`/file path mới.
+   Icon SVG trong `_eyeIcon()` là chuỗi tĩnh, không nội suy biến — không có rủi ro XSS.
+
+## `npm test`
+Tự chạy lại độc lập: `node --test test/*.test.js` → **243 pass / 2 skip / 0 fail**, khớp báo cáo
+Dev.
+
+## Issues Found
+
+### Critical
+(none)
+
+### High
+(none)
+
+### Medium
+(none)
+
+### Low
+- [ ] `js/app.js` `addTranscriptSegment`/`updateInterim` (dòng ~1122-1124, ~1152-1154) — khi 1
+  panel đang ẩn, `panelBody.scrollTop = panelBody.scrollHeight` là no-op (vì `scrollHeight=0`
+  lúc `display:none`). Khi user bật lại panel sau khi đã tích luỹ nhiều segment lúc ẩn, panel sẽ
+  hiện ở vị trí scroll cũ (đầu trang) thay vì tự cuộn xuống cuối, cho tới khi có segment mới kế
+  tiếp. → Gợi ý (không chặn merge): trong `bindVisibilityToggle`, khi `nextVisible === true`,
+  chủ động gọi `section.querySelector('.panel-body').scrollTop = ...scrollHeight` ngay sau khi
+  bỏ `display:none`.
+
+## External contract verification
+N/A — không có tool/API bên thứ 3 nào liên quan tới thay đổi này; chỉ là view-state toggle nội
+bộ + reuse route `/api/settings` sẵn có.
+
+## Positive Notes
+- Tính `data-cols` bằng cách đếm panel thực sự hiển thị (`filter(...).length`) thay vì suy luận
+  qua tổ hợp `if/else` cứng theo biến — tránh đúng loại lỗi "2 nhánh lệch nhau" mà việc thêm biến
+  thể mới (ẩn/hiện độc lập) rất dễ mắc phải nếu vẫn giữ hệ class tĩnh cũ.
+- Tách bạch rõ ràng "view-only toggle" khỏi luồng dữ liệu: segment vẫn được ghi nhận đầy đủ dù
+  panel ẩn — implementation khớp chính xác với thiết kế đã thống nhất với user (không mất dữ
+  liệu khi ẩn/hiện qua lại).
+- `bindVisibilityToggle` early-return an toàn cho trường hợp `translationSection`/
+  `translationVisToggle` là `null` (meeting không bật dịch) — không cần rẽ nhánh
+  `if (meeting.translationLanguage)` lặp lại ở nhiều chỗ.
+- Dọn sạch hệ class CSS cũ khi thay bằng `data-cols`, không để lại dead selector — thường bị bỏ
+  sót trong các refactor tương tự.
+- Setting mới có default backward-compatible đúng cách (qua `DEFAULT_SETTINGS` spread, không
+  qua giá trị `undefined` dễ gây bug điều kiện).

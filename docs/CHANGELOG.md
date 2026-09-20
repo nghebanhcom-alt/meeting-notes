@@ -1450,6 +1450,47 @@ touched by this round.
 - Not re-claiming "fixed"/"done" for the feature as a whole — Reviewer and QA still need to run
   their own passes per Protocol 7.
 
+## 2026-09-20 — Live notes panel on the recording screen
+
+User report: no way to take notes while a meeting is actively recording — `meeting.notes` was
+only editable from the "Notes" tab on the (post-meeting) Meeting Detail screen.
+
+### Changed
+- `js/app.js` `_renderRecording()` — added a third panel to `.recording-streams` (alongside Live
+  Transcript / Live Translation): a `#rec-notes-textarea` seeded from `meeting.notes || ''`.
+  Added a `has-notes` modifier class on `.recording-streams` (kept alongside the pre-existing
+  `has-translation`/`transcript-only` markers).
+- `js/app.js` `_bindRecording()` — new `saveNotes()` + debounced (600ms) `input` listener,
+  mirroring the existing live-transcript autosave pattern (`Transcriber.onResult`): re-fetch
+  `Storage.getMeeting(meetingId)` fresh, set `.notes`, `Storage.saveMeeting(m)`. Also flushes on
+  `blur` and explicitly before `_saveActiveRecording()` runs (Stop & Save), so a pending debounce
+  can't be dropped by finalizing the meeting first.
+- `css/layout.css` — `.recording-streams.has-notes` (2-col) / `.has-translation.has-notes`
+  (3-col) grid rules, notes-panel textarea styling, and the `max-width: 768px` breakpoint now
+  collapses `.has-notes` to 1 column same as `.has-translation`.
+- No new field: reuses `meeting.notes`, the same field the post-meeting Notes tab and BR-63
+  notes-override flow already read/write. No server/API/schema change.
+
+### Reviewed (Protocol 7)
+- `docs/review-report.md` — APPROVE, no Critical/High. 2 Medium fixed same round: a CSS
+  specificity bug (`.recording-notes-body` padding override was losing to the 2-class
+  `.recording-transcript-panel .panel-body` rule — fixed by matching specificity) and the
+  explicit pre-finalize notes flush described above (previously relied on implicit `blur`
+  ordering on button click). Low-severity notes (this changelog entry, minor DRY across the 3
+  fetch-mutate-save call sites) accepted as-is / addressed here.
+
+### Verified
+- Manual: ran against the real running dev server (127.0.0.1:8765, did not start a second
+  `npm start` — see the EADDRINUSE incident already on record in `project_state.json`
+  `blockers`), created one throwaway test meeting, confirmed the Notes panel renders alongside
+  Live Transcript + Live Translation, typing shows "Saving…" → "Saved · 00:00", a real
+  `PUT /api/meetings` 200 request fires, and the text lands in `storage/meetings.json`. Deleted
+  the test meeting afterward (confirmed with the user first) — `storage/meetings.json` back to
+  the original 4 real meetings.
+- Not verified: mobile-width layout by eye (the `max-width: 768px` collapse rule was reasoned
+  from the existing `.has-translation` pattern, not visually confirmed — browser tool couldn't
+  click through the mobile-emulation viewport this round).
+
 ## 2026-09-20 — Fix DeepSeek summary generation failing with "unreadable summary" on long/preset-heavy meetings
 
 Bug report (user): `POST /api/summary` with provider=DeepSeek and the built-in "Brainstorming"
@@ -1582,3 +1623,55 @@ same session before re-requesting review:
 `npm test` after round 1 fixes: 245 total, 243 passing (241 pre-existing + 4 new in
 `test/deepseek-provider.test.js`, up from 3 — added the `deepseek-reasoner` non-override test
 and the fetch-call-count assertion), 2 skipped (pre-existing, unrelated), 0 failing.
+
+## 2026-09-20 — Independent hide/show toggle for Live Transcript & Live Translation
+
+User request, following the same-day live-notes-panel change above: a way to hide/show the
+Live Transcript / Live Translation panels on the recording screen. Confirmed with the user:
+each panel gets its own independent toggle (not one combined switch), and the remaining
+panels (Notes included) expand to fill the freed space.
+
+### Changed
+- `js/storage.js` `DEFAULT_SETTINGS` — 2 new global (not per-meeting) preference fields:
+  `recordingShowLiveTranscript: true`, `recordingShowLiveTranslation: true`. Persisted through
+  the existing `Storage.saveSettings()` → `PUT /api/settings` path, no new endpoint.
+- `js/app.js` — new `_eyeIcon(open)` helper (open-eye / eye-slash SVG). `_renderRecording()`
+  reads the settings above to decide each panel's initial visibility, adds a
+  `btn-icon btn-sm` toggle button to each panel's header, and gives the Live Transcript panel
+  an `id="rec-transcript-section"` (it previously had none — only Live Translation did).
+- `js/app.js` `_bindRecording()` — replaced the static `has-translation`/`has-notes`/
+  `transcript-only` class scheme on `.recording-streams` with a `data-cols` attribute
+  recomputed on every toggle (`updateStreamsLayout()`, counts currently-visible sections).
+  Hiding a panel is `display:none` only — Recorder/Transcriber keep running underneath, and
+  `addTranscriptSegment()`/`updateInterim()` keep appending into the hidden panel's DOM
+  unconditionally, so nothing is lost while it's hidden. Re-showing a panel now also
+  force-scrolls it to bottom (`panelBody.scrollTop = panelBody.scrollHeight`), since that same
+  call is a no-op while the panel is `display:none`.
+- `css/layout.css` — replaced the `has-*` class rules with `[data-cols="2"]` (even split) /
+  `[data-cols="3"]` (transcript/translation even, Notes narrower) attribute rules; base
+  `.recording-streams` rule already covers the 1-column case. The `max-width: 768px` block
+  now matches the same attribute selectors to collapse to 1 column on mobile.
+
+### Reviewed (Protocol 7)
+- `docs/review-report.md` — APPROVE. Reviewer traced `data-cols` correctness across every
+  hide/show combination (including no-translation meetings, where `translationSection`/
+  `translationVisToggle` are `null` and `bindVisibilityToggle`'s early return covers it) and
+  confirmed the toggle is view-only (doesn't touch Recorder/Transcriber/waveform/billing). One
+  Low finding — re-showing a panel didn't catch up its scroll position — fixed same round (see
+  above).
+
+### Verified
+- Manual: real dev server (127.0.0.1:8765, no second `npm start`). Created a test meeting with
+  Translate To enabled, confirmed both eye-icon toggles render on their panel headers, hiding
+  Live Transcript collapses to `data-cols="2"` (Translation + Notes fill the row), hiding Live
+  Translation too collapses to `data-cols="1"` (Notes full-width). Confirmed a real
+  `PUT /api/settings` 200 fires per toggle and the hidden state is remembered across a page
+  reload and a brand-new recording (global preference, as intended). Afterward restored the
+  user's real settings back to both-visible via `Storage.saveSettings(...)` in the live
+  console (production code path, not a hand-edited JSON file) and deleted the 2 throwaway test
+  meetings — confirmed with the user before both the settings restore and the deletions.
+  `storage/meetings.json` back to the original 4 real meetings; `storage/settings.json`
+  confirmed both flags `true` again.
+- Not verified: mobile-width layout by eye (same gap as the live-notes-panel change above —
+  browser tool's mobile-emulation click issue, unrelated to this code).
+- `npm test`: 243 passing / 2 skipped (unrelated) / 0 failing, before and after the scroll fix.

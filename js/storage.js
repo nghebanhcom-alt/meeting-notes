@@ -21,7 +21,11 @@ const Storage = {
     sttModels: {},
     lastSummaryPresetId: '',
     // BR-57.1: meetingType -> presetId last used for that type, on this machine.
-    presetByMeetingType: {}
+    presetByMeetingType: {},
+    // View-only preference for the recording screen — hiding a panel never
+    // pauses its underlying transcription/translation, just its display.
+    recordingShowLiveTranscript: true,
+    recordingShowLiveTranslation: true
   },
   _meetings: [],
   _settings: {},

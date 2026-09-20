@@ -882,12 +882,27 @@ const App = {
      VIEW: Recording
      ══════════════════════════════════════════ */
 
+  _eyeIcon(open) {
+    return open
+      ? '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z"/><circle cx="12" cy="12" r="3"/></svg>'
+      : '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.94 10.94 0 0 1 12 19c-7 0-11-7-11-7a21.8 21.8 0 0 1 5.06-5.94M9.9 4.24A10.94 10.94 0 0 1 12 4c7 0 11 7 11 7a21.8 21.8 0 0 1-2.16 3.19M14.12 14.12a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>';
+  },
+
   _renderRecording(meetingId) {
     const meeting = Storage.getMeeting(meetingId);
     if (!meeting) return this._renderNotFound();
 
     // Generate waveform bars
     const bars = Array.from({ length: 32 }, () => '<div class="waveform-bar"></div>').join('');
+
+    // Live Transcript / Live Translation are independently hideable (Notes
+    // always shows) — a view-only preference remembered across recordings,
+    // NOT a pause of the underlying transcription/translation.
+    const settings = Storage.getSettings();
+    const showTranscript = settings.recordingShowLiveTranscript !== false;
+    const showTranslation = settings.recordingShowLiveTranslation !== false;
+    const hasTranslation = Boolean(meeting.translationLanguage);
+    const initialCols = (showTranscript ? 1 : 0) + (hasTranslation && showTranslation ? 1 : 0) + 1;
 
     return `
       <div class="view-enter">
@@ -938,12 +953,15 @@ const App = {
             </div>
           </div>
 
-          <!-- Bottom: Original transcript and optional translation -->
-          <div class="recording-streams ${meeting.translationLanguage ? 'has-translation' : 'transcript-only'}">
-            <section class="recording-transcript-panel">
+          <!-- Bottom: Original transcript, optional translation, and live notes -->
+          <div class="recording-streams" id="rec-streams" data-cols="${initialCols}">
+            <section class="recording-transcript-panel" id="rec-transcript-section" style="${showTranscript ? '' : 'display:none;'}">
               <div class="panel-header">
                 <h4 style="font-size: var(--text-sm);">📝 Live Transcript</h4>
-                <span class="badge badge-primary" id="rec-lang-badge">${Utils.escapeHtml(meeting.language === 'auto' ? 'Auto multilingual' : (meeting.language || 'vi-VN'))}</span>
+                <div class="flex items-center gap-2">
+                  <span class="badge badge-primary" id="rec-lang-badge">${Utils.escapeHtml(meeting.language === 'auto' ? 'Auto multilingual' : (meeting.language || 'vi-VN'))}</span>
+                  <button class="btn btn-ghost btn-icon btn-sm" id="rec-transcript-visibility-toggle" title="${showTranscript ? 'Hide' : 'Show'} Live Transcript">${this._eyeIcon(showTranscript)}</button>
+                </div>
               </div>
               <div class="panel-body" id="rec-transcript-body">
                 <div class="empty-state" id="rec-transcript-empty" style="padding: var(--space-8);">
@@ -954,11 +972,14 @@ const App = {
               </div>
             </section>
 
-            ${meeting.translationLanguage ? `
-              <section class="recording-transcript-panel" id="rec-translation-section">
+            ${hasTranslation ? `
+              <section class="recording-transcript-panel" id="rec-translation-section" style="${showTranslation ? '' : 'display:none;'}">
                 <div class="panel-header">
                   <h4 style="font-size: var(--text-sm);">🌐 Live Translation</h4>
-                  <span class="badge badge-success">→ ${Utils.escapeHtml(meeting.translationLanguage)}</span>
+                  <div class="flex items-center gap-2">
+                    <span class="badge badge-success">→ ${Utils.escapeHtml(meeting.translationLanguage)}</span>
+                    <button class="btn btn-ghost btn-icon btn-sm" id="rec-translation-visibility-toggle" title="${showTranslation ? 'Hide' : 'Show'} Live Translation">${this._eyeIcon(showTranslation)}</button>
+                  </div>
                 </div>
                 <div class="panel-body" id="rec-translation-body">
                   <div class="empty-state" id="rec-translation-empty" style="padding: var(--space-8);">
@@ -969,6 +990,16 @@ const App = {
                 </div>
               </section>
             ` : ''}
+
+            <section class="recording-transcript-panel recording-notes-panel" id="rec-notes-section">
+              <div class="panel-header">
+                <h4 style="font-size: var(--text-sm);">🗒️ Notes</h4>
+                <span class="text-xs text-tertiary" id="rec-notes-status">Autosaves as you type</span>
+              </div>
+              <div class="panel-body recording-notes-body">
+                <textarea class="input recording-notes-textarea" id="rec-notes-textarea" placeholder="Jot down anything worth remembering while the meeting is happening...">${Utils.escapeHtml(meeting.notes || '')}</textarea>
+              </div>
+            </section>
           </div>
         </div>
       </div>
@@ -994,6 +1025,44 @@ const App = {
     const translationBody = document.getElementById('rec-translation-body');
     const translationEmpty = document.getElementById('rec-translation-empty');
     const translationList = document.getElementById('rec-translation-list');
+    const notesTextarea = document.getElementById('rec-notes-textarea');
+    const notesStatus = document.getElementById('rec-notes-status');
+
+    // Live Transcript / Live Translation visibility toggles — view-only, does
+    // NOT pause Recorder/Transcriber; segments keep arriving into the hidden
+    // panel's DOM so nothing is lost when it's shown again.
+    const streamsEl = document.getElementById('rec-streams');
+    const transcriptSection = document.getElementById('rec-transcript-section');
+    const translationSection = document.getElementById('rec-translation-section');
+    const notesSection = document.getElementById('rec-notes-section');
+    const transcriptVisToggle = document.getElementById('rec-transcript-visibility-toggle');
+    const translationVisToggle = document.getElementById('rec-translation-visibility-toggle');
+
+    const updateStreamsLayout = () => {
+      if (!streamsEl) return;
+      const visibleCount = [transcriptSection, translationSection, notesSection]
+        .filter(section => section && section.style.display !== 'none')
+        .length;
+      streamsEl.dataset.cols = String(visibleCount || 1);
+    };
+
+    const bindVisibilityToggle = (button, section, panelBody, settingKey, label) => {
+      if (!button || !section) return;
+      button.addEventListener('click', () => {
+        const nextVisible = section.style.display === 'none';
+        section.style.display = nextVisible ? '' : 'none';
+        button.title = `${nextVisible ? 'Hide' : 'Show'} ${label}`;
+        button.innerHTML = this._eyeIcon(nextVisible);
+        Storage.saveSettings({ [settingKey]: nextVisible });
+        updateStreamsLayout();
+        // Segments kept arriving while hidden (scrollTop was a no-op on a
+        // display:none panel) — catch the view up now that it's visible again.
+        if (nextVisible && panelBody) panelBody.scrollTop = panelBody.scrollHeight;
+      });
+    };
+    bindVisibilityToggle(transcriptVisToggle, transcriptSection, transcriptBody, 'recordingShowLiveTranscript', 'Live Transcript');
+    bindVisibilityToggle(translationVisToggle, translationSection, translationBody, 'recordingShowLiveTranslation', 'Live Translation');
+    updateStreamsLayout();
 
     this._transcriptSegments = [...(meeting.transcript || [])];
     this._translationSegments = [...(meeting.translations || [])];
@@ -1095,6 +1164,29 @@ const App = {
         document.getElementById('rec-interim-translation')?.remove();
       }
     };
+
+    // Live notes — autosave while the meeting is happening (separate from the
+    // post-meeting Notes tab, but the same `meeting.notes` field / BR-63 flow).
+    let notesSaveTimer = null;
+    const saveNotes = () => {
+      if (!notesTextarea) return;
+      const m = Storage.getMeeting(meetingId);
+      if (!m) return;
+      m.notes = notesTextarea.value;
+      Storage.saveMeeting(m);
+      if (notesStatus) notesStatus.textContent = `Saved · ${Utils.formatTimestamp(Recorder.getElapsedSeconds())}`;
+    };
+    if (notesTextarea) {
+      notesTextarea.addEventListener('input', () => {
+        if (notesStatus) notesStatus.textContent = 'Saving…';
+        clearTimeout(notesSaveTimer);
+        notesSaveTimer = setTimeout(saveNotes, 600);
+      });
+      notesTextarea.addEventListener('blur', () => {
+        clearTimeout(notesSaveTimer);
+        saveNotes();
+      });
+    }
 
     // Recorder callbacks
     Recorder.onTick = (seconds) => {
@@ -1273,6 +1365,8 @@ const App = {
       stopBtn.textContent = 'Saving…';
       removeInterim();
       isRecordingActive = false;
+      clearTimeout(notesSaveTimer);
+      saveNotes();
 
       const saved = await this._saveActiveRecording(meetingId);
       if (!saved) {

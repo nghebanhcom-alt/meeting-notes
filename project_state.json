@@ -86,11 +86,26 @@
     },
     {
       "date": "2026-09-20",
+      "title": "live-notes-panel-on-recording-screen",
+      "file": "js/app.js, css/layout.css",
+      "status": "fixed_and_reviewed",
+      "review": "APPROVE, docs/review-report.md; 2 Medium found (CSS specificity bug, implicit-flush-before-finalize) fixed same round"
+    },
+    {
+      "date": "2026-09-20",
       "title": "deepseek-brainstorming-preset-unreadable-summary-max-tokens-truncation",
       "file": "server/llm/providers/deepseek.js, server/llm/contracts.js, test/deepseek-provider.test.js (new)",
       "status": "fixed_and_reviewed",
       "review": "REQUEST_CHANGES round 1 (3 High + 1 Medium: wasted repair retry on truncation, deepseek-reasoner max_tokens unverified/could regress it, ambiguous test placeholder string, misleading INPUT_BUDGET_RATIO comment) -> all 4 fixed -> APPROVE round 2, docs/review-report.md",
       "note": "Root cause verified with a real call to api.deepseek.com using the user's real 955-segment meeting (not committed to fixtures/tests). DeepSeek's default max_tokens (8K non-thinking mode) truncated the Brainstorming preset's exhaustive-idea output; fix sends an explicit higher max_tokens for deepseek-chat only. Gemini/Codex have the same shape of gap, NOT fixed here — see docs/CHANGELOG.md Known issues."
+    },
+    {
+      "date": "2026-09-20",
+      "title": "independent-hide-show-toggle-live-transcript-live-translation",
+      "file": "js/app.js, css/layout.css, js/storage.js",
+      "status": "fixed_and_reviewed",
+      "review": "APPROVE, docs/review-report.md; 1 Low found (re-shown panel didn't scroll to bottom) fixed same round",
+      "note": "Follow-up to live-notes-panel-on-recording-screen same day. New global settings recordingShowLiveTranscript/recordingShowLiveTranslation (default true) persisted via existing Storage.saveSettings(). User confirmed: independent toggle per panel, not one combined switch."
     }
   ]
 }

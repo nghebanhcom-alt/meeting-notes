@@ -432,8 +432,16 @@
   min-height: 0;
 }
 
-.recording-streams.has-translation {
+/* Column count reflects how many of {transcript, translation, notes} panels
+   are currently visible — Live Transcript/Live Translation are independently
+   toggleable at runtime (js/app.js `updateStreamsLayout`), so this is driven
+   by a data attribute instead of static has-* classes. */
+.recording-streams[data-cols="2"] {
   grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.recording-streams[data-cols="3"] {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(280px, 0.8fr);
 }
 
 .recording-transcript-panel {
@@ -458,6 +466,26 @@
   flex: 1;
   overflow-y: auto;
   padding: var(--space-4);
+}
+
+.recording-transcript-panel .panel-body.recording-notes-body {
+  display: flex;
+  padding: 0;
+}
+
+.recording-notes-textarea {
+  flex: 1;
+  width: 100%;
+  border: none;
+  border-radius: 0;
+  resize: none;
+  background: transparent;
+  padding: var(--space-4);
+}
+
+.recording-notes-textarea:focus {
+  outline: none;
+  box-shadow: none;
 }
 
 /* ── Meeting Detail Layout ── */
@@ -637,7 +665,8 @@
     text-align: center;
   }
 
-  .recording-streams.has-translation {
+  .recording-streams[data-cols="2"],
+  .recording-streams[data-cols="3"] {
     grid-template-columns: 1fr;
   }
 

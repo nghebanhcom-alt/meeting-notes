@@ -1083,3 +1083,301 @@ An toàn để commit + push. Verdict APPROVE cho vòng 2 — 2 issue High đã 
 Critical/High mới. Còn 1 issue Medium tồn đọng từ vòng 1 (FAI-09 copy, DND-01 copy,
 `_pollPartsStatus` elapsed-time lệch) và 4 issue Low mới (3 ở trên + Medium tồn đọng) nên đưa vào
 backlog cho một đợt polish UI riêng, không cần chặn commit lần này.
+
+---
+
+# Review — Rotating backup cho JSON metadata (fix sự cố mất dữ liệu 2026-09-19)
+
+## Verdict: APPROVE
+
+## Phạm vi review
+Chỉ `server.js` (thêm `BACKUP_DIR`, `BACKED_UP_FILES`, `MAX_BACKUPS_PER_FILE`,
+`backupBeforeOverwrite`, `pruneOldBackups`, hook vào `atomicWriteJson`) + `test/atomic-backup.test.js`
+(mới). Đây là fix độc lập với `import-phone-recording`, không đụng route mới, không đụng client JS.
+
+## Đối chiếu bằng tay với `docs/CHANGELOG.md` mục 2026-09-19
+Đã đọc trực tiếp `git diff server.js`, không tin báo cáo suông của Dev.
+
+1. **Thứ tự đọc-cũ-trước-khi-ghi-đè (điểm dễ sai nhất của loại fix này) — ĐÚNG.**
+   `atomicWriteJson` gọi `await backupBeforeOverwrite(filePath)` là dòng đầu tiên, **trước** khi
+   tạo `tempPath`/ghi/`rename`. Bên trong `backupBeforeOverwrite`, `fsp.readFile(filePath, 'utf8')`
+   chạy khi `filePath` chưa hề bị đụng tới bởi lần ghi này — nội dung đọc được chắc chắn là nội
+   dung TRƯỚC lần ghi hiện tại, không phải nội dung mới. Test `overwriting an important file backs
+   up the pre-overwrite content` xác nhận đúng bằng giá trị cụ thể (`marker: 'first'` có trong
+   backup, `marker: 'second'` không có) — không chỉ assert "có file backup".
+   ENOENT (lần ghi đầu tiên, file chưa tồn tại) → trả `null` → bỏ qua backup, không lỗi. Đúng.
+
+2. **Best-effort, không chặn đường ghi chính — ĐÚNG.**
+   Toàn bộ thân `backupBeforeOverwrite` nằm trong 1 try/catch bao ngoài cùng
+   (`mkdir`/`writeFile`/`pruneOldBackups` đều nằm trong try); catch chỉ `console.error` rồi kết
+   thúc hàm, không throw lại, không return giá trị làm hỏng luồng gọi. Vì hàm không bao giờ throw,
+   `await backupBeforeOverwrite(filePath)` ở `atomicWriteJson` không cần try/catch riêng vẫn an
+   toàn. Test "a backup failure never blocks the real write" giả lập `ENOTDIR` (thay `.backups/`
+   bằng 1 file thường) và xác nhận `PUT /api/settings` vẫn trả 200 và giá trị mới thực sự được
+   `GET /api/data` đọc lại đúng — verify tận gốc thay vì chỉ tin status code.
+
+3. **Race condition khi ghi đồng thời — ĐÃ KIỂM, không phải vấn đề nhờ cơ chế có sẵn.**
+   Mọi lần gọi `atomicWriteJson` cho 4 file nằm trong `BACKED_UP_FILES` đều đi qua
+   `mutateJson`/`replaceJson`, và cả hai đều dùng `withJsonMutation` (hàng đợi Promise theo từng
+   `filePath`, đã có từ trước, dòng ~297-311) để serialize hoàn toàn read-modify-write theo từng
+   file — kể cả `JOBS_FILE` vốn được ghi thường xuyên trong lúc nhiều job STT chạy song song
+   (feature import-phone-recording). Nghĩa là không có 2 lần `backupBeforeOverwrite`/
+   `pruneOldBackups` nào chạy đồng thời trên cùng 1 file → không có nguy cơ trùng tên backup hay
+   prune xoá nhầm do race. Tên file backup còn có thêm timestamp ISO (mili-giây) + 8 ký tự
+   `crypto.randomUUID()` ngẫu nhiên, đủ để tránh trùng ngay cả khi giả định không có hàng đợi.
+   Ngoại lệ duy nhất gọi `atomicWriteJson(SETTINGS_FILE, ...)` trực tiếp không qua hàng đợi là
+   `migrateLlmSettings()` (dòng 112) — chạy 1 lần lúc khởi động server trước khi nhận request, không
+   có nguy cơ đồng thời.
+
+4. **`pruneOldBackups` — logic sort/xoá đúng, không off-by-one.**
+   Tên file có dạng `<basename>-<ISO timestamp, `:`/`.` → `-`>-<8 hex>.json`; sort chuỗi tăng dần
+   tương đương sort theo thời gian tăng dần (ISO 8601 sort lexicographic đúng thứ tự thời gian).
+   `excess = matching.length - MAX_BACKUPS_PER_FILE`; nếu `length === 5` → `excess = 0` → giữ đủ 5;
+   nếu `length === 6` → xoá đúng 1 (phần tử đầu mảng đã sort = cũ nhất) → còn lại đúng 5 bản MỚI
+   NHẤT. Không có off-by-one. Test "only the 5 most recent backups per file are kept" ghi 7 lần liên
+   tiếp (có `sleep 5ms` giữa mỗi lần để timestamp không trùng) và assert `length === 5` chính xác
+   (không phải `<= 5`).
+
+5. **Hiệu năng — overhead thấp hơn lo ngại ban đầu trong brief, đã verify bằng cách đọc thêm các
+   call site của `JOBS_FILE`/`MEETINGS_FILE`, không chỉ đọc riêng đoạn diff.**
+   - `MEETINGS_FILE` chỉ lưu metadata (transcript/summary được lưu tách trong
+     `TRANSCRIPTS_DIR`/`SUMMARIES_DIR` qua `artifactPath`, ghi bằng `atomicWriteJson` riêng — các
+     file này KHÔNG nằm trong `BACKED_UP_FILES` nên không phát sinh backup) → kích thước file được
+     backup nhỏ hơn nhiều so với lo ngại "vài MB" trong brief.
+   - `JOBS_FILE` chỉ được ghi tại các mốc vòng đời job (tạo job, promote từ queued→processing,
+     `finishJob`, watchdog dọn job kẹt) — không có polling ghi liên tục; watchdog
+     (`JOB_WATCHDOG_INTERVAL_MS = 5 phút`) cũng chỉ ghi khi thực sự có job kẹt, không ghi mỗi tick.
+   - Với tần suất ghi theo sự kiện (không phải theo thời gian) như trên, overhead 1 lần đọc file cũ
+     + 1 lần ghi backup + 1 lần `readdir` liệt kê tối đa vài chục file trong `.backups/` là không
+     đáng kể. Không thấy nguy cơ nghẽn I/O ở mức hiện tại của app (single-user, local-first).
+
+6. **Test tự chạy lại — khớp báo cáo Dev.** `npm test` (chạy trực tiếp, không dùng lại log cũ):
+   `223 passing, 2 skipped, 0 failing` — khớp chính xác con số Dev báo. 4 test mới trong
+   `test/atomic-backup.test.js` đều pass và đều assert giá trị cụ thể (nội dung backup, đúng số
+   lượng file còn lại, đúng 0 backup cho file ngoài allowlist, request vẫn 200 khi backup lỗi) —
+   không có test nào chỉ `assert_called()`/kiểm sự tồn tại file suông.
+
+7. **Không xung đột với các thay đổi khác.**
+   - `git status` cho thấy `js/app.js`, `js/recorder.js` (2 fix đã APPROVE trước đó) không nằm
+     trong diff hiện tại — đã được commit ở vòng trước, không bị đụng lại.
+   - `grep` xác nhận `server/meeting-parts.js` (route parts mới của import-phone-recording) không
+     gọi `atomicWriteJson` trực tiếp — route parts ghi qua `mutateJson(MEETINGS_FILE, ...)` ở
+     `server.js`, tức là vẫn đi qua đúng 1 điểm chốt `atomicWriteJson` duy nhất, được backup tự
+     động, không cần Dev sửa thêm ở `meeting-parts.js`.
+   - `EXPORT_SETTINGS_FILE` và thư mục `BUG_REPORTS_DIR` cố tình **không** nằm trong
+     `BACKED_UP_FILES` — đúng như Dev mô tả, test "writing a file outside the important list
+     creates no backup" xác nhận bằng `/api/bug-reports` (0 backup sinh ra).
+
+## External contract verification
+N/A — không có tool/API bên thứ 3 nào trong thay đổi này (chỉ đọc/ghi file cục bộ bằng `node:fs`).
+
+## Đối chiếu baseline bảo mật (CLAUDE.md)
+- Không thêm endpoint `/api/*` nào — thay đổi nằm hoàn toàn trong hàm nội bộ `atomicWriteJson`,
+  vẫn được gọi từ các route đã qua `hasTrustedHost`/`isTrustedApiRequest` như trước.
+- Không đụng tới API key/keychain.
+- Tên file backup (`basename` lấy từ hằng số server tự định nghĩa: `meetings`, `settings`, `jobs`,
+  `presets` — không phải input từ client) + timestamp/UUID tự sinh phía server → không có input
+  người dùng nào chạm trực tiếp vào đường dẫn filesystem ở đây, không vi phạm quy tắc hash-id.
+- Không có `child_process.spawn` mới.
+- Lưu ý Low (không chặn merge): các file backup là bản sao plaintext y hệt nội dung đã lưu tại chỗ
+  (`storage/*.json` vốn đã là plaintext theo thiết kế hiện tại của app) — không tạo ra lớp rò rỉ dữ
+  liệu mới, nhưng nhân đôi bề mặt nếu sau này `settings.json`/`meetings.json` chứa dữ liệu nhạy cảm
+  hơn. Không cần hành động ngay, chỉ ghi chú cho lần review kế tiếp nếu scope 2 file này mở rộng.
+
+## Issues Found
+
+### Critical
+(none)
+
+### High
+(none)
+
+### Medium
+(none)
+
+### Low
+- [ ] [server.js, comment phía trên `backupBeforeOverwrite`] Quy trình khôi phục thủ công (dừng
+  server → copy file từ `storage/.backups/` đè lên `storage/<name>.json` → khởi động lại) hiện chỉ
+  được ghi trong 1 comment code. Vì mục tiêu của cả tính năng này là để xử lý đúng loại sự cố vừa
+  xảy ra (mất dữ liệu thật), người sẽ cần quy trình này khi hoảng loạn giữa 1 sự cố thật nhiều khả
+  năng không mở `server.js` ra đọc comment trước. Gợi ý: thêm 1 đoạn ngắn (5-6 dòng) vào
+  `SECURITY.md` hoặc 1 file `docs/RECOVERY.md` mới, trỏ rõ vị trí `storage/.backups/` và các bước
+  khôi phục — việc này không cần code, có thể làm ở đợt sau, không chặn merge.
+- [ ] [project_state.json] `blockers` hiện vẫn còn nguyên
+  `incident-2026-09-19-qa-wiped-real-storage-meetings-json...` (ghi rõ "BLOCKS merge của PR-1 cho
+  tới khi PM/user acknowledge"). Fix này giải quyết đúng NGUYÊN NHÂN GỐC (không có backup nào để
+  khôi phục), nhưng bản thân sự cố mất dữ liệu thật đã xảy ra vẫn cần PM báo cho user xác nhận đã
+  biết — đây không phải lỗi code, chỉ nhắc PM đừng để việc fix xong (tốt) bị hiểu nhầm là sự cố đã
+  "xong" theo nghĩa nhân sự/quy trình.
+
+## Positive Notes
+- Fix bám sát chính xác điểm chết người của loại bug này (đọc cũ trước khi ghi đè) và có test assert
+  bằng giá trị cụ thể để chứng minh, không chỉ tin cấu trúc code "nhìn có vẻ đúng thứ tự".
+- Tận dụng đúng hàng đợi `withJsonMutation` đã có sẵn thay vì tự chế thêm 1 lớp lock riêng cho
+  backup — giảm bề mặt bug mới, và đúng tinh thần "1 điểm chốt duy nhất" (`atomicWriteJson`) mà
+  codebase này đang theo.
+- Phạm vi backup được giới hạn có chủ đích (`BACKED_UP_FILES` allowlist, không backup mọi
+  `atomicWriteJson`) và có test xác nhận rõ ranh giới đó (file ngoài allowlist → 0 backup) — tránh
+  biến backup thành noise vô nghĩa.
+- Test mới đúng tinh thần Protocol 6: assert nội dung cụ thể (giá trị `marker`) truyền/giữ lại giữa
+  các bước ghi, không chỉ assert "có gọi hàm"/"có file".
+- Best-effort error handling được test bằng cách giả lập lỗi thật (`ENOTDIR`) thay vì mock hàm nội
+  bộ để "chắc chắn nó throw" — test này vẫn còn giá trị nếu Dev sau này đổi cách hiện thực bên
+  trong `backupBeforeOverwrite`.
+- CHANGELOG ghi rất rõ ràng, kể cả các quyết định "không làm gì" (không thêm guard "mảng nhỏ hơn
+  là bug" vì xung đột với bulk-delete hợp lệ) — giúp review nhanh hơn nhiều vì không phải tự suy
+  đoán Dev có cân nhắc trường hợp đó chưa.
+
+# Review — 4 bug fix sau QA vòng 2 (import-phone-recording)
+
+## Verdict: APPROVE
+
+## Tóm tắt cho PM
+Đã đọc `docs/CHANGELOG.md` mục Dev vừa append, sau đó tự đọc code độc lập (không tin lời Dev
+mô tả) cho cả 4 fix + 2 file mới, đối chiếu BR-94/BR-139/BR-146/BR-104/BR-136 trong `docs/PRD.md`,
+và tự chạy `npm test`. Không tìm thấy Critical/High. Đề nghị PM chuyển sang QA re-test (vẫn tính
+Dev↔QA round 1/5 theo Protocol 3 — không có vi phạm Protocol 5/8 nào ở đợt fix này).
+
+## Verify từng fix
+
+### BUG-003 (High) — BR-94 áp dụng cho ngày gõ tay
+- Đọc `docs/PRD.md:329`: BR-94 = tương lai quá 1 ngày HOẶC trước 2000-01-01 → từ chối, "áp dụng
+  cho cả giá trị suy ra từ file lẫn giá trị người dùng gõ tay". Đối chiếu `js/meeting-date.js`:
+  `FUTURE_GRACE_MS = 24*3600*1000`, `MIN_PLAUSIBLE_MS = Date.UTC(2000,0,1)`, điều kiện
+  `ms <= now+grace && ms >= min` — khớp chính xác ngưỡng PRD, không phải số Dev tự nhớ.
+- Áp dụng nhất quán ở CẢ 2 nơi, đã grep xác nhận: `js/import.js:712` (handler `[data-field="date"]`
+  cho browser hỗ trợ `datetime-local`) và `:726` (fallback `date-day`/`date-time`), cùng
+  `js/app.js:2512` (`save-premeeting`). Cả 3 nơi cùng gọi `MeetingDate.isPlausibleMeetingDate`,
+  không có nhánh nào bị bỏ sót.
+- Vi phạm → giữ giá trị cũ + báo lỗi, không silent fail: cả 3 handler đều `App.toast(...,'error')`
+  tiếng Việt rồi phục hồi input về giá trị cũ (`entry.dateIso` ở import.js,
+  `_setDateEditorValue(m.date)` ở app.js) trước khi `return`/bỏ qua gán — không có đường nào rơi
+  qua để gán giá trị bất hợp lệ. Ở `app.js:2508-2517`: `newDateIso` bị set về `null` sau khi
+  reject, nên `if (newDateIso) m.date = newDateIso;` đúng là skip — đã trace tay, không suy đoán.
+- Điểm Dev tự quyết (chỉ chặn riêng field `date`, các field khác `meetingType/topic/leadBy` vẫn
+  lưu khi date invalid): chấp nhận được — BR-94/BR-145 chỉ nói về hành vi của riêng `date`, không
+  có yêu cầu nào trong PRD về việc phải abort toàn bộ Save khi 1 field không liên quan bị lỗi;
+  khớp tinh thần "mỗi editor tự lo phần của nó" đã có sẵn trong file này (participants, tags...).
+- Test `test/meeting-date.test.js` (đọc trực tiếp): 6 case gồm đúng biên dưới inclusive
+  (`MIN_PLAUSIBLE_MS` chính nó phải plausible=true), biên trên ±60s quanh `FUTURE_GRACE_MS`, và
+  input không parse được (`'not-a-date'`, `''`, `undefined`) không throw — coverage boundary tốt,
+  không chỉ test giá trị giữa khoảng.
+
+### BUG-002 — `findDuplicateMeeting` duyệt cả `parts[]`
+- Đọc `js/import-preflight.js:140-150`: logic mới `.some(part => part.filename === name &&
+  Number(part.sizeBytes) === sizeBytes)` kết hợp OR với check top-level cũ — đúng cấu trúc BR-139.2.
+- Không false-positive: điều kiện dùng `&&` (tên VÀ size), không phải `||` — file trùng tên khác
+  size, hoặc trùng size khác tên, đều không match. Xác nhận bằng test đã có sẵn
+  (`test/import-preflight.test.js:122-127`, viết từ trước) + test mới (`:129-143`) cover đúng 4
+  case: part 2 của bản ghi ghép phải bắt được (repro chính xác BUG-002), part 1/top-level vẫn hoạt
+  động, không match gì trả `null`, và `parts: []` rỗng trên bản ghi đơn không vỡ gì (không
+  `.some()` trên `undefined`). Đã tự chạy `npm test` xác nhận cả 4 test pass.
+
+### BUG-004 — so đúng `promptContextUpdatedAt`
+- Đọc `js/storage.js:186`: `PROMPT_CONTEXT_FIELDS` = đúng 8 field BR-146 liệt kê
+  (title/date/duration/participants/meetingType/topic/leadBy/notes), field này bump
+  `promptContextUpdatedAt` — xác nhận cơ chế gốc đã đúng từ trước (batch 1), bug chỉ nằm ở chỗ đọc
+  sai field.
+- `git diff` xác nhận đúng bug gốc: code cũ `_preMeetingStaleHint` so `meeting.updatedAt` (bump ở
+  mọi lần save) với `generatedAt`; code mới gọi thẳng `SummaryStaleness.isPreMeetingInfoStale`,
+  không còn đụng `updatedAt` ở đâu trong hàm này nữa.
+- `js/summary-staleness.js` áp dụng đúng R-AF deny-by-default: thiếu `generatedAt` HOẶC thiếu
+  `contextUpdatedAt` → trả `false` (không nudge oan), và so sánh dùng `>` (strictly after) chứ
+  không phải `>=` — có test riêng cho case "equal timestamps -> not stale" xác nhận không phải
+  off-by-one.
+- Test mới (`isPreMeetingInfoStale`, đọc trực tiếp trong file test, đã pass khi tự chạy `npm test`)
+  tái hiện đúng bug gốc: case "tagging bumps updatedAt only" không nudge, và có case riêng chứng
+  minh 1 prompt-context change thật với `updatedAt` CŨ HƠN vẫn nudge đúng (chứng minh `updatedAt`
+  thực sự không còn được dùng, không chỉ test cho qua).
+
+### BUG-001 — `Parts.partErrorCopy` + escape HTML
+- `js/parts.js:218-230`: hàm trả plain text (title/detail), có comment JSDoc nói rõ caller chịu
+  trách nhiệm escape — đúng convention `js/app.js` đang dùng cho các field khác trong cùng file
+  (`Utils.escapeHtml` bọc mọi nội dung động).
+- Render tại `js/app.js` (`_renderMultiPartSection`): cả `copy.title` và `copy.detail` đều đi qua
+  `Utils.escapeHtml(...)` trước khi nội suy vào template string — đã đọc đúng dòng code
+  (`<strong>${Utils.escapeHtml(copy.title)}</strong>`, `<p ...>${Utils.escapeHtml(copy.detail)}</p>`),
+  không có field nào lọt escape. Đây là điểm brief nhấn mạnh dễ tạo XSS — đã đọc kỹ, không chỉ tin
+  báo cáo của Dev: `copy.detail` cho case không phải `STT_TRANSCRIBE_FAILED` nội suy trực tiếp
+  `part.error.message` (dữ liệu từ provider bên ngoài, không tin cậy) vào `detail`, và field này
+  vẫn được escape đúng ở nơi render — không có đường nào để provider message chèn HTML sống.
+- Mã lỗi khác vẫn giữ hành vi cũ: nhánh `else` trả nguyên title cũ ("Phần N chưa tạo được
+  transcript") + `Nhà cung cấp báo: ${message}` làm detail phụ — đúng BR-104 (mã lỗi/message ở
+  dòng phụ, không phải headline) và giữ nguyên hành vi các code khác. Test
+  `test/parts-order.test.js:175-186` xác nhận đúng: `STT_RATE_LIMITED` giữ generic title, và
+  trường hợp `error: null` không throw.
+
+## File mới — convention & wiring
+- `js/meeting-date.js`, `js/summary-staleness.js`: cả 2 đều pure function, không đụng DOM/fetch,
+  có `module.exports` guard giống hệt `js/meeting-types.js`/`js/tags.js`/`js/parts.js` — đúng
+  convention project đã xác lập.
+- `index.html:121-122`: 2 script tag mới nằm SAU `parts.js`, TRƯỚC `import-preflight.js`,
+  `storage.js`, và quan trọng nhất là TRƯỚC `import.js`/`app.js` (2 file thực sự gọi
+  `MeetingDate`/`SummaryStaleness`) — thứ tự load không vỡ dependency, đã đọc toàn bộ khối script
+  tag để xác nhận, không chỉ xem đoạn diff quanh 2 dòng mới.
+- Quyết định tạo 2 file mới thay vì nhét vào file cũ: chấp nhận được — lý do Dev nêu (để có
+  `node --test` trực tiếp, không phụ thuộc browser) hợp lý và nhất quán với pattern hiện có; đây
+  đúng là loại thay đổi nhỏ nên note cho Tech Lead cân nhắc đưa vào Architecture.md module list ở
+  lần review kiến trúc kế tiếp, không phải lỗi cần sửa ngay.
+
+## Test suite — tự chạy độc lập
+`npm test` (chạy trực tiếp, không dùng lại số Dev báo): **239 passing, 2 skipped, 0 failing** —
+khớp chính xác báo cáo trong CHANGELOG. 2 skip là golden fixture Whisper/Google do thiếu API key
+trên máy dev (Protocol 5.4, không liên quan tới 4 fix này).
+
+## Đối chiếu các APPROVE trước đó (không phá vỡ gì)
+- `js/recorder.js` và phần backup JSON (2 vòng review TV1-16, review atomic-backup) không nằm
+  trong diff của đợt fix này — `git status`/CHANGELOG xác nhận 4 fix chỉ chạm
+  `js/meeting-date.js` (mới), `js/summary-staleness.js` (mới), `js/import.js`, `js/app.js`,
+  `js/import-preflight.js`, `js/parts.js`, `index.html`, và các file test tương ứng.
+- Blocker Critical còn mở trong `project_state.json` (sự cố mất dữ liệu `storage/meetings.json`)
+  không liên quan tới 4 fix này (đã lưu ý ở review trước) — không phải lý do chặn đợt review này,
+  chỉ nhắc lại PM vẫn cần xử lý riêng.
+
+## External contract verification
+N/A — cả 4 fix đều là logic thuần phía client (không gọi STT/LLM provider, không thêm
+`child_process.spawn`, không thêm endpoint `/api/*`).
+
+## Đối chiếu baseline bảo mật (CLAUDE.md)
+- Không thêm endpoint `/api/*` nào.
+- Không đụng API key/keychain.
+- Không có ID nào từ input người dùng chạm filesystem trong 4 fix này (toàn bộ là logic hiển
+  thị/validate phía client, thao tác trên object `meeting` đã có sẵn trong bộ nhớ).
+- Không có `child_process.spawn` mới.
+
+## Issues Found
+
+### Critical
+(none)
+
+### High
+(none)
+
+### Medium
+(none)
+
+### Low
+- [ ] [js/parts.js:227-229, generic error branch] `detail` cho các mã lỗi khác `STT_TRANSCRIBE_FAILED`
+  vẫn hiển thị nguyên message tiếng Anh của provider (`Nhà cung cấp báo: ${message}`) — đúng BR-104
+  (mã lỗi/message chỉ ở dòng phụ, không phải headline, nên không vi phạm) nhưng vẫn là text tiếng
+  Anh xen giữa câu tiếng Việt ở dòng phụ. Không chặn merge (đây là hành vi CŨ, không phải do 4 fix
+  này gây ra, và BR-147 cũng chỉ yêu cầu text MỚI của feature phải tiếng Việt) — chỉ ghi chú để
+  backlog xem có cần Việt hoá message của toàn bộ provider ở một đợt riêng.
+- [ ] [docs/Architecture.md] `js/meeting-date.js`/`js/summary-staleness.js` chưa được thêm vào
+  module list của Architecture.md (tự Dev đã flag trong CHANGENOG). Không chặn merge — đề nghị
+  Tech Lead cập nhật ở lần review kiến trúc kế tiếp cho đồng bộ tài liệu.
+
+## Positive Notes
+- Cả 4 fix đều bám sát chính xác root cause đã mô tả trong `docs/test-report.md`, không có fix nào
+  "vá triệu chứng" — ví dụ BUG-004 sửa đúng vào chỗ đọc field, không thêm debounce/workaround che
+  triệu chứng.
+- Ngưỡng BR-94 lấy đúng từ nguồn PRD (đã tự đối chiếu số, không tin lại lời Dev tự thuật) và dùng
+  chung 1 hằng số duy nhất (`js/meeting-date.js`) cho cả 3 điểm áp dụng — tránh đúng kiểu bug "2
+  nhánh lệch nhau" mà Protocol 8 cảnh báo.
+- Test cho cả 4 fix đều assert giá trị cụ thể (chuỗi tiếng Việt chính xác, `null` object cụ thể,
+  boundary chính xác từng mốc thời gian) chứ không chỉ "không throw"/"có gọi hàm" — đúng tinh thần
+  Protocol 6.
+- BUG-001 xử lý escape HTML đúng ở điểm dễ sai nhất (dữ liệu detail chứa message provider không
+  tin cậy) — đã tự đọc kỹ dòng render, không chỉ tin lời Dev báo "đã sửa ở `_renderMultiPartSection`".
+- CHANGELOG minh bạch 2 điểm tự quyết (partial-save khi date invalid, tạo file mới thay vì inline)
+  kèm lý do rõ ràng — giảm thời gian review vì không phải đoán Dev có cân nhắc case đó chưa.

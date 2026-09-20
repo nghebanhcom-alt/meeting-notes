@@ -126,6 +126,22 @@ test('findDuplicateMeeting matches on BOTH filename and byte size', () => {
   assert.strictEqual(findDuplicateMeeting({ name: 'REC_002.m4a', size: 54525952 }, existing), null, 'same size, different name is NOT a duplicate');
 });
 
+test('findDuplicateMeeting also matches part 2+ of a merged meeting (BUG-002 regression, BR-139.2)', () => {
+  const merged = {
+    id: 'm-merged', sourceFilename: 'partA.m4a', sourceSizeBytes: 1000,
+    parts: [{ filename: 'partA.m4a', sizeBytes: 1000 }, { filename: 'partB.m4a', sizeBytes: 2000 }]
+  };
+  assert.strictEqual(findDuplicateMeeting({ name: 'partB.m4a', size: 2000 }, [merged]), merged, 'part 2 of a merged meeting must be caught, not just part 1');
+  assert.strictEqual(findDuplicateMeeting({ name: 'partA.m4a', size: 1000 }, [merged]), merged, 'part 1 (top-level sourceFilename) must still be caught');
+  assert.strictEqual(findDuplicateMeeting({ name: 'partC.m4a', size: 3000 }, [merged]), null, 'a file matching no part at all is not a duplicate');
+});
+
+test('findDuplicateMeeting is unaffected by an absent/empty parts array on a single-file meeting', () => {
+  const single = { id: 'm-single', sourceFilename: 'REC_001.m4a', sourceSizeBytes: 54525952, parts: [] };
+  assert.strictEqual(findDuplicateMeeting({ name: 'REC_001.m4a', size: 54525952 }, [single]), single);
+  assert.strictEqual(findDuplicateMeeting({ name: 'other.m4a', size: 1 }, [single]), null);
+});
+
 test('findDuplicateInBatch flags two picks of the same file within one import action', () => {
   const a = { name: 'x.m4a', size: 100 };
   const b = { name: 'x.m4a', size: 100 };

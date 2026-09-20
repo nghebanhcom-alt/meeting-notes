@@ -1280,3 +1280,172 @@ built and tested in batch 2.
   part — all 3 calls returned the expected shapes).
 - `npm test` after these changes: 221 passing, 2 skipped (unchanged Whisper/Google golden
   fixtures), 0 failing — full output pasted in the Dev report to PM for this round.
+
+## 2026-09-19 — Rotating backup for critical metadata files (data-loss incident fix)
+
+Direct fix for the real incident logged in `project_state.json` → `blockers`
+(`incident-2026-09-19-qa-wiped-real-storage-meetings-json-...`): a QA session hit the real
+server instead of an isolated test one and permanently wiped `storage/meetings.json`, with no
+backup anywhere to recover it. This is an independent fix, unrelated to the
+`import-phone-recording` feature itself.
+
+- **`server.js`**: `atomicWriteJson(filePath, value)` (the single choke point already used for
+  every JSON metadata write) now calls `backupBeforeOverwrite(filePath)` before its existing
+  temp-file-then-rename write. `backupBeforeOverwrite` only acts for a fixed allowlist,
+  `BACKED_UP_FILES` — `MEETINGS_FILE`, `SETTINGS_FILE`, `JOBS_FILE`, `PRESETS_FILE` — deliberately
+  excluding lower-stakes/high-frequency writes through the same function (audio metadata sidecars,
+  export-settings, bug reports, the preset-schema tmp file) so backups stay meaningful instead of
+  noise.
+  - Before an important file is overwritten, if it currently exists on disk, its **current**
+    content (i.e. what's about to be replaced) is copied verbatim to a file under
+    `storage/.backups/`, named `<basename>-<ISO timestamp, `:` and `.` replaced with `-`>-<8-char
+    random id>.json`. The random suffix only exists to avoid same-millisecond filename collisions
+    under rapid writes; it has no other meaning.
+  - After each backup, `pruneOldBackups(basename)` keeps only the 5 most recent files per
+    basename (lexicographic sort on the ISO-prefixed filename), deleting the rest.
+  - Backup is strictly best-effort: any failure (directory uncreatable, disk full, permission
+    denied, etc.) is caught, logged via `console.error`, and swallowed — it can never throw out of
+    `atomicWriteJson` and can never block the real write. Verified directly in the new test's
+    "broken backup directory" case.
+  - No restore endpoint/UI in this v1 (explicitly out of scope per the brief). Manual restore:
+    stop the server, copy the desired file from `storage/.backups/<name>-<timestamp>-<id>.json`
+    over the corresponding `storage/<name>.json`, then restart the server. This is documented as a
+    comment directly above `backupBeforeOverwrite` in `server.js`.
+  - Explicitly did **not** add any "new array smaller than old array" guard/warning — that would
+    conflict with the legitimate "Delete selected" bulk-delete feature (a deliberate shrink is not
+    a bug). Out of scope per the brief; backup-only.
+  - `storage/.backups/` needs no `.gitignore` change — `storage/*` is already ignored.
+
+### Test suite
+- New `test/atomic-backup.test.js` (port 8803, isolated `MEETNOTE_STORAGE_DIR` temp dir, same
+  spawn-the-real-server pattern as `test/http.test.js` — `atomicWriteJson` itself isn't exported,
+  so the backup behavior is only observable end-to-end through real API routes):
+  - `PUT /api/settings` twice → a backup file exists whose parsed content is the value from the
+    *first* write, not the second (asserts the actual JSON value, not just "a file exists").
+  - `PUT /api/settings` 7 times in a row → exactly 5 backup files remain, never 6+.
+  - `POST /api/bug-reports` twice (writes a JSON file through the same `atomicWriteJson`, but not
+    in `BACKED_UP_FILES`) → zero backup files created for it.
+  - Replace `storage/.backups` with a plain file (forces `fsp.mkdir(..., {recursive:true})` to
+    throw `ENOTDIR`) → the next `PUT /api/settings` still returns 200 and the new value is
+    actually persisted (`GET /api/data`).
+- `npm test`: 223 passing (219 pre-existing + 4 new), 2 skipped (unchanged Whisper/Google golden
+  fixtures, no API key on this dev machine), 0 failing.
+
+## 2026-09-20 — Fix 4 bugs from `import-phone-recording` QA round 2 (Dev↔QA round 1/5, Protocol 3)
+
+Fixes for the 4 bugs in `docs/test-report.md` § "Test Report — import-phone-recording, lần 2
+(server cách ly đã verify, trước khi merge PR #1)": BUG-003 (High), BUG-002/BUG-004 (Medium, new
+this round), BUG-001 (Medium, carried over unfixed from round 1). Independent of the still-open
+Critical `storage/meetings.json` incident tracked in `project_state.json` → `blockers` — not
+touched by this round.
+
+### BUG-003 (High) — BR-94 date plausibility never ran for hand-typed dates
+- Root cause: `_suggestedDateIso`/`_suggestedDateSource` (`js/import.js`) already implemented
+  BR-94's threshold (future > now+1 day, or before 2000-01-01) correctly, but only for the
+  `file.lastModified` auto-suggestion. Every place a user could type/change a date by hand — the
+  import modal's per-entry date field, and Meeting Detail's pre-meeting date editor
+  (`save-premeeting`, added in TV13/US-23) — assigned the typed value straight through with no
+  validation at all, client or server.
+- New `js/meeting-date.js`: `isPlausibleMeetingDate(iso)`, a pure function extracting the exact
+  same threshold already approved for the auto-suggestion (`FUTURE_GRACE_MS = 24h`,
+  `MIN_PLAUSIBLE_MS = 2000-01-01`), dual-mode (`module.exports` guard) so `node --test` exercises
+  it directly — new script tag added to `index.html` before `import.js`/`app.js`.
+  `_suggestedDateIso`/`_suggestedDateSource` themselves were left untouched (already verified
+  correct by QA; no reason to risk regressing them by rewiring to share the new helper).
+- `js/import.js`: both manual-date change handlers (`[data-field="date"]` for
+  `datetime-local`-capable browsers, `[data-field="date-day"]`/`[data-field="date-time"]` for the
+  fallback) now call `MeetingDate.isPlausibleMeetingDate` before accepting the typed value; on
+  rejection, shows a Vietnamese `App.toast` error and resets the input(s) back to the entry's
+  current `dateIso` instead of accepting the bad value.
+- `js/app.js`: `save-premeeting` click handler now validates `_readDateEditor()`'s result the same
+  way before assigning `m.date`; on rejection, shows the same toast, calls new
+  `_setDateEditorValue(iso)` (sets the date input(s) back to the meeting's currently-saved
+  `date`), and skips the date assignment — other pre-meeting fields
+  (`meetingType`/`topic`/`leadBy`) in the same Save click still save normally, only the invalid
+  date is rejected.
+- Tests: new `test/meeting-date.test.js` (6 cases) — now, 1 month future (exact QA repro), a date
+  before 2000, the exact inclusive lower bound, the 1-day boundary on both sides, and unparsable
+  input never throwing.
+
+### BUG-002 (Medium) — duplicate-import warning only matched part 1 of a merged meeting
+- Root cause: `findDuplicateMeeting` (`js/import-preflight.js`) only compared against
+  `meeting.sourceFilename`/`meeting.sourceSizeBytes`, which for a merged meeting only ever hold
+  part 1's values (BR-137) — parts 2+ were never checked, so re-selecting a file already used as
+  part 2/3/4 of an existing merged meeting produced no warning at all.
+- Fix: `findDuplicateMeeting` now also checks every entry of `meeting.parts[]`
+  (`filename`/`sizeBytes`) for each candidate meeting, in addition to the existing top-level
+  fields — a match on either the top-level fields or any part counts as a duplicate.
+- Tests: added to `test/import-preflight.test.js` — the exact QA repro (2000-byte `partB.m4a` as
+  part 2 of a merged meeting must resolve, not `null`), part-1/top-level match still works, no
+  match at all still returns `null`, and a single-file meeting with an empty `parts` array is
+  unaffected.
+
+### BUG-004 (Medium) — "info newer than summary" nudge compared the wrong timestamp
+- Root cause: `_preMeetingStaleHint` (`js/app.js`) compared `meeting.updatedAt` (bumped on
+  *every* save — tags, action item ticks, preset choice) against
+  `meeting.summaryGeneration.generatedAt`. The correct field, `meeting.promptContextUpdatedAt`
+  (bumped only when one of the 8 prompt-context fields actually changes — already implemented
+  correctly in `js/storage.js` since batch 1/TV8), was computed but never read anywhere.
+- New `js/summary-staleness.js`: `isPreMeetingInfoStale(meeting)`, a pure function (dual-mode,
+  script tag added to `index.html`) comparing `promptContextUpdatedAt` vs. `generatedAt`, with
+  R-AF deny-by-default (missing `promptContextUpdatedAt` → never stale). `_preMeetingStaleHint`
+  now just calls this and renders the same markup as before.
+- Tests: new `test/summary-staleness.test.js` (5 cases) — the exact BUG-004 repro (tag-only save
+  bumping `updatedAt` but not `promptContextUpdatedAt` must not nudge), a real prompt-context
+  change correctly nudges even with an *older* `updatedAt` (proves `updatedAt` really is ignored
+  now), no `summaryGeneration` yet, missing `promptContextUpdatedAt` (deny-by-default), and equal
+  timestamps (must be strictly after, not `>=`).
+
+### BUG-001 (Medium, carried over unfixed from round 1) — silent-part error message was raw English
+- Root cause: the failed-part error card (`_renderMultiPartSection`, `js/app.js`) always rendered
+  the generic title "Phần N chưa tạo được transcript" plus `error.message` verbatim — for an empty
+  transcript (`STT_TRANSCRIBE_FAILED`, thrown by `normalizeResult` in
+  `server/stt/contracts.js` when a part has no detectable speech), that raw message is the
+  English string "The provider did not return any transcript for this audio.", not the Vietnamese
+  "không nghe thấy giọng nói" BR-136 requires.
+- New `Parts.partErrorCopy(part)` in `js/parts.js` (already the shared pure-logic module for
+  multi-part client helpers, used by both `import.js` and `app.js`): recognizes
+  `part.error.code === 'STT_TRANSCRIBE_FAILED'` and returns a Vietnamese title +
+  detail ("Phần N không nghe thấy giọng nói" / "Có thể do bấm nhầm nút ghi âm hoặc đoạn ghi bị im
+  lặng hoàn toàn."); every other error code keeps the previous generic title with the raw
+  provider message as a secondary detail (BR-104: error code/message belongs in the secondary
+  detail line, never the headline). Returns plain text only — `js/app.js` still owns
+  `Utils.escapeHtml` on both fields before rendering, same convention as the rest of the file.
+- Tests: added to `test/parts-order.test.js` — `STT_TRANSCRIBE_FAILED` gets the Vietnamese
+  headline with no leaked English text, any other code keeps the generic title + raw message,
+  and a missing `error` object never throws.
+
+### Self-assessed points where the brief/docs were silent (flagging per Dev Agent instructions)
+- BUG-003 Meeting Detail behavior on an invalid date: the brief/BR-94 describe "reject, keep the
+  previous value" for the *value itself*, but say nothing about whether the rest of a
+  `save-premeeting` click (meetingType/topic/leadBy) should still be saved when only the date is
+  invalid. Chose to save the other fields and only skip the date — no PRD text suggested the
+  whole Save action should be aborted for an unrelated field's edit, and this matches this
+  card's existing per-field-independent feel (each editor already saves its own concern).
+- BUG-001 microcopy: `docs/ux-import-phone-recording.md` has no approved string for this exact
+  case (grepped, no hit). Wrote "Phần N không nghe thấy giọng nói" / "Có thể do bấm nhầm nút ghi
+  âm hoặc đoạn ghi bị im lặng hoàn toàn." directly from BR-136's own wording ("không nghe thấy
+  giọng nói trong phần này") and the Dev-facing suggestion already in `docs/test-report.md`'s
+  BUG-001 entry, rather than inventing new phrasing — flagging in case UX/PM want to bless
+  different exact wording later.
+- New shared pure-logic files (`js/meeting-date.js`, `js/summary-staleness.js`): not explicitly
+  named in Architecture.md. Followed the codebase's own established convention (same header
+  comment pattern as `js/meeting-types.js`/`js/tags.js`/`js/parts.js`: pure function, no DOM/fetch,
+  `module.exports` guard, one script tag added to `index.html` before the glue code that uses it)
+  rather than inlining the logic in `js/app.js`/`js/import.js` directly, specifically so each new
+  fix could get a real `node --test` case instead of only living behind manual/live QA — the brief
+  explicitly required "test cho cả 4 fix". Flagging as a small scope decision (new files, not
+  requested verbatim) in case Tech Lead wants these folded into Architecture.md's module list.
+
+### Test suite
+- `npm test`: 239 passing (223 pre-existing + 16 new: 6 in `test/meeting-date.test.js`, 5 in
+  `test/summary-staleness.test.js`, 3 in `test/parts-order.test.js`, 2 in
+  `test/import-preflight.test.js`), 2 skipped (unchanged Whisper/Google golden fixtures, no API
+  key on this dev machine), 0 failing.
+- Manual smoke check: started `server.js` on an isolated port (8903) + isolated
+  `MEETNOTE_STORAGE_DIR` (`/tmp/meetnote-dev-smoke`, deleted after) — confirmed `GET /api/data`
+  returned `meetings: []` before touching anything, the 2 new script tags serve `200` at their
+  `index.html` paths, then tore the temp dir down. Did not touch `storage/` or port 8765 at any
+  point.
+- Not re-claiming "fixed"/"done" for the feature as a whole — Reviewer and QA still need to run
+  their own passes per Protocol 7.

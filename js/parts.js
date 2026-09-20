@@ -205,6 +205,30 @@ function formatGapRangeClock(prevLastModified, nextLastModified) {
   return `${clock(start)} → ${clock(end)}`;
 }
 
+// BR-104/136 — decide the (title, detail) copy for a failed part's error
+// card. An empty-transcript failure (`STT_TRANSCRIBE_FAILED` — the provider
+// ran fine but found no speech, e.g. a misfire or a fully silent recording)
+// is a recording problem, not a technical fault, and must say so in plain
+// Vietnamese (BUG-001) rather than surface the provider's raw English
+// message as the headline. Every other failure keeps a generic title with
+// the raw message as a secondary detail.
+// @param {{order:number, error:{code?:string,message?:string}|null}} part
+// @returns {{title:string, detail:string}} both PLAIN TEXT — the caller
+//   (js/app.js) is responsible for HTML-escaping before rendering.
+function partErrorCopy(part) {
+  const order = part && part.order;
+  if (part && part.error && part.error.code === 'STT_TRANSCRIBE_FAILED') {
+    return {
+      title: `Phần ${order} không nghe thấy giọng nói`,
+      detail: 'Có thể do bấm nhầm nút ghi âm hoặc đoạn ghi bị im lặng hoàn toàn.'
+    };
+  }
+  return {
+    title: `Phần ${order} chưa tạo được transcript`,
+    detail: part && part.error && part.error.message ? `Nhà cung cấp báo: ${part.error.message}` : ''
+  };
+}
+
 const Parts = {
   meetingCapabilities,
   naturalCompare,
@@ -218,7 +242,8 @@ const Parts = {
   formatDDMM,
   computeReorderedPartIds,
   removingCreatesGap,
-  formatGapRangeClock
+  formatGapRangeClock,
+  partErrorCopy
 };
 
 if (typeof module !== 'undefined' && module.exports) {

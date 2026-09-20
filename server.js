@@ -33,6 +33,12 @@ const SETTINGS_FILE = path.join(STORAGE_DIR, 'settings.json');
 const JOBS_FILE = path.join(STORAGE_DIR, 'jobs.json');
 const PRESETS_FILE = path.join(STORAGE_DIR, 'presets.json');
 const EXPORT_SETTINGS_FILE = path.join(STORAGE_DIR, 'export-settings.json');
+const BACKUP_DIR = path.join(STORAGE_DIR, '.backups');
+// Only files whose accidental loss is catastrophic and unrecoverable
+// (unlike, say, a regenerable audio-metadata sidecar). Adding a file here
+// is deliberate; don't widen it to "every atomicWriteJson call".
+const BACKED_UP_FILES = new Set([MEETINGS_FILE, SETTINGS_FILE, JOBS_FILE, PRESETS_FILE]);
+const MAX_BACKUPS_PER_FILE = 5;
 const MAX_EXPORT_CONTENT_BYTES = 8 * 1024 * 1024;
 const LOGS_DIR = path.join(STORAGE_DIR, 'logs');
 const APP_LOG_FILE = path.join(LOGS_DIR, 'meetnote.log');
@@ -124,9 +130,48 @@ async function readJson(filePath, fallback) {
 }
 
 async function atomicWriteJson(filePath, value) {
+  await backupBeforeOverwrite(filePath);
   const tempPath = `${filePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
   await fsp.writeFile(tempPath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
   await fsp.rename(tempPath, filePath);
+}
+
+// Snapshots the pre-write content of a small set of critical metadata files
+// (see BACKED_UP_FILES) so a bad write/delete against the live server is
+// recoverable. Best-effort only: a backup failure must never block the real
+// write, so every failure is swallowed here and just logged.
+//
+// Manual restore (no UI/API for this in v1): stop the server, copy the
+// desired file from storage/.backups/<name>-<timestamp>-<id>.json over
+// storage/<name>.json, then restart the server.
+async function backupBeforeOverwrite(filePath) {
+  if (!BACKED_UP_FILES.has(filePath)) return;
+  try {
+    const current = await fsp.readFile(filePath, 'utf8').catch(error => {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    });
+    if (current === null) return; // nothing to back up yet (first write)
+
+    await fsp.mkdir(BACKUP_DIR, { recursive: true });
+    const basename = path.basename(filePath, '.json');
+    const safeTimestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const backupPath = path.join(BACKUP_DIR, `${basename}-${safeTimestamp}-${crypto.randomUUID().slice(0, 8)}.json`);
+    await fsp.writeFile(backupPath, current, 'utf8');
+    await pruneOldBackups(basename);
+  } catch (error) {
+    console.error(`Could not create backup for ${filePath}:`, error);
+  }
+}
+
+async function pruneOldBackups(basename) {
+  const entries = await fsp.readdir(BACKUP_DIR).catch(() => []);
+  const matching = entries
+    .filter(name => name.startsWith(`${basename}-`) && name.endsWith('.json'))
+    .sort();
+  const excess = matching.length - MAX_BACKUPS_PER_FILE;
+  if (excess <= 0) return;
+  await Promise.all(matching.slice(0, excess).map(name => fsp.rm(path.join(BACKUP_DIR, name), { force: true }).catch(() => {})));
 }
 
 function sanitizeDiagnosticValue(value, depth = 0) {

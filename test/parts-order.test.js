@@ -161,3 +161,26 @@ test('formatGapRangeClock: degrades to "" when either timestamp is missing (neve
   assert.strictEqual(Parts.formatGapRangeClock(0, Date.now()), '');
   assert.strictEqual(Parts.formatGapRangeClock(Date.now(), 0), '');
 });
+
+/* ── BR-104/136 — partErrorCopy (BUG-001 regression) ── */
+
+test('partErrorCopy: STT_TRANSCRIBE_FAILED (empty transcript / no speech) gets a Vietnamese "no speech" headline, not the raw provider message', () => {
+  const part = { order: 2, error: { code: 'STT_TRANSCRIBE_FAILED', message: 'The provider did not return any transcript for this audio.' } };
+  const copy = Parts.partErrorCopy(part);
+  assert.strictEqual(copy.title, 'Phần 2 không nghe thấy giọng nói');
+  assert.ok(!copy.detail.includes('The provider did not return any transcript'), 'raw English message must not leak into the detail line');
+  assert.match(copy.detail, /im lặng|ghi hụt/);
+});
+
+test('partErrorCopy: any other error code keeps the generic title with the raw provider message as detail', () => {
+  const part = { order: 1, error: { code: 'STT_RATE_LIMITED', message: 'Rate limit exceeded' } };
+  const copy = Parts.partErrorCopy(part);
+  assert.strictEqual(copy.title, 'Phần 1 chưa tạo được transcript');
+  assert.strictEqual(copy.detail, 'Nhà cung cấp báo: Rate limit exceeded');
+});
+
+test('partErrorCopy: no error object at all -> generic title, empty detail (never throws)', () => {
+  const copy = Parts.partErrorCopy({ order: 3, error: null });
+  assert.strictEqual(copy.title, 'Phần 3 chưa tạo được transcript');
+  assert.strictEqual(copy.detail, '');
+});

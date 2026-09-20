@@ -133,13 +133,20 @@ function classify(file, providerId, providersPayload) {
 
 // BR-109/BR-139.2: a file matching an EXISTING meeting's saved source file
 // (name + byte size, never content hashing — zero-dependency, files can be
-// huge). Returns the matching meeting or null.
+// huge). For a merged meeting, `sourceFilename`/`sourceSizeBytes` only ever
+// hold PART 1's values (BR-137) — so part 2+ must be checked against
+// `meeting.parts[]` too, or a duplicate of a later part silently passes
+// (BUG-002). Returns the matching meeting or null.
 function findDuplicateMeeting(file, existingMeetings) {
   const name = (file && file.name) || '';
   const sizeBytes = Number(file && file.size) || 0;
   if (!name) return null;
-  return (existingMeetings || []).find(meeting =>
-    meeting && meeting.sourceFilename === name && Number(meeting.sourceSizeBytes) === sizeBytes) || null;
+  return (existingMeetings || []).find(meeting => {
+    if (!meeting) return false;
+    if (meeting.sourceFilename === name && Number(meeting.sourceSizeBytes) === sizeBytes) return true;
+    return (meeting.parts || []).some(part =>
+      part && part.filename === name && Number(part.sizeBytes) === sizeBytes);
+  }) || null;
 }
 
 // BR-139.1: two files picked in the SAME batch with identical name+size —

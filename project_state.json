@@ -18,10 +18,12 @@
   },
   "iterations": {
     "dev_reviewer": 0,
-    "dev_qa": 0
+    "dev_qa": 1
   },
   "status": "in_progress",
-  "blockers": [],
+  "blockers": [
+    "incident-2026-09-19-qa-wiped-real-storage-meetings-json-during-import-phone-recording-live-testing-EADDRINUSE-silent-fail-hit-real-server-instead-of-isolated-one-see-docs/test-report.md-latest-section-BLOCKS-merge-of-PR-1-until-PM-user-acknowledge"
+  ],
   "backlog": [
     "T7-gate-smoke-test-codex-blocked-cli-not-installed-on-dev-machine",
     "T8-gate-smoke-test-gemini-blocked-no-api-key-on-dev-machine",

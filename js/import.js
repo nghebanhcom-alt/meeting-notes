@@ -704,14 +704,34 @@ const Import = {
     }));
     document.querySelectorAll('[data-field="date"]').forEach(input => input.addEventListener('change', () => {
       const entry = this._state.entries.find(e => e.id === input.dataset.entry);
-      if (entry && input.value) { entry.dateIso = new Date(input.value).toISOString(); entry.dateSource = 'manual'; }
+      if (!entry || !input.value) return;
+      const iso = new Date(input.value).toISOString();
+      // BR-94 applies to hand-typed dates too, not just the file.lastModified
+      // suggestion (BUG-003) — reject and restore the previous value instead
+      // of silently accepting an implausible date.
+      if (!MeetingDate.isPlausibleMeetingDate(iso)) {
+        App.toast('Ngày không hợp lệ (quá xa trong tương lai hoặc trước năm 2000) — đã giữ nguyên ngày cũ.', 'error');
+        input.value = this._isoToLocalInputValue(entry.dateIso);
+        return;
+      }
+      entry.dateIso = iso; entry.dateSource = 'manual';
     }));
     document.querySelectorAll('[data-field="date-day"],[data-field="date-time"]').forEach(input => input.addEventListener('change', () => {
       const entry = this._state.entries.find(e => e.id === input.dataset.entry);
       if (!entry) return;
       const dayEl = document.querySelector(`[data-field="date-day"][data-entry="${entry.id}"]`);
       const timeEl = document.querySelector(`[data-field="date-time"][data-entry="${entry.id}"]`);
-      if (dayEl?.value) { entry.dateIso = new Date(`${dayEl.value}T${timeEl?.value || '00:00'}`).toISOString(); entry.dateSource = 'manual'; }
+      if (!dayEl?.value) return;
+      const iso = new Date(`${dayEl.value}T${timeEl?.value || '00:00'}`).toISOString();
+      if (!MeetingDate.isPlausibleMeetingDate(iso)) {
+        App.toast('Ngày không hợp lệ (quá xa trong tương lai hoặc trước năm 2000) — đã giữ nguyên ngày cũ.', 'error');
+        const prevDate = new Date(entry.dateIso);
+        const pad = n => String(n).padStart(2, '0');
+        dayEl.value = `${prevDate.getFullYear()}-${pad(prevDate.getMonth() + 1)}-${pad(prevDate.getDate())}`;
+        if (timeEl) timeEl.value = `${pad(prevDate.getHours())}:${pad(prevDate.getMinutes())}`;
+        return;
+      }
+      entry.dateIso = iso; entry.dateSource = 'manual';
     }));
 
     // Drag-and-drop reordering for merged mode (native HTML5 DnD).

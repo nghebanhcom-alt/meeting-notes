@@ -1662,17 +1662,24 @@ const App = {
     ` : '';
 
     const failedOrDropped = parts.filter(p => p.status === 'failed');
-    const errorCards = failedOrDropped.map(part => `
-      <div class="card" style="margin-bottom: var(--space-4); border-color: var(--color-warning); background: var(--color-warning-muted);" data-part-error="${part.partId}">
-        <strong style="color: var(--color-warning);">Phần ${part.order} chưa tạo được transcript</strong>
-        ${part.error?.message ? `<p class="text-xs text-tertiary" style="margin-top:var(--space-2);">Nhà cung cấp báo: ${Utils.escapeHtml(part.error.message)}</p>` : ''}
-        <div class="flex gap-2" style="margin-top:var(--space-3);">
-          <button class="btn btn-secondary btn-sm" data-action="retry-part" data-part="${part.partId}">Thử lại</button>
-          <button class="btn btn-secondary btn-sm" data-action="retry-part-other-provider" data-part="${part.partId}">Thử nhà cung cấp khác</button>
-          <button class="btn btn-ghost btn-sm" data-action="drop-part" data-part="${part.partId}">Bỏ phần ${part.order} khỏi bản ghi này</button>
+    // BR-104/136: Parts.partErrorCopy (js/parts.js) decides title/detail as
+    // plain text (BUG-001 fix — no speech detected reads in Vietnamese, not
+    // the provider's raw English message); escaping is this renderer's job,
+    // same convention as the rest of js/app.js.
+    const errorCards = failedOrDropped.map(part => {
+      const copy = Parts.partErrorCopy(part);
+      return `
+        <div class="card" style="margin-bottom: var(--space-4); border-color: var(--color-warning); background: var(--color-warning-muted);" data-part-error="${part.partId}">
+          <strong style="color: var(--color-warning);">${Utils.escapeHtml(copy.title)}</strong>
+          ${copy.detail ? `<p class="text-xs text-tertiary" style="margin-top:var(--space-2);">${Utils.escapeHtml(copy.detail)}</p>` : ''}
+          <div class="flex gap-2" style="margin-top:var(--space-3);">
+            <button class="btn btn-secondary btn-sm" data-action="retry-part" data-part="${part.partId}">Thử lại</button>
+            <button class="btn btn-secondary btn-sm" data-action="retry-part-other-provider" data-part="${part.partId}">Thử nhà cung cấp khác</button>
+            <button class="btn btn-ghost btn-sm" data-action="drop-part" data-part="${part.partId}">Bỏ phần ${part.order} khỏi bản ghi này</button>
+          </div>
         </div>
-      </div>
-    `).join('');
+      `;
+    }).join('');
 
     return progressCard + errorCards;
   },
@@ -2366,6 +2373,24 @@ const App = {
     return new Date(`${dayEl.value}T${timeEl?.value || '00:00'}`).toISOString();
   },
 
+  // Sets the date editor(s) to a specific ISO value — used by BR-94 rejection
+  // to put the editor back to the currently-saved date, distinct from
+  // `restoreDateIfBlank` (js/app.js `_bindPreMeetingInfo`) which only fires
+  // on an empty input.
+  _setDateEditorValue(iso) {
+    if (this._supportsDateTimeLocal()) {
+      const el = document.getElementById('detail-date');
+      if (el) el.value = this._isoToLocalInputValue(iso);
+      return;
+    }
+    const dayEl = document.getElementById('detail-date-day');
+    const timeEl = document.getElementById('detail-date-time');
+    const date = new Date(iso);
+    const pad = n => String(n).padStart(2, '0');
+    if (dayEl) dayEl.value = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+    if (timeEl) timeEl.value = `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  },
+
   /* ── Participants editor (T13, BR-144) — same chip pattern as Tags ── */
 
   _renderParticipantChips(participants) {
@@ -2411,14 +2436,14 @@ const App = {
     });
   },
 
-  // BR-29: nudge when pre-meeting info may be newer than the last Generate.
-  // No dedicated "pre-meeting edited at" timestamp exists on the meeting
-  // object, so this compares the meeting's own updatedAt against the last
-  // summaryGeneration timestamp — the closest available signal.
+  // BR-146: nudge only when a field that actually feeds the summary prompt
+  // (title/date/duration/participants/meetingType/topic/leadBy/notes) changed
+  // after the last Generate — NOT `meeting.updatedAt`, which bumps on every
+  // save (tag, action item tick, preset choice...) and would nag constantly
+  // (BUG-004). Decision lives in js/summary-staleness.js so it's unit
+  // testable without a browser.
   _preMeetingStaleHint(meeting) {
-    const generatedAt = meeting.summaryGeneration?.generatedAt;
-    if (!generatedAt || !meeting.updatedAt) return '';
-    if (new Date(meeting.updatedAt).getTime() <= new Date(generatedAt).getTime()) return '';
+    if (!SummaryStaleness.isPreMeetingInfoStale(meeting)) return '';
     return '<p class="text-xs text-tertiary" style="margin-bottom: var(--space-3);">ℹ️ Thông tin cuộc họp có thể mới hơn lần tạo tóm tắt gần nhất — Generate lại nếu muốn AI dùng thông tin mới.</p>';
   },
 
@@ -2480,7 +2505,15 @@ const App = {
       m.topic = Storage.normalizeShortText(document.getElementById('detail-topic')?.value);
       m.leadBy = Storage.normalizeShortText(document.getElementById('detail-lead-by')?.value);
       const previousDayKey = new Date(m.date).toDateString();
-      const newDateIso = this._readDateEditor();
+      let newDateIso = this._readDateEditor();
+      // BR-94 applies to hand-typed dates too, not just the file.lastModified
+      // suggestion at import time (BUG-003) — reject and keep the previously
+      // saved date instead of silently accepting an implausible one.
+      if (newDateIso && !MeetingDate.isPlausibleMeetingDate(newDateIso)) {
+        this.toast('Ngày không hợp lệ (quá xa trong tương lai hoặc trước năm 2000) — đã giữ nguyên ngày cũ.', 'error');
+        this._setDateEditorValue(m.date);
+        newDateIso = null;
+      }
       if (newDateIso) m.date = newDateIso;
       Storage.saveMeeting(m);
       this.toast('Đã lưu thông tin cuộc họp', 'success');

@@ -331,6 +331,24 @@ const Storage = {
     };
   },
 
+  /**
+   * Every pending (not-done) action item across all meetings, newest meeting first,
+   * annotated with the source meeting's id/title/date so callers can link back to it.
+   */
+  getPendingActionItems() {
+    const meetings = this.getAllMeetings();
+    return meetings
+      .flatMap(m => (m.actionItems || [])
+        .filter(a => !a.done)
+        .map(a => ({
+          ...a,
+          meetingId: m.id,
+          meetingTitle: m.title,
+          meetingDate: m.date
+        })))
+      .sort((a, b) => new Date(b.meetingDate) - new Date(a.meetingDate));
+  },
+
   /* ── Search ── */
 
   searchMeetings(query) {

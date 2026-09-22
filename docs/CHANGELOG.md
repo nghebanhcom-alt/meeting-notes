@@ -1674,4 +1674,20 @@ panels (Notes included) expand to fill the freed space.
   confirmed both flags `true` again.
 - Not verified: mobile-width layout by eye (same gap as the live-notes-panel change above —
   browser tool's mobile-emulation click issue, unrelated to this code).
+
+## 2026-09-22 — Fix Pending Actions modal: reuse `Storage.toggleActionItem()`
+
+Fixed the last Medium issue from `docs/review-report.md` (post-approve on the 4-item batch):
+the "done" checkbox handler in `_openPendingActionsModal()` (`js/app.js`) was reimplementing
+`Storage.toggleActionItem()` by hand (find item, set `.done = true`, `saveMeeting`) instead of
+calling the existing helper (`js/storage.js:272`).
+
+- `js/app.js`: checkbox `change` handler now calls `Storage.toggleActionItem(meetingId, actionId)`.
+  Kept a lookup guard (`Storage.getMeeting(meetingId)?.actionItems?.some(...)`) before calling,
+  to preserve the old no-op-on-missing-item behavior since `toggleActionItem` itself doesn't
+  early-return a signal for "not found" beyond returning the meeting unchanged.
+- Behavior preserved exactly: the modal only lists items from `Storage.getPendingActionItems()`
+  (already-undone items only), so toggling can only flip undone → done here — same net effect
+  as the old hardcoded `action.done = true`.
+- `npm test`: 243 passing / 2 skipped (no API key, Protocol 5.4) / 0 failing.
 - `npm test`: 243 passing / 2 skipped (unrelated) / 0 failing, before and after the scroll fix.

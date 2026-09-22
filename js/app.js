@@ -338,6 +338,7 @@ const App = {
     Recorder.onStop = null;
     Recorder.onChunk = null;
     Recorder.onSystemAudioLost = null;
+    Recorder.onSystemAudioSilent = null;
     Transcriber.onResult = null;
     Transcriber.onError = null;
     Transcriber.onStatusChange = null;
@@ -517,7 +518,7 @@ const App = {
             <div class="stat-value">${stats.thisWeek}</div>
             <div class="stat-label">This Week</div>
           </div>
-          <div class="card stat-card">
+          <div class="card stat-card" id="dash-pending-actions" style="cursor: pointer;">
             <div class="stat-icon" style="background: var(--color-warning-muted); color: var(--color-warning);">✅</div>
             <div class="stat-value">${stats.pendingActions}</div>
             <div class="stat-label">Pending Actions</div>
@@ -566,7 +567,46 @@ const App = {
     document.getElementById('dash-new-meeting')?.addEventListener('click', () => this.navigate('new'));
     document.getElementById('dash-view-all')?.addEventListener('click', () => this.navigate('meetings'));
     document.getElementById('dash-upload')?.addEventListener('click', () => Import.open());
+    document.getElementById('dash-pending-actions')?.addEventListener('click', () => this._openPendingActionsModal());
     this._bindMeetingItemClicks();
+  },
+
+  _openPendingActionsModal() {
+    const items = Storage.getPendingActionItems();
+    const listHtml = items.length ? items.map(item => `
+      <label class="checkbox" data-action-id="${Utils.escapeHtml(item.id)}" data-meeting-id="${Utils.escapeHtml(item.meetingId)}">
+        <input type="checkbox">
+        <span class="checkbox-label">${Utils.escapeHtml(item.text)}</span>
+        ${item.assignee ? `<span class="chip" style="margin-left: auto;">${Utils.escapeHtml(item.assignee)}</span>` : ''}
+        ${item.dueDate ? `<span class="chip"${item.assignee ? '' : ' style="margin-left: auto;"'}>${Utils.escapeHtml(item.dueDate)}</span>` : ''}
+      </label>
+      <div class="text-xs text-tertiary" style="margin: 0 0 var(--space-3) var(--space-8);">
+        ${Utils.escapeHtml(item.meetingTitle || 'Untitled Meeting')} · ${Utils.formatDate(item.meetingDate)}
+      </div>
+    `).join('') : '<p class="text-sm text-tertiary">No pending action items.</p>';
+
+    this.showModal(`
+      <div class="modal-header">
+        <h3>Pending Actions (${items.length})</h3>
+        <button class="btn btn-ghost btn-icon" onclick="App.closeModal()">✕</button>
+      </div>
+      <div class="modal-body">
+        ${listHtml}
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="App.closeModal()">Close</button>
+      </div>
+    `);
+
+    document.querySelectorAll('#modal [data-action-id][data-meeting-id]').forEach(el => {
+      el.querySelector('input[type="checkbox"]')?.addEventListener('change', () => {
+        const meetingId = el.dataset.meetingId;
+        const actionId = el.dataset.actionId;
+        if (!Storage.getMeeting(meetingId)?.actionItems?.some(a => a.id === actionId)) return;
+        Storage.toggleActionItem(meetingId, actionId);
+        this._openPendingActionsModal();
+      });
+    });
   },
 
   _defaultMeetingTitle(date = new Date()) {
@@ -1265,6 +1305,12 @@ const App = {
           statusEl.innerHTML = `<span class="badge badge-recording">● Recording · Mic only · ${_liveProviderName} live</span>`;
         };
 
+        // System audio track was captured but stayed silent — user likely
+        // shared the wrong tab or the source is muted. Warn only; recording continues.
+        Recorder.onSystemAudioSilent = () => {
+          this.toast('Không phát hiện âm thanh hệ thống (system audio) — kiểm tra bạn đã chọn đúng tab đang chạy cuộc họp, hoặc âm thanh đang bị tắt tiếng.', 'warning');
+        };
+
         // Start recorder with optional system audio
         const started = await Recorder.start({ captureSystemAudio: wantSystemAudio });
         if (!started) {
@@ -1443,7 +1489,7 @@ const App = {
       <div class="transcript-block" data-index="${i}">
         <span class="transcript-time">${Utils.formatTimestamp(seg.time)}</span>
         <div class="flex-1">
-          <div class="transcript-speaker">${Utils.escapeHtml(seg.speaker || 'Speaker')}</div>
+          <div class="transcript-speaker" data-speaker-seg-index="${i}" title="Click to rename this speaker" style="cursor:pointer;">${Utils.escapeHtml(seg.speaker || 'Speaker')}</div>
           <div class="transcript-text" contenteditable="true" data-seg-index="${i}">${Utils.escapeHtml(seg.text)}</div>
         </div>
       </div>
@@ -2663,6 +2709,14 @@ const App = {
           m.transcript[idx].text = el.textContent;
           Storage.saveMeeting(m);
         }
+      });
+    });
+
+    // Rename a speaker label after the fact (post-hoc, not live)
+    document.querySelectorAll('.transcript-speaker[data-speaker-seg-index]').forEach(el => {
+      el.addEventListener('click', () => {
+        const idx = parseInt(el.dataset.speakerSegIndex, 10);
+        this._openSpeakerRenameModal(meetingId, idx);
       });
     });
 
@@ -4285,6 +4339,69 @@ const App = {
         App.navigate(`meeting/${el.dataset.meetingId}`);
       });
     });
+  },
+
+  /**
+   * Rename a "Speaker N" label after recording, applied to every segment
+   * sharing that exact label WITHIN THE SAME PART (segments carry `partId`
+   * once merged from multi-part audio, server/stt/merge.js). Segments with
+   * no `partId` belong to a single-part meeting, so the rename applies to
+   * the whole transcript — matching current behavior with no part boundaries.
+   */
+  _openSpeakerRenameModal(meetingId, segIndex) {
+    const meeting = Storage.getMeeting(meetingId);
+    const segment = meeting?.transcript?.[segIndex];
+    if (!meeting || !segment || segment.kind) return;
+
+    const originalLabel = segment.speaker || 'Speaker';
+
+    this.showModal(`
+      <div class="modal-header">
+        <h3>Rename Speaker</h3>
+        <button class="btn btn-ghost btn-icon" id="cancel-speaker-rename" type="button">✕</button>
+      </div>
+      <div class="input-group">
+        <label for="edit-speaker-name">New name for "${Utils.escapeHtml(originalLabel)}"</label>
+        <input class="input" id="edit-speaker-name" maxlength="80" value="${Utils.escapeHtml(originalLabel)}">
+        <span class="text-xs text-tertiary">Applies to every line labeled "${Utils.escapeHtml(originalLabel)}" in this ${segment.partId ? 'part of the ' : ''}meeting.</span>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" id="cancel-speaker-rename-footer" type="button">Cancel</button>
+        <button class="btn btn-primary" id="save-speaker-rename" type="button">Rename</button>
+      </div>
+    `);
+
+    const input = document.getElementById('edit-speaker-name');
+    const save = async () => {
+      const newName = input.value.trim();
+      if (!newName) {
+        this.toast('Speaker name cannot be empty.', 'warning');
+        input.focus();
+        return;
+      }
+      const current = Storage.getMeeting(meetingId);
+      if (!current) return;
+      current.transcript = (current.transcript || []).map(seg => {
+        if (seg.kind) return seg;
+        if (seg.speaker !== originalLabel) return seg;
+        if (segment.partId !== undefined && seg.partId !== segment.partId) return seg;
+        return { ...seg, speaker: newName };
+      });
+      Storage.saveMeeting(current);
+      await Storage.flush();
+      this.closeModal();
+      this.toast('Speaker renamed.', 'success');
+      this.navigate(`${this.currentRoute}/${this.currentMeetingId}`, { force: true });
+    };
+
+    document.getElementById('save-speaker-rename')?.addEventListener('click', save);
+    document.getElementById('cancel-speaker-rename')?.addEventListener('click', () => this.closeModal());
+    document.getElementById('cancel-speaker-rename-footer')?.addEventListener('click', () => this.closeModal());
+    input?.addEventListener('keydown', event => {
+      if (event.key === 'Enter') save();
+    });
+    input?.focus();
+    input?.select();
   },
 
   _openMeetingTitleEditor(meetingId) {

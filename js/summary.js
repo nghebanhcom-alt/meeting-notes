@@ -150,14 +150,14 @@ const Summary = {
     if (section.type === 'paragraph') return String(value || '').trim();
     if (section.type === 'bulletList') {
       const values = Array.isArray(value) ? value.map(String).filter(Boolean) : [];
-      return values.length ? values.map(item => `• ${item}`).join('\n') : '';
+      return values.length ? values.map(item => `- ${item}`).join('\n') : '';
     }
     if (section.type === 'actionList') {
       const values = Array.isArray(value) ? value.filter(item => item && item.text) : [];
       if (!values.length) return '';
       return values.map(item => {
         const meta = [item.assignee, item.dueDate].filter(Boolean).join(' · ');
-        return meta ? `• ${item.text} (${meta})` : `• ${item.text}`;
+        return meta ? `- ${item.text} (${meta})` : `- ${item.text}`;
       }).join('\n');
     }
     return '';

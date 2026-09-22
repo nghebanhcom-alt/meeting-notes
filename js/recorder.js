@@ -26,8 +26,10 @@ const Recorder = {
   onStop: null,       // callback(blob)
   onChunk: null,      // callback(blob) for realtime transcription
   onSystemAudioLost: null, // callback() when system audio share is stopped mid-recording
+  onSystemAudioSilent: null, // callback() when system audio track produced no signal for the check window
   _stopPromise: null,
   _resolveStop: null,
+  _silenceCheckTimeout: null,
 
   /**
    * Check if getDisplayMedia with audio is supported in this browser.
@@ -130,6 +132,7 @@ const Recorder = {
         this._systemSource.connect(this._mixDestination);
         recordingStream = this._mixDestination.stream;
         this._mixedStream = recordingStream;
+        this._checkSystemAudioSilence();
       } else {
         // Mic only — same as before
         recordingStream = this.audioStream;
@@ -246,8 +249,60 @@ const Recorder = {
     return this._stopPromise;
   },
 
+  /**
+   * Sample the system-audio track's RMS level for a few seconds right after
+   * capture starts. If it never rises above a near-silence threshold, the
+   * user likely picked the wrong tab/window or muted it — warn without
+   * interrupting the recording.
+   */
+  _checkSystemAudioSilence() {
+    if (!this._systemSource) return;
+    const SILENCE_THRESHOLD = 0.01; // RMS on a 0-1 scale; below this is effectively silence
+    const CHECK_DURATION_MS = 4000;
+    const SAMPLE_INTERVAL_MS = 200;
+
+    const analyser = this.audioContext.createAnalyser();
+    analyser.fftSize = 512;
+    this._systemSource.connect(analyser);
+
+    const data = new Uint8Array(analyser.fftSize);
+    let peakRms = 0;
+    let elapsed = 0;
+
+    const sample = () => {
+      if (!this.isRecording || !this._systemSource) {
+        try { analyser.disconnect(); } catch {}
+        return;
+      }
+      analyser.getByteTimeDomainData(data);
+      let sumSquares = 0;
+      for (let i = 0; i < data.length; i++) {
+        const normalized = (data[i] - 128) / 128;
+        sumSquares += normalized * normalized;
+      }
+      const rms = Math.sqrt(sumSquares / data.length);
+      peakRms = Math.max(peakRms, rms);
+
+      elapsed += SAMPLE_INTERVAL_MS;
+      if (elapsed >= CHECK_DURATION_MS) {
+        try { analyser.disconnect(); } catch {}
+        if (peakRms < SILENCE_THRESHOLD && this.onSystemAudioSilent) {
+          this.onSystemAudioSilent();
+        }
+        return;
+      }
+      this._silenceCheckTimeout = setTimeout(sample, SAMPLE_INTERVAL_MS);
+    };
+
+    this._silenceCheckTimeout = setTimeout(sample, SAMPLE_INTERVAL_MS);
+  },
+
   /** Stop all media tracks and clean up audio graph nodes. */
   _cleanupStreams() {
+    if (this._silenceCheckTimeout) {
+      clearTimeout(this._silenceCheckTimeout);
+      this._silenceCheckTimeout = null;
+    }
     if (this.audioStream) {
       this.audioStream.getTracks().forEach(track => track.stop());
       this.audioStream = null;

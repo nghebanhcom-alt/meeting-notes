@@ -569,6 +569,99 @@ Whisper/Google ở audio 32kbps Opus", đúng như comment trong code đã tự 
    Chênh lệch WER (word error rate) đáng kể giữa 2 bitrate ở bất kỳ provider nào → không nên đặt
    32kbps làm mặc định chung, có thể cân nhắc mức trung gian (ví dụ 48-64kbps).
 4. Test riêng luồng **live transcription** (không chỉ file ghi xong): nói liên tục trong lúc
+
+---
+
+## Review: Thêm 2 preset Đàm phán hợp đồng & Tìm hiểu cơ hội hợp tác — 2026-09-21
+
+## Verdict: APPROVE
+
+## Phạm vi
+Thay đổi thuần dữ liệu: thêm 2 object vào `BUILT_IN_PRESETS` (`server/llm/presets.js`), 2 entry
+tương ứng vào `MEETING_TYPES` (`js/meeting-types.js`), cập nhật số đếm hardcode 10→12 trong 2 file
+test, và đồng bộ `docs/preset-templates.md`. Không đụng route, filesystem, subprocess, hay API key.
+
+## Verify độc lập đã thực hiện
+- `npm test`: tự chạy lại `node --test test/*.test.js` → **243/243 pass, 0 fail, 2 skipped**
+  (2 skip là smoke test Whisper/Google thiếu API key trên máy dev, đúng Protocol 5.4, không liên
+  quan tới thay đổi này).
+- Đo bằng script độc lập (không tin số Dev báo): `instruction.length` của cả 12 preset đều
+  `<= LIMITS.INSTRUCTION_MAX` (2000) — 2 preset mới lần lượt 1627 và 1818 ký tự, sát ngưỡng nhưng
+  hợp lệ.
+- `BUILT_IN_PRESETS.map(p=>p.name)` không có tên trùng (12 tên duy nhất).
+- Chạy `instantiateBuiltIns()` thật và kiểm tra `sectionKeyFor` cho từng preset: không có `key`
+  trùng trong nội bộ preset nào (kể cả 2 preset mới, 9 section mỗi preset, dưới
+  `LIMITS.SECTIONS_MAX` = 10), không key nào trùng `RESERVED_KEYS`
+  (`summaryGeneration`/`summaryPreset`/`meetingId`/`title`/`details`/`error`).
+- BR-67 invariant: tự đối chiếu `MEETING_TYPES.map(t=>t.presetName)` với
+  `BUILT_IN_PRESETS.map(p=>p.name)` bằng mắt cho toàn bộ 12 cặp — khớp 1-1 đúng thứ tự. Test
+  `BR-67: MEETING_TYPES.presetName matches BUILT_IN_PRESETS.name 1-1` trong
+  `test/presets.test.js:48` đã pass trong lần chạy `npm test` ở trên.
+- `abbr` (`DP`, `HT`) và `code` (`dam-phan`, `hop-tac`) mới trong `MEETING_TYPES` không trùng 10
+  entry cũ (tự kiểm tra bằng script, không có duplicate).
+- Cú pháp JS: `node -e "require('./server/llm/presets.js')"` chạy không lỗi — template literal
+  chứa `"..."` lồng bên trong dấu backtick không có ký tự nào phá cú pháp (không có backtick trần
+  hay `${` không mong muốn trong nội dung tiếng Việt).
+- Diff 2 file test (`test/presets.test.js`, `test/meeting-types.test.js`) chỉ đổi đúng các con số
+  đếm (10→12) và danh sách tên preset kỳ vọng — không có thay đổi logic test nào khác, đúng phạm
+  vi khai báo.
+
+## Issues Found
+
+### Critical
+(none)
+
+### High
+(none)
+
+### Medium
+(none)
+
+### Low
+- [ ] `docs/preset-templates.md:406` — Heading preset #12 ghi `## 12. TRAO ĐỔI TÌM HIỂU CƠ HỘI
+  HỢP TÁC`, thêm chữ "TRAO ĐỔI" so với `Tên preset` thực tế (`Tìm hiểu cơ hội hợp tác`) ngay bên
+  dưới. Toàn bộ 11 heading còn lại trong file (kể cả preset #11 mới) đều dùng đúng nguyên văn tên
+  preset làm heading. Không ảnh hưởng hành vi (anchor link mục lục `#12-trao-đổi-tìm-hiểu-cơ-hội-
+  hợp-tác` tự tạo từ chính heading này nên vẫn khớp), chỉ là inconsistency nhỏ về style tài liệu.
+  → Gợi ý sửa: đổi heading thành `## 12. TÌM HIỂU CƠ HỘI HỢP TÁC` cho khớp mẫu các preset khác.
+- [ ] Không thể tự verify độc lập việc rút gọn `instruction` (2 preset mới) có giữ nguyên **mọi**
+  ý so với bản gốc hay không, vì file nguồn `preset-bo-sung-dam-phan-hop-tac.md` được nhắc tới
+  trong ghi chú rút gọn (`docs/preset-templates.md:409`, `:519`) không tồn tại trong repo (đã
+  `find` toàn repo, không thấy) — có thể là file tạm ở máy Dev, chưa commit. Đã đọc kỹ nội dung 2
+  `instruction` hiện tại và thấy mạch lạc, đầy đủ các quy tắc quan trọng tương ứng với 9 section
+  liệt kê bên dưới (phân định 2 bên, trạng thái điều khoản, trích nguyên văn, cặp nhượng bộ-đánh
+  đổi cho preset Đàm phán; 3 mức cam kết, không thổi phồng chắc chắn cho preset Tìm hiểu hợp tác)
+  — không thấy dấu hiệu rõ ràng của việc mất ý. Nhưng đây là đánh giá "nội dung tự nó hợp lý",
+  không phải đối chiếu byte-for-byte với bản gốc. → Gợi ý: nếu file gốc còn tồn tại ở máy Dev, nên
+  commit vào `tests/fixtures/` hoặc đính kèm 1 lần cho lần review sau đối chiếu, hoặc PM xác nhận
+  bằng mắt 1 lần là đã so sánh kỹ trước khi coi rủi ro này là đã đóng.
+
+## External contract verification
+N/A — thay đổi thuần dữ liệu (text preset), không gọi API/CLI/thư viện bên ngoài nào.
+
+## Kiểm tra bảo mật (theo baseline CLAUDE.md)
+Xác nhận thay đổi không chạm bất kỳ cơ chế bảo mật nào cần audit:
+- Không thêm/sửa route `/api/*` nào — `server/llm/presets.js` là module thuần data + validate,
+  không tự expose HTTP endpoint (route hiện có `/api/summary-presets*` đã được review ở lần trước
+  và không đổi ở đây).
+- Không đụng tới API key/keychain.
+- Không có ID nào từ client chạm filesystem trong diff này.
+- Không có `child_process.spawn` mới.
+
+## Positive Notes
+- 2 preset mới bám sát đúng pattern kiến trúc + tone của 10 preset cũ: cùng cấu trúc `instruction`
+  (bối cảnh → nguyên tắc quan trọng nhất → các quy tắc chi tiết → điều cấm), cùng 3 type section
+  hợp lệ, section cuối luôn `actionList` cho "việc cần làm".
+- Nội dung 2 preset thể hiện tư duy domain tốt: phân biệt rõ 2 giai đoạn dễ nhầm (đàm phán đã chốt
+  điều khoản vs. thăm dò hợp tác chưa cam kết) — kể cả có hẳn 1 mục "GHI CHÚ PHÂN BIỆT HAI PRESET"
+  trong docs giúp người dùng chọn đúng preset, và trong `instruction` có cơ chế tự phòng vệ chống
+  "thổi phồng mức chắc chắn" (phân 3 mức CAM KẾT/THIỆN CHÍ/XÃ GIAO) — đúng tinh thần các preset cũ
+  như OKR (cấm tự suy ra % hoàn thành) và HĐQT (ghi cả ý kiến trái chiều).
+- Dev tự để lại comment giải thích rõ lý do rút gọn ngay trong `docs/preset-templates.md`
+  (`*(đã rút gọn còn <2000 ký tự...)*`) thay vì âm thầm sửa — đúng tinh thần minh bạch quyết định,
+  giúp reviewer/người đọc sau không hiểu nhầm đây là nội dung gốc.
+- Cập nhật test tối thiểu, đúng phạm vi (chỉ đổi số đếm + danh sách tên kỳ vọng), không sửa logic
+  test khác kèm theo — giảm rủi ro regression ẩn.
    recording đang chạy, xác nhận kết quả interim/final hiển thị trong `js/app.js` giống chất lượng
    cũ — vì đây là luồng dùng chung `MediaRecorder` với chunk 500ms, khác pipeline với file hoàn
    chỉnh upload sau khi dừng ghi.
@@ -1836,3 +1929,242 @@ bộ + reuse route `/api/settings` sẵn có.
   sót trong các refactor tương tự.
 - Setting mới có default backward-compatible đúng cách (qua `DEFAULT_SETTINGS` spread, không
   qua giá trị `undefined` dễ gây bug điều kiện).
+
+---
+
+# Review Report — 2026-09-22
+
+## Phạm vi review
+4 việc, chưa commit:
+1. `js/recorder.js` + `js/app.js` — cảnh báo system-audio im lặng qua `AnalyserNode` RMS 4s đầu.
+2. `js/summary.js` — đổi bullet prefix "• " → "- " trong `_formatSection`.
+3. `js/storage.js` + `js/app.js` — `Storage.getPendingActionItems()` + modal xem/đánh done action item chưa xong từ dashboard.
+4. `js/app.js` — click nhãn "Speaker N" trong transcript mở modal đổi tên, áp dụng theo `partId`.
+
+Các file khác đang có modification từ trước (`docs/preset-templates.md`, `js/meeting-types.js`,
+`server/llm/presets.js`, `test/meeting-types.test.js`, `test/presets.test.js`) — không thuộc
+phạm vi review này, bỏ qua theo yêu cầu.
+
+## Verdict: APPROVE
+
+## Issues Found
+
+### Critical
+(none)
+
+### High
+(none)
+
+### Medium
+- [ ] `js/app.js:~4390-4399` (`_openSpeakerRenameModal` → save handler) — logic đánh dấu done
+  action item trong modal Pending Actions không tái dùng `Storage.toggleActionItem(meetingId,
+  actionItemId)` đã có sẵn (`js/storage.js:272`), mà tự viết lại y hệt logic đó (tìm meeting →
+  tìm action item theo id → set field → `saveMeeting`). Trùng lặp không cần thiết (DRY). Gợi ý:
+  thêm `Storage.setActionItemDone(meetingId, actionItemId, done)` dùng chung, hoặc gọi thẳng
+  `toggleActionItem` nếu chấp nhận "chỉ tích, chưa hỗ trợ bỏ tích trong modal" là hành vi toggle
+  1 chiều (vẫn đúng vì item hiện tại luôn `!done`).
+
+### Low
+- [ ] Không có test mới cho cả 4 thay đổi (không có test file nào trong diff ngoài các file đã
+  loại trừ). Với riêng việc 4 (speaker rename theo `partId`) — đúng loại logic Protocol 6 cảnh
+  báo ("từng bước đúng riêng lẻ nhưng nối sai") — nên có ít nhất 1 unit test thuần cho hàm map
+  transcript (tách phần tính "segment nào được đổi tên" ra khỏi DOM/modal để test được bằng
+  `node --test`, theo đúng pattern các test hiện có trong `test/*.test.js` chỉ test pure
+  functions). Không chặn approve vì: (a) toàn bộ 243 test hiện có đều xanh, (b) project hiện
+  không có tiền lệ unit test cho `js/*.js` (chỉ test server-side pure functions), nên đây là gap
+  nhất quán với coverage hiện tại chứ không phải regression riêng của Dev.
+- [ ] `js/app.js` (`_renderDashboard`) — stat card "Pending Actions" phía sau modal không tự
+  cập nhật số khi user tích done trong modal (modal tự re-render đúng, nhưng dashboard đằng sau
+  vẫn giữ số cũ cho tới khi navigate rời trang rồi quay lại). Cosmetic, dữ liệu persist đúng —
+  không chặn approve.
+- [ ] `js/recorder.js` `_checkSystemAudioSilence` — ngưỡng `SILENCE_THRESHOLD = 0.01` / cửa sổ
+  4s là con số kinh nghiệm, chưa có nguồn đo thực tế nào (không phải external tool contract nên
+  Protocol 5 không bắt buộc, nhưng đáng ghi chú: cuộc họp thực sự im lặng >4s lúc đầu — ví dụ
+  đang chờ người tham gia join — sẽ bị cảnh báo nhầm 1 lần). Vì đây chỉ là toast cảnh báo, không
+  chặn/ngắt recording, rủi ro false-positive chấp nhận được.
+
+## External contract verification
+N/A — không có tool/API bên thứ 3 nào liên quan tới 4 thay đổi này (AnalyserNode/getDisplayMedia
+là Web API chuẩn đã dùng sẵn trong codebase từ trước, không phải dependency mới cần verify theo
+Protocol 5).
+
+## Chi tiết verify từng việc
+
+**Việc 1 (recorder.js silence detection):**
+- Memory leak: KHÔNG có. `_silenceCheckTimeout` được lưu lại và `clearTimeout` trong
+  `_cleanupStreams()`, gọi cả từ `stop()` lẫn từ nhánh `catch` của `start()` khi lỗi giữa chừng
+  (`js/recorder.js:184-195`). Timeout tự chấm dứt chuỗi (chỉ tự lặp lại khi còn `isRecording` và
+  còn `_systemSource`) nên không leak kể cả khi `onSystemAudioLost` (ended event handler) tự
+  set `_systemSource = null` mà không đụng vào timeout — lần `sample()` kế tiếp sẽ tự dừng, không
+  reschedule tiếp.
+- Callback không chặn luồng recording chính: đúng, `_checkSystemAudioSilence` chỉ connect thêm 1
+  `AnalyserNode` từ `_systemSource` (không chèn vào graph ghi âm/`_mixDestination`), và
+  `onSystemAudioSilent` chỉ hiện toast cảnh báo (`js/app.js`), không có `return`/`throw` nào ảnh
+  hưởng `Recorder.start()`.
+- Callback được reset về `null` đúng chỗ dọn dẹp chung với `onSystemAudioLost`
+  (`js/app.js:340-341`), tránh giữ closure cũ qua lần recording sau.
+- Ngưỡng/cửa sổ: xem Low ở trên — chấp nhận được vì chỉ là cảnh báo mềm.
+
+**Việc 2 (bullet "• " → "- "):**
+- Grep toàn repo (`js/`, `server/`, `test/`, cả markdown ngoài `docs/`) không còn chỗ nào phụ
+  thuộc "• " cho format output của `_formatSection`. Duy nhất 1 match "•" còn lại trong
+  `js/app.js:626` là regex validate pattern tiêu đề cuộc họp mặc định (`Meeting — dd/mm/yyyy ·
+  hh:mm`), không liên quan tới bullet list, không bị ảnh hưởng.
+- `test/export-markdown.test.js` mock hẳn `_formatSection: () => ''` nên không assert ký tự bullet
+  — không có test nào failed hay cần sửa vì thay đổi này (khớp với `npm test` chạy xanh 243/243).
+
+**Việc 3 (pending action items modal):**
+- Đánh done trong modal ghi đúng vào storage: `Storage.saveMeeting(meeting)` cập nhật
+  `this._meetings` in-memory ngay lập tức (qua `_saveMeetings`, xác nhận tại
+  `js/storage.js:250+`), nên `Storage.getMeeting`/`getAllMeetings`/`getPendingActionItems` gọi
+  ngay sau đó (kể cả từ view khác như meeting detail, dashboard) đều thấy trạng thái mới —
+  không phải chỉ update state cục bộ của modal. Ghi xuống file JSON qua `_queueWrite` là async
+  nhưng không ảnh hưởng tính đúng của UI vì UI đọc từ `_meetings` in-memory, không đọc lại từ
+  server.
+- Modal tái dùng đúng `this.showModal`/`this.closeModal` sẵn có (cùng pattern với các modal khác
+  trong file, ví dụ dòng 265, 1433, 1868, 1896) — không tạo overlay/backdrop trùng.
+- 1 issue Medium về trùng logic toggle, xem trên.
+
+**Việc 4 (speaker rename theo partId) — điểm cần verify kỹ nhất:**
+- Đọc `server/stt/merge.js`: với meeting nhiều part, `buildMergedTranscript` gắn `partId:
+  part.partId` vào MỌI segment thật (dòng ~120) lẫn segment `part-divider`/`part-gap` (nhưng các
+  segment `kind`-hoá này luôn có `kind` set). Với meeting 1 part duy nhất (kể cả import 1 file),
+  `computeTimeline`/`buildMergedTranscript` vẫn chạy và vẫn gắn `partId` — nhưng vì chỉ có 1 part
+  nên "giới hạn theo partId" tương đương "áp dụng toàn bộ transcript", không có sai lệch hành vi.
+- Với meeting ghi âm trực tiếp (live, không qua `server/meeting-parts.js`), transcript client lấy
+  từ `this._transcriptSegments` tích luỹ tại chỗ (`js/app.js:365`, `:1262`) — các segment này
+  KHÔNG có field `partId` (server merge không chạy trong luồng này), khớp đúng giả định của Dev
+  trong comment (`segment.partId !== undefined` → coi là single-part, áp dụng toàn bộ).
+- Guard `if (seg.kind) return seg` loại đúng segment `part-divider`/`part-gap` ra khỏi rename —
+  xác nhận thêm bằng template render (`js/app.js:1483-1493`): chỉ segment KHÔNG có `kind` mới
+  được gắn `data-speaker-seg-index`/click handler, nên modal rename không bao giờ được mở từ 1
+  divider/gap segment ngay từ đầu (double-safe).
+- So khớp với ràng buộc ghi trong `server/llm/prompts.js:159` (Speaker label không nhất quán
+  giữa các part) — code rename tôn trọng đúng ràng buộc này: chỉ đổi tên trong cùng `partId`,
+  không lan sang part khác dù label trùng tên "Speaker 1".
+- Persist: `Storage.saveMeeting(current)` + `await Storage.flush()` trước khi `closeModal()` và
+  `navigate(..., { force: true })` — đảm bảo re-render đọc lại state đã lưu, và `flush()` chờ
+  `_pendingWrite` (ghi xuống file JSON thật) hoàn tất trước khi coi thao tác xong, nên sống sót
+  qua reload (khác việc 3 vốn không cần `flush()` vì không có bước điều hướng ngay sau).
+- Không tìm thấy sai lệch nào giữa giả định của Dev và cấu trúc `partId` thực tế trong
+  `server/stt/merge.js`.
+
+## Bảo mật
+- `git diff --stat -- server.js server/` xác nhận **không có thay đổi nào ở `server.js`** — cả 4
+  việc đều thuần client-side (`js/*.js`), không thêm endpoint mới, không thêm `child_process`
+  call, không thêm file-write mới. Baseline `isTrustedApiRequest`/`hasTrustedHost`, keychain-only
+  API key, hash ID trước khi chạm filesystem, `spawn` `shell:false` — không có gì trong diff động
+  tới các cơ chế này.
+- `server/llm/presets.js` có thay đổi trong `git diff` nhưng thuộc modification từ trước, ngoài
+  phạm vi 4 việc được giao — không review trong lần này.
+
+## Positive Notes
+- Việc 4 (speaker rename) có comment giải thích rõ ràng lý do phân biệt `partId` NGAY TRONG CODE
+  (`js/app.js:4347-4353`), trỏ đúng tới `server/stt/merge.js` và ràng buộc ở
+  `server/llm/prompts.js:159` — đúng tinh thần Protocol 6, không phải kiểu "sau đó xử lý tiếp"
+  mập mờ.
+- Recorder cleanup (việc 1) xử lý đúng cả 3 đường thoát (stop bình thường, lỗi giữa `start()`,
+  system audio bị mất giữa chừng) mà không cần thêm `try/finally` cồng kềnh — tái dùng đúng
+  `_cleanupStreams()` sẵn có thay vì viết logic dọn dẹp riêng.
+- Việc 3 tái dùng đúng field `id` ổn định có sẵn trên action item (`Utils.uuid()` khi tạo,
+  `js/storage.js:261`/`js/summary.js:108`) để match trong modal, không tự chế khoá định danh mới.
+- Toàn bộ 4 việc chạy `npm test` xanh 243/243 (2 skipped không liên quan, do thiếu API key thật
+  cho Whisper/Google, đã có sẵn từ trước) — không có regression nào bị phát hiện.
+
+---
+
+# Review Report — 2026-09-22 (fix nhỏ: dùng lại `Storage.toggleActionItem()`)
+
+## Phạm vi
+Dev sửa đúng issue Medium nêu trong section review trước (`js/app.js`, `_openPendingActionsModal`
+→ handler `change` của checkbox). Đã tự chạy `git diff -- js/app.js` để xem diff thật (không tin
+nguyên nội dung message coordinator) — diff khớp với mô tả:
+
+```js
+// Trước
+el.querySelector('input[type="checkbox"]')?.addEventListener('change', () => {
+  const meetingId = el.dataset.meetingId;
+  const actionId = el.dataset.actionId;
+  const meeting = Storage.getMeeting(meetingId);
+  const action = meeting?.actionItems?.find(a => a.id === actionId);
+  if (!meeting || !action) return;
+  action.done = true;
+  Storage.saveMeeting(meeting);
+  this._openPendingActionsModal();
+});
+
+// Sau
+el.querySelector('input[type="checkbox"]')?.addEventListener('change', () => {
+  const meetingId = el.dataset.meetingId;
+  const actionId = el.dataset.actionId;
+  if (!Storage.getMeeting(meetingId)?.actionItems?.some(a => a.id === actionId)) return;
+  Storage.toggleActionItem(meetingId, actionId);
+  this._openPendingActionsModal();
+});
+```
+
+Không có thay đổi nào khác trong diff `js/app.js` ngoài đúng khối này (đã đối chiếu toàn bộ diff,
+phần còn lại là các thay đổi đã review ở section trước, không đổi).
+
+## Verdict: APPROVE
+
+## Verify `Storage.toggleActionItem()` (`js/storage.js:272-279`)
+```js
+toggleActionItem(meetingId, actionItemId) {
+  const meeting = this.getMeeting(meetingId);
+  if (!meeting) return;
+  const item = meeting.actionItems.find(a => a.id === actionItemId);
+  if (item) item.done = !item.done;
+  this.saveMeeting(meeting);
+  return meeting;
+},
+```
+Đây thực sự là **flip true↔false**, không phải "set true" — đúng như coordinator lưu ý cần kiểm.
+Tuy nhiên hành vi cuối cùng trong ngữ cảnh modal này vẫn tương đương "chỉ đi false→true", vì 3 lý
+do cộng dồn (đã trace bằng tay, không suy đoán):
+
+1. Danh sách item trong modal luôn lấy từ `Storage.getPendingActionItems()` (`js/storage.js:341`),
+   hàm này `filter(a => !a.done)` — mọi item render trong modal tại thời điểm mở đều có
+   `done === false`. Checkbox HTML render ra không có thuộc tính `checked` (`js/app.js` template
+   trong `_openPendingActionsModal`), nên nó luôn bắt đầu ở trạng thái unchecked khớp với
+   `done === false` thật.
+2. DOM `change` event trên checkbox chỉ fire khi state đổi (unchecked→checked) do người dùng
+   click — không tự fire lại nếu không có tương tác mới.
+3. Ngay trong handler, sau khi gọi `toggleActionItem`, code gọi `this._openPendingActionsModal()`
+   đồng bộ (không có `await` chờ networking) → modal render lại ngay, `innerHTML` bị thay hoàn
+   toàn → checkbox cũ bị gỡ khỏi DOM, listener cũ mất tác dụng. Không có cửa sổ thời gian nào để
+   cùng 1 checkbox fire `change` lần 2 trên item đã toggle thành `done=true`.
+
+→ Kết luận: không có race condition thực tế trong luồng single-window hiện tại của app khiến
+`toggle` lật ngược lại `false`. Nếu sau này có thêm luồng multi-tab/multi-window đồng bộ storage
+thời gian thực, `toggle` sẽ kém an toàn hơn `set true` tường minh (không idempotent) — nhưng đó
+là rủi ro giả định chưa tồn tại trong kiến trúc hiện tại (`storage.js` không có cơ chế multi-tab
+sync), nên không chặn approve. Ghi nhận làm lưu ý cho tương lai, không phải issue.
+
+Guard mới (`!Storage.getMeeting(meetingId)?.actionItems?.some(a => a.id === actionId)`) tương
+đương đúng guard cũ (`!meeting || !action`) — vẫn chặn đúng trường hợp meeting hoặc action item bị
+xoá ở nơi khác trước khi checkbox được click.
+
+## Test
+Tự chạy lại `npm test` (không chỉ tin báo cáo Dev): **243 pass / 0 fail / 2 skipped** — kết quả
+giống hệt trước fix, không có regression.
+
+## Issues Found
+### Critical / High / Medium
+(none — issue Medium trước đó đã được giải quyết)
+
+### Low
+- [ ] (Ghi chú, không chặn) Nếu tương lai thêm đồng bộ multi-tab/multi-window cho storage, cần
+  soát lại toàn bộ chỗ dùng `toggleActionItem()` theo pattern lấy-danh-sách-rồi-toggle này, vì
+  `toggle` không idempotent như `set` tường minh — dễ tạo lỗi lật ngược trạng thái nếu 2 nơi cùng
+  toggle gần như đồng thời trên cùng item.
+
+## External contract verification
+N/A — không liên quan external dependency.
+
+## Positive Notes
+- Dev xử lý đúng và tối thiểu: chỉ đổi đúng khối logic bị flag, không lan sang phần code khác
+  (diff review lại xác nhận không có thay đổi ngoài ý).
+- Chọn tái dùng `toggleActionItem()` thay vì tạo thêm `setActionItemDone()` mới — đơn giản hơn gợi
+  ý ban đầu của Reviewer, và vẫn đúng vì đã verify được invariant "modal chỉ chứa item false" giữ
+  cho phép toggle tương đương set true trong ngữ cảnh gọi hiện tại.

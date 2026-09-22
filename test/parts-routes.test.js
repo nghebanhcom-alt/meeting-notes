@@ -414,6 +414,45 @@ test('GET /parts returns a compact status summary without transcript content', a
   }
 });
 
+test('GET /parts exposes per-part refine status and transcriptSource, plus meeting-level refiningParts (T-W13.2)', async () => {
+  await startServer();
+  try {
+    const meetingId = 'merged-refine-poll-' + Date.now();
+    const parts = [
+      {
+        partId: partId(1), order: 1, filename: 'a.m4a', status: 'completed',
+        transcript: [{ start: 0, end: 1, text: 'hi', speaker: 'S1' }],
+        transcriptSource: 'refined',
+        refine: { status: 'running', jobId: 'job-refine-1', startedAt: new Date().toISOString(), finishedAt: null, error: null }
+      },
+      {
+        partId: partId(2), order: 2, filename: 'b.m4a', status: 'completed',
+        transcript: [{ start: 0, end: 1, text: 'yo', speaker: 'S1' }]
+        // never refined — refine/transcriptSource intentionally absent
+      }
+    ];
+    await putMergedMeeting(meetingId, parts);
+
+    const r = await fetch(`${BASE}/api/meetings/${meetingId}/parts`);
+    assert.strictEqual(r.status, 200);
+    const body = await r.json();
+
+    assert.deepStrictEqual(body.refiningParts, [1], 'part 1 is running -> its order shows up in refiningParts');
+
+    const [p1, p2] = body.parts;
+    assert.strictEqual(p1.transcriptSource, 'refined');
+    assert.strictEqual(p1.refine.status, 'running');
+    assert.strictEqual(p1.refine.jobId, 'job-refine-1');
+
+    // Regression: a part that never went through refine still gets a
+    // backward-compatible default, not undefined/missing.
+    assert.strictEqual(p2.transcriptSource, 'original');
+    assert.strictEqual(p2.refine, null);
+  } finally {
+    await cleanup();
+  }
+});
+
 /* ── security (§V16) — every new route goes through the same host/origin guard ── */
 
 test('every new parts route returns 403 for a DNS-rebinding Host header', async () => {

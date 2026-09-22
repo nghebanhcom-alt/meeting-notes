@@ -17,7 +17,7 @@
     "architecture_v3": "docs/Architecture.md §V (660-1443)"
   },
   "iterations": {
-    "dev_reviewer": 0,
+    "dev_reviewer": 1,
     "dev_qa": 1
   },
   "status": "in_progress",
@@ -113,6 +113,20 @@
       "file": "server/stt/soniox-context.js (new), server/stt/providers/soniox.js, server/stt/index.js, server.js, test/soniox-context.test.js (new)",
       "status": "code_complete_pending_review",
       "note": "Architecture.md SW5.4/SW6. npm test: 254 passing / 2 skipped / 0 failing. Protocol 7: Reviewer already APPROVEd this change (docs/review-report.md), but flagged Protocol 5.4 as still open pending a real-API smoke test. T-W7 (2026-09-22): ran createSonioxAdapter().transcribe() against the real Soniox API with meetingTitle/participants so `context` was actually attached -- request succeeded, no 400/422, valid transcript returned. Golden fixture tests/fixtures/soniox/real-transcribe-with-context.json captured. Protocol 5.4 gap now closed; see docs/CHANGELOG.md 2026-09-22 entry."
+    },
+    {
+      "date": "2026-09-22",
+      "title": "T-W1-T-W2-T-W3-T-W4-T-W10-T-W11-refine-transcript-backend-single-and-multipart",
+      "file": "server/refine.js (new), server/meeting-parts.js, server.js, test/refine.test.js (new), test/refine-routes.test.js (new)",
+      "status": "code_complete_pending_review",
+      "note": "Architecture.md SW3/SW11-SW13. Backend only (no js/app.js/UI, per task scope). npm test: 275 passing / 2 skipped / 0 failing (21 new tests, 0 regressions). Protocol 7: NOT yet reviewed -- no Reviewer spawned in this session, docs/review-report.md not updated for this change. Do not treat as done until a Reviewer round runs. See docs/CHANGELOG.md 2026-09-22 entry for full detail, including a flagged discrepancy: the task brief asserted E-W1-E-W6 were all decided, but Architecture.md SW16 itself still ends with an unresolved Protocol 2 checkpoint blocking multi-part work and lists E-W3/E-W5/E-W6 as 'Van mo' -- implemented anyway per explicit brief instruction, flagged for PM/Tech Lead reconciliation rather than silently proceeding."
+    },
+    {
+      "date": "2026-09-22",
+      "title": "T-W13.2-expose-refine-status-on-GET-api-meetings-id-parts-reviewer-fix-round-2",
+      "file": "server.js, test/parts-routes.test.js",
+      "status": "fix_applied_pending_reviewer_round_2",
+      "note": "Fixes sole Medium from docs/review-report.md 2026-09-22 round. Added part.refine, part.transcriptSource, meeting.refiningParts to the GET /api/meetings/:id/parts projection (minimal addition, no other field touched). npm test: 276 passing / 2 skipped / 0 failing (1 new test, 0 regressions). Protocol 3: Dev-Reviewer round 1/3 used. NOT self-declared done -- awaiting real Reviewer pass."
     }
   ]
 }

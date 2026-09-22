@@ -1984,11 +1984,11 @@ Thứ tự: T-W10 → T-W1 → T-W2 → T-W11/T-W12 → T-W3 → T-W13 → T-W5 
 | ID | Vấn đề | Đề xuất |
 |---|---|---|
 | ~~E-W1~~, ~~E-W4~~ | — | ✅ đã quyết, xem §W8 |
-| **E-W2** | Giới hạn an toàn khi tự động chạy | **Không còn áp dụng** — E-W1=(a) đã bỏ chế độ tự động. Vẫn giữ 1 kiểm tra kỹ thuật: part nào tự nó > **300 phút** ⇒ `skipped` với `reason:'PART_TOO_LONG'` (giới hạn cứng của Soniox, §W9-S3) |
-| **E-W3** | `translations` rỗng sau refine (người dùng không chọn ngôn ngữ dịch) | Vẫn mở. Áp dụng **cùng một luật cho cả 2 nhánh**: kết quả `translations` rỗng ⇒ **giữ** `previousTranslations`, không ghi đè bằng mảng rỗng |
-| **E-W5** | D-W2 là *experimental* | Vẫn mở, và **nặng hơn với multi-part**: nếu T-W6 không làm trước, refine một part đã `completed` chỉ là chạy lại cấu hình cũ ⇒ tốn tiền mà gần như không đổi kết quả. Đề nghị PM chốt: **T-W6 nằm trong phạm vi v1** |
-| **E-W6** *(mới)* | Refine **không** làm nhãn người nói nhất quán giữa các part (W11.2) — nếu đây chính là nỗi đau người dùng đang gặp với bản ghi ghép thì refine **không chữa được** | Cần PM/BA hỏi lại người dùng: nhầm speaker đang xảy ra **trong cùng một phần** (refine + D-W1/D-W2 có cửa) hay **giữa các phần** (chỉ phương án B ghép audio mới giải quyết, chi phí lớn hơn hẳn, nên là feature riêng). **Không tự chọn thay người dùng** |
+| ~~E-W2~~ | Giới hạn an toàn khi tự động chạy | ✅ Không còn áp dụng — E-W1=(a) đã bỏ chế độ tự động. Vẫn giữ 1 kiểm tra kỹ thuật: part nào tự nó > **300 phút** ⇒ `skipped` với `reason:'PART_TOO_LONG'` (giới hạn cứng của Soniox, §W9-S3) |
+| ~~E-W3~~ | `translations` rỗng sau refine (người dùng không chọn ngôn ngữ dịch) | ✅ **Đã duyệt tường minh qua AskUserQuestion (2026-09-22)**: kết quả `translations` rỗng ⇒ **giữ** bản dịch live/part cũ, không ghi đè bằng mảng rỗng. Áp dụng cùng luật cho cả 2 nhánh (single + multi-part) |
+| ~~E-W5~~ | D-W2 là *experimental* | ✅ **Đã duyệt tường minh (2026-09-22)**: T-W6 nằm trong phạm vi v1, làm **trước** phần refine chính. Đã code, Reviewer APPROVE, verify bằng smoke test Soniox thật (T-W7), đã commit (`c41aa0b`) |
+| ~~E-W6~~ *(mới)* | Refine không làm nhãn người nói nhất quán giữa các part | ✅ **Đã duyệt tường minh (2026-09-22)**: user xác nhận nỗi đau thật là nhầm speaker **trong cùng 1 phần/clip liền mạch** (ca "Lady Hà P3"), không phải giữa các part ghép. Refine + T-W6 context có cửa giải quyết đúng trường hợp này; hạn chế "không hợp nhất nhãn giữa các part" vẫn giữ nguyên cảnh báo ở `prompts.js` (WHY-W11), không phải feature cần làm thêm ở v1 |
 
 ---
 
-⏸ **CHECKPOINT (Protocol 2) — CHỜ PM DUYỆT §W10–§W16.** Dev **chưa** được bắt đầu phần multi-part. Cần chốt **E-W3**, **E-W5** (T-W6 có nằm trong v1 không) và **E-W6** (nỗi đau thật là trong-part hay giữa-part). Mọi nhãn `[UNVERIFIED]` ở §W9 vẫn nguyên hiệu lực.
+✅ **CHECKPOINT (Protocol 2) — ĐÃ DUYỆT §W10–§W16 (2026-09-22).** Toàn bộ E-W1→E-W6 đã được PM xác nhận tường minh qua AskUserQuestion với user thật (không phải suy diễn/im lặng — đúng yêu cầu "xác nhận phải tường minh" của CLAUDE.md). Dev đã bắt đầu implement phần backend multi-part (T-W1→T-W2, T-W3/T-W4, T-W10→T-W11) dựa trên checkpoint này. Mọi nhãn `[UNVERIFIED]` ở §W9 vẫn nguyên hiệu lực — không đổi hằng số bitrate/audio-format dựa trên các nhãn đó.

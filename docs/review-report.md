@@ -2319,3 +2319,233 @@ feature này go-live với user thật.
 - `runTranscriptionJob` xử lý `meeting` có thể `undefined` một cách graceful thay vì giả định luôn
   tồn tại — tránh crash job vì lý do phụ (context) trong khi phần chính (transcribe audio) vẫn nên
   chạy được.
+
+---
+
+# Review Report — 2026-09-22 (bổ sung)
+
+## Phạm vi review
+Backend "Tinh chỉnh transcript" (refine) theo Architecture.md §W1–§W16 — single-meeting
+(§W1–§W9) + multi-part (§W10–§W16, đã qua ✅ CHECKPOINT Protocol 2 ngày 2026-09-22, xác nhận
+tường minh qua AskUserQuestion với user thật — đã đọc dòng CHECKPOINT ở cuối §W16, hợp lệ).
+File mới: `server/refine.js`, `test/refine.test.js`, `test/refine-routes.test.js`. File sửa:
+`server/meeting-parts.js`, `server.js` (import refine.js, `pumpJobQueue`/`runTranscriptionJob`/
+`recoverInterruptedJobs`/`sweepStuckJobs` dùng `JOB_MODES`, endpoint mới
+`POST /api/meetings/:id/refine-transcript`, guard `PUT /api/meetings` mở rộng).
+
+Đã đọc toàn bộ §W1–§W16 của Architecture.md (không chỉ báo cáo Dev), đọc `git diff` thật cho mọi
+file, đọc toàn bộ `server/refine.js`, đọc kỹ `git diff server/meeting-parts.js` và
+`git diff server.js`, đọc toàn bộ `test/refine.test.js` + `test/refine-routes.test.js`, và tự
+chạy `npm test`.
+
+## Verdict: REQUEST_CHANGES (nhẹ — 1 issue Medium, không có Critical/High)
+
+## Trace tay theo đúng 8 trọng tâm được giao
+
+1. **Lỗ hổng mất dữ liệu (`retryPart` xoá trắng transcript)** — Đã verify: `grep retryPart`
+   trong `server.js`/`server/refine.js` cho thấy `retryPart` chỉ còn được gọi ở route
+   `/parts/:partId/retry` cũ (`server.js:1833`), refine không đụng tới nó ở bất kỳ đâu.
+   `markPartRefineQueued` snapshot `previousTranscript` **trước** khi tạo job, `applyPartRefineResult`
+   chỉ ghi khi thành công, `markPartRefineFailed` không đụng `transcript`/`status`. Có test
+   `test/refine-routes.test.js` (`... never calls retryPart's wipe-then-run path`) chạy job thật
+   với provider chưa cấu hình (fail chắc chắn, deterministic) và assert `p.transcript` giữ nguyên
+   byte-for-byte sau khi job fail. **Đạt.**
+2. **`pumpJobQueue` hỏi bảng thay vì `if (mode === 'refine')` rải rác** — Verify đúng:
+   `if (job.partId && modeFor(job).ownsPartStatus)` (server.js, thay cho `if (job.partId)` cũ) —
+   đúng tinh thần Protocol 8.3, không có nhánh `if (job.mode === 'refine')` nào rải rác trong
+   `runTranscriptionJob`/`recoverInterruptedJobs`/`sweepStuckJobs` — cả ba đều gọi chung
+   `writeJobFailure(job, errorInfo)` mới, bản thân hàm đó cũng chỉ hỏi `modeFor(job)` một lần.
+   **Đạt.**
+3. **Vị trí backup đúng chỗ** — Verify: single-meeting backup ở `meeting.liveTranscript`
+   (`markRefineRunning`, chỉ snapshot lần đầu, không ghi đè lần refine thứ 2 — đúng WHY-W4, có
+   test riêng cho việc này). Multi-part backup ở `part.previousTranscript`
+   (`markPartRefineQueued`), **không** ở cấp meeting. Đọc kỹ `rebuildMergedMeeting`
+   (`meeting-parts.js:200-232`): field trả về là danh sách cố định
+   (`transcript/translations/duration/durationEstimated/missingParts/sonioxUsage/status/
+   refiningParts`) — không đụng `parts[i].previousTranscript`/`parts[i].refine`, vì các field đó
+   nằm trong mảng `parts` được spread nguyên vẹn (`{...meeting, parts, ...merged}`), không bị
+   field cấp-meeting nào ghi đè. **Đạt, không có việc "field backup bị rebuild ghi đè".**
+4. **Guard `PUT /api/meetings` (R-W2)** — Verify bằng test thật
+   (`refine-routes.test.js`: "PUT /api/meetings while refine.status===running..."): gửi snapshot
+   client cũ với `status:'completed'` + transcript khác → server giữ nguyên
+   `transcript/duration/sonioxUsage/refine`, chỉ field không sở hữu (title) mới pass qua. Guard
+   mới **không** đụng nhánh `preserveServerOwnedFields` sẵn có cho multi-part (nhánh multi-part
+   `return` sớm trước khi chạm nhánh refine-guard mới — hai nhánh loại trừ lẫn nhau đúng, không
+   viết trùng lặp logic). **Đạt.**
+5. **E-W3 (giữ bản dịch cũ nếu refine ra rỗng) ở cả 2 nhánh** — Verify: `applyRefineResult`
+   (single) dòng `translations = newTranslations.length > 0 ? newTranslations : (meeting.translations
+   || [])`; `applyPartRefineResult` (multi-part) dòng tương đương
+   `translations = newTranslations.length > 0 ? newTranslations : part.translations`. Cả hai có
+   test riêng xác nhận (`E-W3: an empty translations result does not blank out...`). **Đạt, không
+   thiếu nhánh nào.**
+6. **Bảo mật endpoint mới** — `POST /api/meetings/:id/refine-transcript` nằm dưới `handleApi`,
+   và toàn bộ `handleApi` được gọi sau `if (!hasTrustedHost(request) || !isTrustedApiRequest(request))
+   { ... return; }` ở `requestHandler` cấp trên (server.js dòng ~2408) — route mới **không** tự
+   viết lại check này, đi qua đúng cổng chung. Có test xác nhận thật:
+   `POST refine-transcript returns 403 for a DNS-rebinding Host header`. Route chỉ nhận `:id` (qua
+   `decodePathSegment`) + `partIds` (validate bằng `isValidPartId` — cùng regex
+   `/^part-[a-z0-9-]{8,64}$/` dùng cho hash path, không nối chuỗi vào filesystem), không nhận bất
+   kỳ đường dẫn file nào từ client. Response code khớp đúng bảng W13.1: 201/200 cho single, 201
+   cho parts kèm `skipped[]`, 409 `REFINE_ALREADY_RUNNING` (chỉ khi MỌI part được yêu cầu đều
+   đang chạy), 422 `REFINE_NO_ELIGIBLE_PARTS`/`REFINE_NOT_APPLICABLE`, 400 `PART_NOT_FOUND`, 404
+   khi meeting/audio không còn. Không thêm `child_process.spawn` nào (đúng WHY-W7 — phương án A
+   không cần ffmpeg). **Đạt.**
+7. **Regression job không có `mode`** — `modeFor(job)` trả `JOB_MODES[job.mode] || JOB_MODES.attach`,
+   nên `job.mode === undefined` (mọi job cũ) rơi về `JOB_MODES.attach` — bảng này gói đúng behavior
+   cũ (`writePartSuccess: applyPartResult`, `writePartFailure: markPartFailed`, không có
+   `writeSingleSuccess/writeSingleFailure` nên nhánh single-meeting cũ vẫn rơi vào
+   `mergeTranscriptionIntoMeeting` y hệt trước — code có comment giải thích rõ lý do). Có test
+   riêng `regression: POST /api/import-transcription (job with no mode) still completes as
+   before` chạy server thật, assert `meeting.status === 'failed'` + `processingError` tồn tại sau
+   khi job thật (provider chưa cấu hình) fail — đúng hành vi cũ. **Đạt.**
+8. **`npm test`** — tự chạy lại, kết quả: **277 tests, 275 pass, 0 fail, 2 skipped** (2 skip là
+   Whisper/Google golden fixture thiếu API key trên máy này — pre-existing, không liên quan PR
+   này). Khớp đúng số Dev báo cáo (275 passing/2 skipped/0 failing). **Đạt.**
+
+## External contract verification
+N/A — phần backend này không thêm lời gọi tool bên ngoài mới (không dùng `context` mới, không
+`ffmpeg`/subprocess mới). Mọi tham chiếu Soniox (300 phút, `stt-async-v5`) đã được Tech Lead
+verify từ trước ở §W9 (Protocol 5), không có claim mới chưa có nguồn trong phần code này.
+
+## Issues Found
+
+### Critical
+(không có)
+
+### High
+(không có)
+
+### Medium
+- [ ] `server.js` route `GET /api/meetings/:id/parts` (dòng ~1649-1680) — **T-W13 (Architecture
+  §W13.2) chưa được implement.** Spec yêu cầu thêm đúng 2 field vào từng phần tử `parts[]` của
+  projection (`refine: part.refine || null`, `transcriptSource: part.transcriptSource ||
+  'original'`) và 1 field cấp meeting (`refiningParts: meeting.refiningParts || []`) — dữ liệu
+  này đã tồn tại đúng trong model (`part.refine`, `part.transcriptSource`,
+  `meeting.refiningParts` đều được `server/meeting-parts.js`/`server/refine.js` tính đúng), chỉ
+  là chưa được lộ ra qua endpoint poll rẻ này. Đã `grep refiningParts server.js` xác nhận field
+  này chỉ xuất hiện ở `PUT /api/meetings` guard, không ở route GET parts. CHANGELOG của Dev tự
+  giác ghi rõ phạm vi task là "T-W1/T-W2/T-W3/T-W4/T-W10/T-W11" — không claim T-W13 đã xong, nên
+  đây không phải một claim sai, nhưng theo đúng thứ tự task ở §W15
+  (`T-W10 → T-W1 → T-W2 → T-W11/T-W12 → T-W3 → T-W13 → T-W5 ...`), T-W13 nằm ngay sau T-W3 và là
+  điều kiện tiên quyết để T-W5 (UI) poll được trạng thái refine per-part mà không phải tải cả
+  `/api/data` (phá đúng mục đích "poll rẻ" của route này, ghi ở W10.13). Không chặn approve backend
+  increment này (đã tách task rõ ràng, không có bug/regression), nhưng phải làm **trước khi bắt
+  đầu T-W5** — nếu không, UI multi-part refine sẽ không có cách nào biết part nào đang refine mà
+  không đổi hẳn cơ chế poll.
+  → **Gợi ý sửa**: thêm đúng 2 field/1 field như W13.2 mô tả vào response hiện có, kèm 1 test cho
+  `test/parts-routes.test.js` (hoặc file tương đương) xác nhận field mới xuất hiện đúng dạng khi
+  `part.refine` có giá trị.
+
+### Low
+- [ ] `server.js` route refine-transcript multi-part (~dòng 2012-2075) — eligibility check
+  (`ALREADY_RUNNING`/`PART_NOT_COMPLETED`/`PART_TOO_LONG`/`AUDIO_NOT_FOUND`) đọc từ `current`
+  (snapshot `readJson` một lần, ngoài transaction), rồi mới `mutateMeeting`/`mutateJson` riêng —
+  giữa hai bước này có khe hở lý thuyết cho 2 request đồng thời cùng vượt qua eligibility check
+  cho cùng 1 part trước khi cái nào ghi `refine.status='running'` trước. Test
+  `called twice for the same part` đã cover case tuần tự (not truly concurrent) và chấp nhận cả
+  201 lẫn 409 tuỳ thời điểm — nghĩa là race thật (2 request đồng thời, cả hai đọc `current` trước
+  khi bên kia ghi) chưa có test khẳng định không tạo ra 2 job trùng. Đây là pattern **giống hệt**
+  cách `findActiveJob`/dedupe hiện có của luồng import/attach đã hoạt động trước cả PR này (không
+  phải lỗ hổng riêng của refine) nên không chặn approve, nhưng đáng ghi lại vì multi-part tạo N
+  request/part cùng lúc từ UI (hộp chọn "tick tất cả phần") — xác suất trúng race cao hơn
+  single-job trường hợp cũ.
+
+## Positive Notes
+- Bám sát Architecture §W10.16-W16 tới mức comment trong code trỏ thẳng số mục Architecture
+  (`WHY-W4`, `WHY-W8`, `W12.1 step 1`, `G2, W10.16`...) — review bằng cách đối chiếu tay giữa
+  spec và code nhanh hơn nhiều nhờ việc này, và giảm rủi ro "code trôi khỏi spec theo thời gian".
+- `JOB_MODES`/`modeFor` đúng tinh thần Protocol 8.3: năng lực khai báo trên object
+  (`ownsMeetingStatus`, `ownsPartStatus`, `usage`, các hàm writer) thay vì rẽ nhánh theo tên mode
+  rải rác — cả 4 điểm gọi (`pumpJobQueue`, `runTranscriptionJob`, `recoverInterruptedJobs`,
+  `sweepStuckJobs`) đều thống nhất qua 1 bảng, không có điểm nào bị bỏ sót (đã trace tay cả 4).
+- `writeJobFailure` — refactor gộp 3 chỗ code trùng lặp gần như y hệt (failure-write ở
+  `runTranscriptionJob`/`recoverInterruptedJobs`/`sweepStuckJobs`) thành 1 hàm dùng chung, đúng
+  DRY, và quan trọng hơn: đảm bảo watchdog + restart-recovery không bị quên cập nhật khi thêm mode
+  mới sau này (chỉ cần sửa `JOB_MODES`, không phải sửa 3 nơi).
+- Test `test/refine.test.js`/`test/refine-routes.test.js` không chỉ `assert_called()` suông —
+  nhiều chỗ assert **giá trị cụ thể** (transcript byte-for-byte của part không bị đụng, thứ tự
+  `usageBreakdown`, `refiningParts` rỗng sau khi done) đúng tinh thần Protocol 6.2.
+- `markRefineRunning` xử lý đúng edge case "refine lần 2" — không ghi đè `liveTranscript` gốc
+  bằng bản đã refine của lần chạy trước, có test riêng xác nhận. Đây là chi tiết dễ bị bỏ sót nếu
+  chỉ đọc lướt Architecture.
+- Test bảo mật DNS-rebinding cho route mới không bị bỏ quên (nhiều PR thêm route mới hay quên
+  test này) — `POST refine-transcript returns 403 for a DNS-rebinding Host header`.
+
+---
+
+# Review Report — 2026-09-22 (vòng 2/3 — fix issue Medium T-W13.2)
+
+## Phạm vi
+Dev báo cáo đã fix issue Medium duy nhất từ vòng 1 (T-W13.2 — thiếu field `refine`/
+`transcriptSource`/`refiningParts` trong `GET /api/meetings/:id/parts`). Đây là vòng 2/3 theo
+Protocol 3. Đã tự `git diff` lại (không tin nguyên văn báo cáo), đọc toàn bộ đoạn code thay đổi
+trong `server.js` + `test/parts-routes.test.js`, và tự chạy `npm test`.
+
+## Verify 3 điểm được giao
+
+1. **Tên field có khớp data model đã duyệt ở vòng 1 không?** — Khớp chính xác, không bịa field
+   mới: `part.refine` (object `{status, jobId, startedAt, finishedAt, error}` — đúng shape
+   `normalizePartRefine` ở `server/meeting-parts.js` đã chuẩn hoá từ vòng 1),
+   `part.transcriptSource` (đúng `TRANSCRIPT_SOURCES = new Set(['original', 'refined'])` cũng ở
+   `meeting-parts.js`), `meeting.refiningParts` (đúng tên field `rebuildMergedMeeting` đã tính từ
+   vòng 1: `refiningParts: timed.filter(part => part.refine?.status === 'running').map(part =>
+   part.order)`). Không có field mới nào được đặt tên khác đi so với những gì đã review/approve
+   ở vòng 1.
+2. **Tương thích ngược** — Trace tay 1 meeting có `parts` nhưng chưa từng gọi refine: mỗi part
+   không có `refine`/`transcriptSource` trong storage (từ trước tính năng này tồn tại)
+   → `part.refine || null` cho `null` (không `undefined`, không lỗi), `part.transcriptSource ||
+   'original'` cho `'original'` — đúng giá trị mặc định W13.2 quy định. `meeting.refiningParts`
+   cũng đã tồn tại sẵn từ `rebuildMergedMeeting` (mọi meeting có `parts` đều chạy qua hàm này ở
+   mọi lần ghi) nên không có case `undefined` — code còn tự phòng thủ thêm
+   `Array.isArray(meeting.refiningParts) ? meeting.refiningParts : []` cho trường hợp dữ liệu cũ
+   trên đĩa từ trước khi field này tồn tại. Toàn bộ thay đổi là **thuần thêm field vào object JSON
+   trả về**, không đổi tên/kiểu/vị trí bất kỳ field cũ nào (`partId, order, filename, status,
+   error, spanSeconds, offsetSeconds, hasTranscript, startedAt, endedAt` — đối chiếu diff, không
+   dòng nào trong nhóm này bị sửa) → client cũ đọc theo key (không phải theo thứ tự) sẽ không vỡ.
+   Test có sẵn từ trước (`GET /parts returns a compact status summary...`) chỉ assert
+   `!('transcript' in part)` + có mặt của vài field cụ thể, không assert exhaustive shape, nên
+   không cần sửa để pass — tự chạy lại xác nhận **vẫn xanh**, không việc gì phải sửa test cũ để
+   né field mới (dấu hiệu tốt: field mới thực sự additive, không phải Dev né bug bằng cách sửa
+   assertion). **Đạt — tương thích ngược đúng như claim.**
+3. **`refiningParts` có phải field đã tính sẵn từ vòng 1, hay Dev tự viết logic tính mới?** —
+   Đã `grep` xác nhận: route chỉ đọc `meeting.refiningParts` trực tiếp từ đối tượng meeting đã
+   đọc từ `MEETINGS_FILE` (`refiningParts: Array.isArray(meeting.refiningParts) ?
+   meeting.refiningParts : []`), **không** có phép tính `.filter(...).map(...)` nào mới viết lại
+   ở `server.js`. Logic tính toán duy nhất vẫn là `rebuildMergedMeeting` trong
+   `server/meeting-parts.js` mà vòng 1 đã review và không có diff nào ở file đó trong vòng 2
+   (`git status` xác nhận `server/meeting-parts.js` không nằm trong danh sách file thay đổi của
+   vòng này). Đúng như Dev báo cáo: field có sẵn, chỉ lộ ra qua response, không viết logic mới
+   cần review sâu hơn.
+
+## Kết quả khác
+- `npm test`: tự chạy lại, kết quả **278 tests, 276 pass, 0 fail, 2 skip** — khớp đúng số Dev báo
+  cáo (276 pass/2 skip/0 fail; tăng đúng 1 test mới so với vòng 1 là 275→276 và tổng test
+  277→278).
+- Test mới (`test/parts-routes.test.js`: "GET /parts exposes per-part refine status and
+  transcriptSource, plus meeting-level refiningParts (T-W13.2)") cover đúng 2 case được yêu cầu:
+  part đang refine (`status:'running'`, có `refine`/`transcriptSource`) và part chưa từng refine
+  (thiếu cả 2 field trong storage → fallback đúng `'original'`/`null`) — không chỉ test case
+  "happy path có sẵn dữ liệu", có test cả case thiếu dữ liệu (regression thật, không phải test tự
+  xác nhận).
+- Bảo mật: route này không đổi (không route mới), vẫn nằm dưới cùng `handleApi`/`hasTrustedHost`
+  guard đã verify ở vòng 1 — không cần re-verify.
+
+## Verdict: APPROVE
+
+Issue Medium duy nhất của vòng 1 đã được fix đúng, đầy đủ, đúng data model đã duyệt, có test
+regression cụ thể (không phải `assert_called()` suông), và không phát sinh vấn đề mới. Không còn
+issue Critical/High/Medium nào mở. Issue Low về race condition dedupe multi-part (ghi ở vòng 1)
+vẫn còn treo nhưng không chặn approve — đã ghi rõ là pattern kế thừa từ trước PR này, không phải
+lỗi mới, và không nằm trong phạm vi fix được yêu cầu ở vòng 2 này.
+
+## External contract verification
+N/A — không có thay đổi liên quan tool bên ngoài trong vòng fix này.
+
+## Positive Notes
+- Fix đúng trọng tâm, không lan sang sửa file khác ngoài phạm vi cần thiết (`git status` xác nhận
+  chỉ `server.js` + `test/parts-routes.test.js` thay đổi so với vòng 1, cộng file review-report
+  này).
+- Không "sửa" test cũ để né field mới — field mới thực sự cộng thêm, tự chứng minh tương thích
+  ngược bằng cách để nguyên test cũ vẫn xanh thay vì sửa nó.
+- Test mới cover cả 2 nhánh (đang refine / chưa từng refine) trong cùng 1 test, đúng tinh thần
+  kiểm tra giá trị cụ thể thay vì chỉ "route trả 200".

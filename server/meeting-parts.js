@@ -50,6 +50,31 @@ function normalizeTranscriptSegment(segment) {
   };
 }
 
+const REFINE_STATUSES = new Set(['running', 'done', 'failed']);
+const TRANSCRIPT_SOURCES = new Set(['original', 'refined']);
+
+// §W12 — refine's per-part status, kept separate from `part.status` (WHY-W8).
+// `null` (not `undefined`) when absent, same discipline as
+// clampNullableNonNegativeNumber's comment above: a part that was never
+// refined must normalize to the exact same "nothing happened" shape every
+// time, not accumulate stray fields on repeated normalization.
+function normalizePartRefine(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  return {
+    status: REFINE_STATUSES.has(raw.status) ? raw.status : 'failed',
+    jobId: clampString(raw.jobId, 100),
+    startedAt: clampString(raw.startedAt, 64),
+    finishedAt: raw.finishedAt ? clampString(raw.finishedAt, 64) : null,
+    error: raw.error && typeof raw.error === 'object'
+      ? { code: clampString(raw.error.code, 100), message: clampString(raw.error.message, 2000) }
+      : null
+  };
+}
+
+function normalizeUsageBreakdown(raw) {
+  return Array.isArray(raw) ? raw.filter(entry => entry && typeof entry === 'object').slice(0, 50) : [];
+}
+
 // Defensive re-normalization of a stored/incoming part-shaped object (§V3.2).
 // Anything server-computed (spanSeconds/offsetSeconds/status/transcript
 // content) is preserved as given here — computing those is rebuildMergedMeeting's
@@ -78,7 +103,20 @@ function normalizePart(raw) {
     spanSeconds: Number.isFinite(Number(part.spanSeconds)) ? Math.max(0, Number(part.spanSeconds)) : 0,
     offsetSeconds: Number.isFinite(Number(part.offsetSeconds)) ? Math.max(0, Number(part.offsetSeconds)) : 0,
     usage: part.usage && typeof part.usage === 'object' ? part.usage : null,
-    addedAt: clampString(part.addedAt, 64) || new Date().toISOString()
+    addedAt: clampString(part.addedAt, 64) || new Date().toISOString(),
+    // §W12 (T-W10) — refine fields. All optional; absent = pre-refine
+    // behavior. Preserved verbatim across repeated normalizePart calls so a
+    // route that re-normalizes defensively (every route in this file does)
+    // never drops a running/failed refine or a backup transcript.
+    refine: normalizePartRefine(part.refine),
+    previousTranscript: Array.isArray(part.previousTranscript)
+      ? part.previousTranscript.slice(0, 50000).map(normalizeTranscriptSegment)
+      : undefined,
+    previousTranslations: Array.isArray(part.previousTranslations)
+      ? part.previousTranslations.slice(0, 50000).map(normalizeTranscriptSegment)
+      : undefined,
+    transcriptSource: TRANSCRIPT_SOURCES.has(part.transcriptSource) ? part.transcriptSource : 'original',
+    usageBreakdown: normalizeUsageBreakdown(part.usageBreakdown)
   };
 }
 
@@ -129,27 +167,38 @@ function overallStatus(parts) {
 // V3.4 — sonioxUsage becomes a SUM across completed parts. Field name is kept
 // (not renamed) because every existing UI reads `meeting.sonioxUsage`
 // (js/app.js:368,611,1385).
+// T-W11 (§W11.3): a refined part may have run more than once — `part.usage`
+// alone only ever holds the MOST RECENT run. When `part.usageBreakdown` is
+// present it is the full history and is summed instead; a part with no
+// breakdown (never refined) falls back to `part.usage` exactly as before, so
+// this is byte-for-byte the pre-refine result for every meeting that never
+// touches refine.
 function aggregateUsage(parts) {
-  const counted = parts.filter(part => part.status === 'completed' && part.usage);
+  const counted = parts.filter(part =>
+    part.status === 'completed' && (part.usage || (Array.isArray(part.usageBreakdown) && part.usageBreakdown.length > 0)));
   if (counted.length === 0) return null;
 
-  const providers = new Set(counted.map(part => part.usage.provider));
-  const models = new Set(counted.map(part => part.usage.model));
-  const rates = new Set(counted.map(part => part.usage.pricingUsdPerHour));
-  const costs = counted.map(part => part.usage.estimatedCostUsd);
+  const entries = counted.flatMap(part =>
+    Array.isArray(part.usageBreakdown) && part.usageBreakdown.length > 0 ? part.usageBreakdown : (part.usage ? [part.usage] : []));
+  if (entries.length === 0) return null;
+
+  const providers = new Set(entries.map(usage => usage.provider));
+  const models = new Set(entries.map(usage => usage.model));
+  const rates = new Set(entries.map(usage => usage.pricingUsdPerHour));
+  const costs = entries.map(usage => usage.estimatedCostUsd);
   const allCostsNull = costs.every(cost => cost === null || cost === undefined);
-  const startedTimes = counted.map(part => part.usage.startedAt).filter(Boolean).sort();
-  const endedTimes = counted.map(part => part.usage.endedAt).filter(Boolean).sort();
+  const startedTimes = entries.map(usage => usage.startedAt).filter(Boolean).sort();
+  const endedTimes = entries.map(usage => usage.endedAt).filter(Boolean).sort();
 
   return {
     provider: providers.size === 1 ? [...providers][0] : 'mixed',
     model: models.size === 1 ? [...models][0] : 'mixed',
     startedAt: startedTimes[0] || null,
     endedAt: endedTimes[endedTimes.length - 1] || null,
-    billableDurationSeconds: counted.reduce((sum, part) => sum + (Number(part.usage.billableDurationSeconds) || 0), 0),
+    billableDurationSeconds: entries.reduce((sum, usage) => sum + (Number(usage.billableDurationSeconds) || 0), 0),
     pricingUsdPerHour: rates.size === 1 ? [...rates][0] : null,
     estimatedCostUsd: allCostsNull ? null : costs.reduce((sum, cost) => sum + (Number(cost) || 0), 0),
-    translationEnabled: counted.some(part => Boolean(part.usage.translationEnabled)),
+    translationEnabled: entries.some(usage => Boolean(usage.translationEnabled)),
     source: 'file-upload',
     partCount: parts.length,
     partsCounted: counted.length
@@ -175,7 +224,10 @@ function rebuildMergedMeeting(meeting) {
     durationEstimated: merged.durationEstimated,
     missingParts: merged.missingParts,
     sonioxUsage: aggregateUsage(timed),
-    status: overallStatus(timed)
+    status: overallStatus(timed),
+    // §W12 — derived, for the UI's "Đang tinh chỉnh N/M phần" indicator
+    // (W14). Empty array = nothing refining, same as before this feature.
+    refiningParts: timed.filter(part => part.refine && part.refine.status === 'running').map(part => part.order)
   };
 }
 
@@ -336,7 +388,7 @@ function applyTranscriptEdits(meeting, incomingTranscript) {
 // SERVER-SIDE copy already has parts, regardless of what status the client
 // sends. `parts`/duration/status/etc are server-owned; transcript edits are
 // applied field-by-field instead of accepted wholesale.
-const SERVER_OWNED_STATIC_FIELDS = ['duration', 'durationEstimated', 'missingParts', 'sonioxUsage', 'status', 'processingError', '_activeJobId'];
+const SERVER_OWNED_STATIC_FIELDS = ['duration', 'durationEstimated', 'missingParts', 'sonioxUsage', 'status', 'processingError', '_activeJobId', 'refiningParts'];
 
 function preserveServerOwnedFields(current, incoming) {
   if (!current || !Array.isArray(current.parts) || current.parts.length === 0) return incoming;

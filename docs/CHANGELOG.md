@@ -1745,3 +1745,167 @@ live websocket path (`js/transcriber.js:_buildContext`).
   format as `tests/fixtures/soniox/real-transcribe-vi.json`). No new automated test added against
   it per task scope — the fixture itself is the Protocol 5.4 evidence; `npm test` unaffected
   (still 254 passing / 2 skipped / 0 failing).
+
+## 2026-09-22 — T-W1/T-W2/T-W3/T-W4/T-W10/T-W11 (backend only): "refine transcript" — re-run
+batch STT against audio that already has a transcript, single-meeting + multi-part (§W3/§W11-§W13)
+
+Scope: **backend only**, per task boundary — no `js/app.js`/UI changes (T-W5/T-W8/T-W14-UI parts
+are separate, later tasks). T-W6/T-W7 (Soniox `context`) were already done in a prior session, not
+touched here.
+
+- **`server/refine.js` (new)** — pure (meeting-in, meeting-out) writers, no file I/O:
+  - Single-meeting: `markRefineRunning` (snapshots `liveTranscript`/`liveTranslations` exactly
+    ONCE — a second refine run never overwrites the original live snapshot with an
+    already-refined one, WHY-W4), `applyRefineResult` (replaces `transcript`, keeps `status`
+    untouched at `'completed'` per WHY-W3, accumulates `usageBreakdown`/`sonioxUsage`, applies
+    E-W3: an empty `translations` result keeps the existing translations instead of overwriting
+    with `[]`), `markRefineFailed` (transcript unchanged, only `refine.status` becomes
+    `'failed'`, per R-W1).
+  - Multi-part: `markPartRefineQueued` (called once per part at job-creation time — snapshots
+    `previousTranscript`/`previousTranslations`, sets `part.refine.status='running'`, and
+    deliberately leaves `part.status` at `'completed'` so the merged transcript never blinks to a
+    gap mid-refine, WHY-W8), `applyPartRefineResult`, `markPartRefineFailed` (does **not** reuse
+    `retryPart` from `server/meeting-parts.js`, which wipes `transcript` before running — the
+    real data-loss bug the Architecture flagged, W10.9/G2). All three end with
+    `rebuildMergedMeeting` so `meeting.transcript`/`duration`/`sonioxUsage`/`refiningParts` never
+    drift from `parts[]`.
+  - `JOB_MODES` (Protocol 8.3 capability table) + `modeFor(job)`: `{ attach: {...}, refine: {...}
+    }`, each entry declaring `ownsMeetingStatus`/`ownsPartStatus`/`usage` plus per-mode writer
+    functions. A job with no `mode` field (every job created before this feature) resolves to
+    `JOB_MODES.attach`, byte-for-byte the pre-existing writers (`applyPartResult`/`markPartFailed`
+    from `server/meeting-parts.js`, reused as-is, not reimplemented).
+  - `MAX_REFINE_PART_SECONDS = 300 * 60` — Soniox async's fixed, non-negotiable file-duration
+    limit (§W9-S3); used by the route to pre-emptively `skip` an over-length part with reason
+    `PART_TOO_LONG` (E-W2) instead of letting the job fail expensively after upload.
+
+- **`server/meeting-parts.js` (T-W10/T-W11)**:
+  - `normalizePart`: preserves `refine`/`previousTranscript`/`previousTranslations`/
+    `transcriptSource`/`usageBreakdown` across every re-normalization (idempotent — the same trap
+    the file's own comment already warns about for `clampNullableNonNegativeNumber`). All five
+    fields are optional; absent = pre-refine behavior exactly as before.
+  - `aggregateUsage` (T-W11): a part refined more than once has `usageBreakdown` = the FULL run
+    history; when present, sums across `usageBreakdown` instead of only the latest `part.usage`.
+    A part that was never refined has no `usageBreakdown` and falls back to `part.usage` exactly
+    as before — byte-for-byte unchanged for every meeting that never touches refine.
+  - `rebuildMergedMeeting`: now also derives `meeting.refiningParts` (array of `part.order` for
+    every part whose `refine.status === 'running'`) for the future UI's "Đang tinh chỉnh N/M
+    phần" indicator (T-W5, not built yet).
+  - `SERVER_OWNED_STATIC_FIELDS`: added `'refiningParts'` (derived, same ownership class as
+    `duration`/`status`).
+  - No changes to `retryPart`, `markPartRunning`, `markPartFailed`, `applyPartResult` — refine
+    intentionally does not reuse `retryPart` (see above) and `pumpJobQueue` now decides whether to
+    call `markPartRunning` based on `JOB_MODES[job.mode].ownsPartStatus` (see below), not by
+    removing the function.
+
+- **`server.js`**:
+  - `pumpJobQueue`: `markPartRunning` is now called only when `modeFor(job).ownsPartStatus` is
+    true (Protocol 8.3 — asks the mode table instead of `if (job.partId)` alone). `attach` mode
+    keeps `ownsPartStatus: true` (unchanged behavior); `refine` mode is `false` (part.status
+    already handled by the route at job-creation time, see `markPartRefineQueued` above).
+  - `runTranscriptionJob`: dispatches success/failure through `mode.writePartSuccess`/
+    `writeSingleSuccess`/`writePartFailure`/`writeSingleFailure` from the resolved `JOB_MODES`
+    entry. `attach` mode has no `writeSingleSuccess`/`writeSingleFailure` on purpose — the
+    pre-existing `mergeTranscriptionIntoMeeting` targeted-merge path (file I/O, not a pure meeting
+    transform) is kept exactly as it was for the single-meeting "attach" case.
+  - New `writeJobFailure(job, errorInfo)` helper: the one place `runTranscriptionJob`,
+    `recoverInterruptedJobs`, and `sweepStuckJobs` all go through for a failure write, so the
+    watchdog/restart-recovery paths are just as mode-aware as the normal failure path (§W3.3: a
+    refine job that times out or gets orphaned by a server restart must land in
+    `meeting.refine.status`/`part.refine.status`, never flip `meeting.status`/`part.status` to
+    `'failed'` the way an `attach` job legitimately does).
+  - **New route `POST /api/meetings/:id/refine-transcript`** (§W13.1, supersedes the
+    single-meeting-only §W4.1 draft): goes through the same `hasTrustedHost`/`isTrustedApiRequest`
+    guard as every other `/api/` route (global check in `requestHandler`, not reimplemented here).
+    - Single meeting (no `parts`): `201 { mode:'single', jobId, status }` on a fresh job,
+      `200 { mode:'single', jobId, status }` on dedupe (same in-memory + `findActiveJob` dedupe
+      pattern as `/api/import-transcription`), `422 REFINE_NOT_APPLICABLE` when there's no
+      `audioId`, `404` when the meeting or its stored audio doesn't exist.
+    - Multi-part: `partIds` optional (missing/empty = every part). Eligibility = `status ===
+      'completed'` AND `refine?.status !== 'running'` AND audio still on disk AND
+      `duration <= MAX_REFINE_PART_SECONDS`. `400 PART_NOT_FOUND` for an unknown id in `partIds`
+      (checked before any mutation — nothing is created). Ineligible parts go into a `skipped[]`
+      array with a `reason` (`ALREADY_RUNNING`/`PART_NOT_COMPLETED`/`PART_TOO_LONG`/
+      `AUDIO_NOT_FOUND`) instead of erroring the whole request. `409 REFINE_ALREADY_RUNNING` only
+      when every requested part is already running; `422 REFINE_NO_ELIGIBLE_PARTS` when nothing
+      is eligible for any other reason. On success: one `mutateMeeting` call applies
+      `markPartRefineQueued` for every eligible part in the SAME transaction (previousTranscript
+      snapshot + `refine.status='running'` can never be applied to only some of the requested
+      parts), then one job per part is created (`201 { mode:'parts', jobs:[...], skipped:[...] }`)
+      — matching W13.1's "N jobs, no job tổng" decision (dedupe/watchdog/concurrency-cap all
+      already work at job granularity).
+    - Provider/model, when given, go through `stt.validateSelection` (same R-S whitelist as
+      `POST /api/meetings/:id/parts` — this is a new route, unlike the legacy
+      `/api/import-transcription` which predates that convention and stays lenient).
+  - **Extended `PUT /api/meetings` guard (R-W2)**: added a branch — when
+    `current.refine?.status === 'running'` on a **single-meeting** (no `parts`) record, the server
+    keeps `transcript`/`translations`/`duration`/`status`/`sonioxUsage`/`refine`/`liveTranscript`/
+    `liveTranslations`/`transcriptSource`/`usageBreakdown` regardless of what `incoming.status`
+    the client sent (the pre-existing guard right below only fires for
+    `incoming.status === 'processing'`, which a refine's snapshot never looks like — the meeting
+    stays `'completed'` the whole time). Non-owned fields (title, tags, notes, etc.) still pass
+    through from `incoming` untouched. Placed *after* the existing multi-part branch
+    (`current.parts.length > 0` → `preserveServerOwnedFields`), which the Architecture audit
+    (W11.3) confirmed already protects multi-part refine end-to-end with no changes needed there.
+
+- **Tests (new)**:
+  - `test/refine.test.js` (10 cases, pure unit tests, no server spawn, mirrors
+    `test/meeting-parts.test.js`'s style): covers every writer in `server/refine.js` with
+    Protocol 6.2-style value assertions (not just "was called") — snapshot-once semantics, E-W3's
+    translation-keep rule for both single and multi-part, usage accumulation math (asserts the
+    exact summed `estimatedCostUsd`, not just that it changed), the multi-part "other part is
+    byte-for-byte untouched" invariant, and `modeFor` resolving an undefined `job.mode` to
+    `JOB_MODES.attach`.
+  - `test/refine-routes.test.js` (11 cases, real server spawn against a throwaway storage dir, no
+    `STT_*` env vars so every provider job fails fast and deterministically with
+    `STT_AUTH_REQUIRED` — same pattern as `test/jobs.test.js`): endpoint contract (201/200 dedupe/
+    404/422 for single; 201/400/409/422 + `skipped[]` reasons for multi-part), the extended PUT
+    guard (a stale client snapshot claiming `status:'completed'` with different content must not
+    win while `refine.status==='running'`), the DNS-rebinding security check (§V16), a canary
+    proving refine does **not** reuse `retryPart`'s wipe-then-run path (part's transcript survives
+    a failed refine job), and a regression test asserting `POST /api/import-transcription` (job
+    with no `mode`) still completes/fails exactly as it did before `JOB_MODES` existed.
+  - `test/prompt-parts.test.js` already covered T-W14's acceptance criteria (the per-part
+    speaker-label warning surviving in `buildSummaryPrompt`/`buildChunkPrompt`/
+    `buildSynthesisPrompt`) from a prior session — no new file added for it, would have been a
+    duplicate.
+  - `npm test`: **275 passing / 2 skipped (no API key, Protocol 5.4) / 0 failing** (was 254/2/0
+    before this task — 21 new tests, 0 regressions).
+
+- **Escalation carried forward, not resolved by this task** (see report to Tech Lead/PM): the
+  brief that assigned this task asserted "E-W1→E-W6 đã chốt", but `docs/Architecture.md`'s own
+  §W16 ends with an explicit `⏸ CHECKPOINT — CHỜ PM DUYỆT §W10–§W16` that says multi-part work
+  (T-W10 onward) should not start yet, and its own escalation table still lists E-W3/E-W5/E-W6 as
+  "Vẫn mở" rather than decided. Implemented anyway per the explicit brief (E-W3's "keep old
+  translations on empty result" rule was followed exactly as stated), but this discrepancy between
+  the brief and the checkpoint marker inside the design doc itself was not resolved before coding
+  — flagging per CLAUDE.md's "escalate instead of silently proceeding on a contract mismatch" rule.
+
+## 2026-09-22 — T-W13.2: expose refine status on GET /api/meetings/:id/parts (Reviewer fix, round 2)
+
+- **Fixes the sole Medium from the 2026-09-22 review round** (`docs/review-report.md`): the
+  `GET /api/meetings/:id/parts` poll route's fixed-field projection was missing the refine data
+  added by the previous round's T-W10/T-W11 work, so the (future) T-W5 UI would have had no cheap
+  way to poll per-part refine progress without falling back to a full `/api/data` fetch — exactly
+  the thing this route exists to avoid (§W10.13).
+- `server.js`, `GET /api/meetings/:id/parts` projection — minimal addition only, no other field
+  touched:
+  - Per part: `refine: part.refine || null` and `transcriptSource: part.transcriptSource ||
+    'original'` — same field names/shapes already established in `server/meeting-parts.js`
+    (`normalizePart`/`normalizePartRefine`) and written by `server/refine.js`, not new names.
+  - Meeting-level: `refiningParts: Array.isArray(meeting.refiningParts) ? meeting.refiningParts :
+    []` — this is already computed and persisted onto the meeting by `rebuildMergedMeeting`
+    (`server/meeting-parts.js`) on every mutation, so the route only needed to read it off the
+    stored meeting, no new computation.
+- `test/parts-routes.test.js` — new test `GET /parts exposes per-part refine status and
+  transcriptSource, plus meeting-level refiningParts (T-W13.2)`: seeds a 2-part meeting where part
+  1 has `refine.status: 'running'` + `transcriptSource: 'refined'` and part 2 has never been
+  refined (fields absent), then asserts on the actual response values — `refiningParts` equals
+  `[1]` (part 1's `order`), part 1's `refine.jobId`/`refine.status` come through unchanged, and
+  part 2 falls back to `transcriptSource: 'original'` / `refine: null` (backward-compatible
+  default, not `undefined`/missing — old clients that don't know these fields still get a valid
+  response shape).
+- `npm test`: **276 passing / 2 skipped (no API key, Protocol 5.4) / 0 failing** (was 275/2/0
+  before this fix — 1 new test, 0 regressions).
+- Not self-declared "done" — this is Dev round 2 of the Dev↔Reviewer cycle (Protocol 3, round
+  1/3 used by the original Medium finding), awaiting a real Reviewer pass before being reported
+  as closed.

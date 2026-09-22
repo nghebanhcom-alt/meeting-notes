@@ -14,9 +14,12 @@ const { snapshotOf } = require('./server/llm/preset-schema');
 const { isKnownMeetingTypeCode } = require('./server/meeting-types');
 const { resolveAudioMime, APP_ACCEPTED_EXTENSIONS, statusFor, extensionOf } = require('./server/stt/formats');
 const {
-  isValidPartId, MAX_PARTS_PER_MEETING, registerParts, applyPartResult, markPartFailed,
+  isValidPartId, MAX_PARTS_PER_MEETING, registerParts,
   markPartRunning, retryPart, dropPart, reorderParts, preserveServerOwnedFields
 } = require('./server/meeting-parts');
+const {
+  MAX_REFINE_PART_SECONDS, markRefineRunning, markPartRefineQueued, modeFor
+} = require('./server/refine');
 const { buildFileName } = require('./server/export/filename');
 const { validateExportDir, writeExportFile } = require('./server/export/dir');
 
@@ -755,7 +758,11 @@ async function pumpJobQueue() {
   for (const job of promoted) {
     const key = jobKey(job.meetingId, job.partId);
     if (runningJobs.has(key)) continue; // defensive; should not happen
-    if (job.partId) {
+    // Protocol 8.3: ask the mode's capability instead of "if (job.partId)"
+    // alone — refine jobs own the part's audio via job.partId too, but must
+    // NOT flip part.status to 'processing' (W11.3: that would blank the
+    // part's content out of the merged transcript mid-refine).
+    if (job.partId && modeFor(job).ownsPartStatus) {
       await mutateMeeting(job.meetingId, meeting => markPartRunning(meeting, job.partId, job.id));
     }
     const promise = runTranscriptionJob(job).finally(() => {
@@ -812,11 +819,32 @@ async function finishJob(job, patch) {
   });
 }
 
+// Protocol 8.3 — the ONE place every job-lifecycle failure path (this
+// function, recoverInterruptedJobs, sweepStuckJobs) goes through, so all
+// three stay consistent about which field a failure is allowed to touch.
+// `mode` with no writeSingleFailure (today, only 'attach') keeps the
+// pre-existing mergeTranscriptionIntoMeeting targeted-merge path.
+async function writeJobFailure(job, errorInfo) {
+  const mode = modeFor(job);
+  if (job.partId) {
+    await mutateMeeting(job.meetingId, meeting => mode.writePartFailure(meeting, job.partId, errorInfo));
+  } else if (mode.writeSingleFailure) {
+    await mutateMeeting(job.meetingId, meeting => mode.writeSingleFailure(meeting, errorInfo));
+  } else {
+    await mergeTranscriptionIntoMeeting(job.meetingId, {
+      status: 'failed',
+      processingError: errorInfo.message,
+      _activeJobId: null
+    });
+  }
+}
+
 // Runs stt.transcribe, persists the result onto the meeting/part BEFORE
 // marking the job complete (acceptance criterion). `job.partId` (M5) — not
 // `job.meetingId` — is the audio to load, so retrying/running part 2 can
 // never accidentally transcribe part 1's or the whole meeting's audio.
 async function runTranscriptionJob(job) {
+  const mode = modeFor(job);
   try {
     const audio = await openStoredAudio(job.partId || job.meetingId);
     // title/participants are meeting-level (same across parts) — only used
@@ -850,8 +878,12 @@ async function runTranscriptionJob(job) {
       source: 'file-upload'
     };
 
+    // Protocol 8.3 — dispatch through the mode's writer table (§W3.3/§W11.3)
+    // instead of an `if (job.mode === 'refine')` check at this call site.
     if (job.partId) {
-      await mutateMeeting(job.meetingId, meeting => applyPartResult(meeting, job.partId, { ...result, usage }));
+      await mutateMeeting(job.meetingId, meeting => mode.writePartSuccess(meeting, job.partId, { ...result, usage }));
+    } else if (mode.writeSingleSuccess) {
+      await mutateMeeting(job.meetingId, meeting => mode.writeSingleSuccess(meeting, result, usage));
     } else {
       await mergeTranscriptionIntoMeeting(job.meetingId, {
         transcript: Array.isArray(result.transcript) ? result.transcript : [],
@@ -872,15 +904,7 @@ async function runTranscriptionJob(job) {
       code: error.llmCode || 'STT_TRANSCRIBE_FAILED',
       message: error.message || 'Transcription failed.'
     };
-    if (job.partId) {
-      await mutateMeeting(job.meetingId, meeting => markPartFailed(meeting, job.partId, errorInfo));
-    } else {
-      await mergeTranscriptionIntoMeeting(job.meetingId, {
-        status: 'failed',
-        processingError: errorInfo.message,
-        _activeJobId: null
-      });
-    }
+    await writeJobFailure(job, errorInfo);
     await finishJob(job, { status: 'failed', error: errorInfo });
   }
 }
@@ -900,15 +924,7 @@ async function recoverInterruptedJobs() {
     job.status = 'failed';
     job.error = { code: 'STT_SERVER_RESTARTED', message: 'The server restarted before transcription finished. The original audio is preserved — please try again.' };
     job.updatedAt = now;
-    if (job.partId) {
-      await mutateMeeting(job.meetingId, meeting => markPartFailed(meeting, job.partId, job.error));
-    } else {
-      await mergeTranscriptionIntoMeeting(job.meetingId, {
-        status: 'failed',
-        processingError: job.error.message,
-        _activeJobId: null
-      });
-    }
+    await writeJobFailure(job, job.error);
   }
   await replaceJson(JOBS_FILE, jobs);
 }
@@ -928,15 +944,7 @@ async function sweepStuckJobs() {
     const errorInfo = { code: 'STT_JOB_TIMEOUT', message: 'This transcription took too long and was stopped automatically. Try again, or use a smaller file.' };
     const applied = await finishJob(job, { status: 'failed', error: errorInfo });
     if (!applied) continue;
-    if (job.partId) {
-      await mutateMeeting(job.meetingId, meeting => markPartFailed(meeting, job.partId, errorInfo));
-    } else {
-      await mergeTranscriptionIntoMeeting(job.meetingId, {
-        status: 'failed',
-        processingError: errorInfo.message,
-        _activeJobId: null
-      });
-    }
+    await writeJobFailure(job, errorInfo);
     runningJobs.delete(jobKey(job.meetingId, job.partId));
   }
   if (stuck.length > 0) await pumpJobQueue();
@@ -1657,6 +1665,9 @@ async function handleApi(request, response, url) {
         missingParts: Array.isArray(meeting.missingParts) ? meeting.missingParts : [],
         duration: Number(meeting.duration) || 0,
         durationEstimated: Boolean(meeting.durationEstimated),
+        // T-W13.2 — derived by rebuildMergedMeeting (meeting-parts.js), already
+        // persisted on the meeting so no extra computation needed here.
+        refiningParts: Array.isArray(meeting.refiningParts) ? meeting.refiningParts : [],
         parts: parts.map(part => ({
           partId: part.partId,
           order: part.order,
@@ -1667,7 +1678,11 @@ async function handleApi(request, response, url) {
           offsetSeconds: part.offsetSeconds || 0,
           hasTranscript: Array.isArray(part.transcript) && part.transcript.length > 0,
           startedAt: part.usage?.startedAt || null,
-          endedAt: part.usage?.endedAt || null
+          endedAt: part.usage?.endedAt || null,
+          // T-W13.2 — lets the UI poll per-part refine state without a full
+          // /api/data fetch (keeps this route's "cheap poll" contract, §W10.13).
+          refine: part.refine || null,
+          transcriptSource: part.transcriptSource || 'original'
         }))
       });
       return true;
@@ -1917,6 +1932,163 @@ async function handleApi(request, response, url) {
     return true;
   }
 
+  // ── Refine transcript (Architecture §W3/§W13) — re-run the batch pipeline
+  // against audio that already produced a transcript once (live recording's
+  // full file, or an already-completed multi-part part). Distinct from
+  // POST /api/import-transcription: that route is for a meeting that has NO
+  // transcript yet (BR-98 guards exactly that). This route is for a meeting
+  // that already has one, on purpose, with a backup (WHY-W2).
+  const refineMatch = url.pathname.match(/^\/api\/meetings\/([^/]+)\/refine-transcript$/);
+  if (request.method === 'POST' && refineMatch) {
+    const meetingId = decodePathSegment(refineMatch[1]);
+    if (!meetingId) { sendError(response, 400, 'Invalid meeting id'); return true; }
+    const body = await readJsonRequest(request).catch(() => ({}));
+
+    // R-S-style whitelist for a NEW route (unlike the legacy /api/import-transcription).
+    let adapter = null;
+    if (typeof body?.provider === 'string' && body.provider) {
+      try {
+        adapter = stt.validateSelection(body.provider, typeof body?.model === 'string' ? body.model : '');
+      } catch (error) {
+        sendMeetingPartsError(response, error);
+        return true;
+      }
+    }
+    const overrideProvider = adapter ? adapter.id : '';
+    const overrideModel = typeof body?.model === 'string' ? body.model : '';
+    const overrideLanguage = typeof body?.language === 'string' ? body.language.slice(0, 20) : '';
+    const overrideTranslationLanguage = typeof body?.translationLanguage === 'string' ? body.translationLanguage.slice(0, 20) : undefined;
+
+    const meetingsSnapshot = await readJson(MEETINGS_FILE, []);
+    const current = meetingsSnapshot.find(m => m.id === meetingId);
+    if (!current) { sendError(response, 404, 'Meeting not found'); return true; }
+
+    const isMultiPart = Array.isArray(current.parts) && current.parts.length > 0;
+
+    if (!isMultiPart) {
+      // ── Single-meeting refine (W13.1 mode: 'single') ──
+      if (!current.audioId) {
+        sendJson(response, 422, { error: { code: 'REFINE_NOT_APPLICABLE', message: 'This meeting has no recorded audio to refine.', provider: '', retryable: false } });
+        return true;
+      }
+      const existingInMemory = runningJobs.get(jobKey(meetingId, ''));
+      if (existingInMemory) {
+        sendJson(response, 200, { mode: 'single', jobId: existingInMemory.jobId, status: 'processing' });
+        return true;
+      }
+      try {
+        await openStoredAudio(meetingId);
+      } catch {
+        sendError(response, 404, 'Uploaded audio was not found for this meeting');
+        return true;
+      }
+
+      const jobId = `job-${crypto.randomUUID()}`;
+      const transaction = await mutateJson(JOBS_FILE, [], jobs => {
+        const existing = findActiveJob(jobs, meetingId, '');
+        if (existing) return { job: existing, created: false };
+        const now = new Date().toISOString();
+        const job = {
+          id: jobId, meetingId, partId: '', mode: 'refine',
+          provider: overrideProvider, model: overrideModel,
+          language: overrideLanguage || 'auto',
+          translationLanguage: overrideTranslationLanguage || '',
+          status: 'queued', error: null, createdAt: now, updatedAt: now
+        };
+        jobs.push(job);
+        pruneTerminalJobs(jobs);
+        return { job, created: true };
+      });
+      const { job, created } = transaction;
+      if (!created) {
+        sendJson(response, 200, { mode: 'single', jobId: job.id, status: job.status });
+        return true;
+      }
+
+      // Snapshot the live transcript + mark refine running BEFORE the job can
+      // possibly finish (R-W1) — same ordering discipline as the 'attach'
+      // path marking `status: 'processing'` before pumpJobQueue runs.
+      await mutateMeeting(meetingId, meeting => markRefineRunning(meeting, job.id));
+      await pumpJobQueue();
+      const currentJobs = await readJobs();
+      const currentStatus = currentJobs.find(item => item.id === job.id)?.status || job.status;
+      sendJson(response, 201, { mode: 'single', jobId: job.id, status: currentStatus });
+      return true;
+    }
+
+    // ── Multi-part refine (W13.1 mode: 'parts') ──
+    const requestedIds = Array.isArray(body?.partIds) && body.partIds.length > 0
+      ? body.partIds
+      : current.parts.map(part => part.partId);
+
+    for (const id of requestedIds) {
+      if (!isValidPartId(id) || !current.parts.some(part => part.partId === id)) {
+        sendJson(response, 400, { error: { code: 'PART_NOT_FOUND', message: `Unknown part "${id}".`, provider: '', retryable: false } });
+        return true;
+      }
+    }
+
+    // Part đủ điều kiện = completed + not already refining + audio still on
+    // disk + not longer than Soniox's fixed 300-minute async limit (E-W2).
+    const eligible = [];
+    const skipped = [];
+    for (const id of requestedIds) {
+      const part = current.parts.find(p => p.partId === id);
+      if (part.refine && part.refine.status === 'running') { skipped.push({ partId: id, reason: 'ALREADY_RUNNING' }); continue; }
+      if (part.status !== 'completed') { skipped.push({ partId: id, reason: 'PART_NOT_COMPLETED' }); continue; }
+      if (Number(part.duration) > MAX_REFINE_PART_SECONDS) { skipped.push({ partId: id, reason: 'PART_TOO_LONG' }); continue; }
+      try {
+        await openStoredAudio(id);
+      } catch {
+        skipped.push({ partId: id, reason: 'AUDIO_NOT_FOUND' });
+        continue;
+      }
+      eligible.push(part);
+    }
+
+    if (eligible.length === 0) {
+      const allRunning = skipped.length > 0 && skipped.every(item => item.reason === 'ALREADY_RUNNING');
+      if (allRunning) {
+        sendJson(response, 409, { error: { code: 'REFINE_ALREADY_RUNNING', message: 'The requested part(s) are already being refined.', provider: '', retryable: false } });
+      } else {
+        sendJson(response, 422, { error: { code: 'REFINE_NO_ELIGIBLE_PARTS', message: 'None of the requested parts can be refined right now.', provider: '', retryable: false } });
+      }
+      return true;
+    }
+
+    const now = new Date().toISOString();
+    const jobsToCreate = eligible.map(part => ({
+      id: `job-${crypto.randomUUID()}`, meetingId, partId: part.partId, mode: 'refine',
+      provider: overrideProvider || part.provider,
+      model: overrideModel || part.model,
+      language: overrideLanguage || part.language,
+      translationLanguage: overrideTranslationLanguage !== undefined ? overrideTranslationLanguage : part.translationLanguage,
+      status: 'queued', error: null, createdAt: now, updatedAt: now
+    }));
+
+    // One meeting mutation snapshots previousTranscript + flips refine.status
+    // to 'running' for every eligible part in the SAME transaction (W12.1
+    // step 1 — never partially applied across separate writes).
+    await mutateMeeting(meetingId, meeting => {
+      let next = meeting;
+      for (const job of jobsToCreate) next = markPartRefineQueued(next, job.partId, job.id);
+      return next;
+    });
+    await mutateJson(JOBS_FILE, [], jobs => {
+      jobs.push(...jobsToCreate);
+      pruneTerminalJobs(jobs);
+    });
+    await pumpJobQueue();
+
+    const finalJobs = await readJobs();
+    sendJson(response, 201, {
+      mode: 'parts',
+      jobs: jobsToCreate.map(job => ({ partId: job.partId, jobId: job.id, status: finalJobs.find(j => j.id === job.id)?.status || 'queued' })),
+      skipped
+    });
+    return true;
+  }
+
   if (request.method === 'POST' && url.pathname === '/api/import-transcription') {
     const body = await readJsonRequest(request);
     const meetingId = typeof body?.meetingId === 'string' ? body.meetingId.slice(0, 256) : '';
@@ -2055,6 +2227,29 @@ async function handleApi(request, response, url) {
         // is not enough once a `completed` snapshot could otherwise wipe `parts`.
         if (current && Array.isArray(current.parts) && current.parts.length > 0) {
           return preserveServerOwnedFields(current, incoming);
+        }
+        // R-W2 (§W2.3/§W3.2): while a single-meeting refine job is running,
+        // the server owns transcript/translations/duration/sonioxUsage
+        // REGARDLESS of `incoming.status` — the guard below only fires for
+        // `incoming.status === 'processing'`, which is not what a refine's
+        // snapshot looks like (the meeting stays 'completed' the whole time,
+        // WHY-W3), so without this branch a routine edit (title/tags) made
+        // mid-refine would silently overwrite the refined result.
+        if (current && current.refine && current.refine.status === 'running') {
+          return {
+            ...incoming,
+            transcript: current.transcript,
+            translations: current.translations,
+            duration: current.duration,
+            status: current.status,
+            sonioxUsage: current.sonioxUsage,
+            refine: current.refine,
+            liveTranscript: current.liveTranscript,
+            liveTranslations: current.liveTranslations,
+            transcriptSource: current.transcriptSource,
+            usageBreakdown: current.usageBreakdown,
+            updatedAt: current.updatedAt
+          };
         }
         // A stale browser snapshot must never roll a server-owned terminal STT
         // result back to processing. Explicit future retries should go through

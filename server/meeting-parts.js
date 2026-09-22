@@ -374,9 +374,12 @@ function applyTranscriptEdits(meeting, incomingTranscript) {
     if (segment.kind === 'part-divider' || segment.kind === 'part-gap') return;
     const part = partsById.get(segment.partId);
     if (!part || !Number.isInteger(segment.srcIndex) || !part.transcript[segment.srcIndex]) return;
-    const incomingText = typeof incoming[i]?.text === 'string' ? incoming[i].text : part.transcript[segment.srcIndex].text;
-    if (incomingText !== part.transcript[segment.srcIndex].text) {
-      part.transcript[segment.srcIndex].text = incomingText;
+    const target = part.transcript[segment.srcIndex];
+    const incomingText = typeof incoming[i]?.text === 'string' ? incoming[i].text : target.text;
+    const incomingSpeaker = typeof incoming[i]?.speaker === 'string' ? incoming[i].speaker : target.speaker;
+    if (incomingText !== target.text || incomingSpeaker !== target.speaker) {
+      target.text = incomingText;
+      target.speaker = incomingSpeaker;
       changed = true;
     }
   });

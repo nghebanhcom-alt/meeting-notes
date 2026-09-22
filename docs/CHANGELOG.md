@@ -2029,3 +2029,40 @@ touched.
   regression risk there).
 - Not self-declared "done" — Protocol 3 round 2/3; Reviewer must re-approve before
   this is reported as ready.
+
+## 2026-09-22 — Fix: speaker-only rename silently dropped on multi-part meetings (Bẫy 3, Architecture.md §X)
+
+Tech Lead found this during unrelated research and handed off a repro. Bug: `server/meeting-parts.js`
+`applyTranscriptEdits` (called from `preserveServerOwnedFields`, R-R / §V3.6, on every
+`PUT /api/meetings` for a meeting whose server-side copy already has `parts`) only compared/wrote
+back the `text` field of an edited segment. Renaming a speaker (`js/app.js`
+`_openSpeakerRenameModal`, which changes `speaker` but keeps `text` identical) left `changed ===
+false`, so the server discarded the incoming edit and re-served the old `speaker` — data loss with
+no error surfaced to the user.
+
+- **Fix** (`server/meeting-parts.js`, `applyTranscriptEdits`): the per-segment write-back now reads
+  and compares both `incoming[i].text` and `incoming[i].speaker` against the stored segment; `changed`
+  is set (and both fields written) if either differs. Previously only `text` was read/compared/written.
+- **Scope confirmed** (Tech Lead's finding, verified by reading the call sites): this only affects
+  **multi-part** meetings. `server.js`'s `PUT /api/meetings` handler only calls
+  `preserveServerOwnedFields`/`applyTranscriptEdits` when `current.parts.length > 0`
+  (`server.js` ~line 2225). A single-part meeting falls through to `return incoming;` (no `parts`,
+  no running refine, no completed→processing downgrade) — the client's full transcript array,
+  including the renamed `speaker`, is accepted wholesale, so single-part rename was never broken.
+- **Client-side verified, not changed**: `js/app.js` `_openSpeakerRenameModal`'s `save()` already
+  builds the correct request — it maps `current.transcript`, matching segments by
+  `seg.speaker === originalLabel` (+ `partId` when the segment came from a part), spreads the
+  segment and only overrides `speaker` (`{ ...seg, speaker: newName }`), so `partId`/`srcIndex`/`text`
+  are preserved untouched — then `Storage.saveMeeting(current)` + `await Storage.flush()`, which is
+  the same `PUT /api/meetings` path exercised above. No client change was needed; the bug was
+  server-only.
+- **Test** (`test/meeting-parts.test.js`): added "editing ONLY a segment's speaker (text unchanged)
+  writes it back to the correct part — Bẫy 3 repro (§X)". Confirmed FAILS on the pre-fix code
+  (asserted `part2.transcript[0].speaker === 'Alice'`, got `'Speaker 1'` — the pre-fix silent-drop
+  behavior) and PASSES after the fix. Also asserts the *other* part's segment is untouched and that
+  `text` on the edited segment is unchanged (confirms the fix doesn't regress the plain-text-edit
+  path already covered by the adjacent existing test).
+- `npm test`: **284 passing / 2 skipped (no API key, Protocol 5.4) / 0 failing** (was 283/2/0 before
+  this fix — +1 new test, no other test touched).
+- Not self-declared "done" — Protocol 7 requires a Reviewer pass on this change before it's reported
+  as ready; none has run yet in this session.

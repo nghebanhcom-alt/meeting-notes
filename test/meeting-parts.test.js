@@ -163,6 +163,21 @@ test('editing one segment\'s text in the incoming transcript writes it back to t
   assert.strictEqual(part1.transcript[0].text, 'hello');
 });
 
+test('editing ONLY a segment\'s speaker (text unchanged) writes it back to the correct part — Bẫy 3 repro (§X)', () => {
+  const current = mergedMeeting([completedPart(), completedPart({ partId: 'part-cccccccc', order: 2, filename: 'c.m4a', transcript: [{ time: 0, speaker: 'Speaker 1', text: 'original text' }] })]);
+  const incomingTranscript = current.transcript.map(seg =>
+    (seg.part === 2 && !seg.kind) ? { ...seg, speaker: 'Alice' } : seg);
+
+  const merged = preserveServerOwnedFields(current, { ...current, transcript: incomingTranscript });
+  const part2 = merged.parts.find(p => p.partId === 'part-cccccccc');
+  assert.strictEqual(part2.transcript[0].speaker, 'Alice', 'speaker-only edit must not be silently dropped');
+  assert.strictEqual(part2.transcript[0].text, 'original text', 'text is unchanged, as intended');
+  assert.strictEqual(merged.transcript.find(seg => seg.part === 2 && !seg.kind).speaker, 'Alice', 'the merged view reflects the rename too');
+  // The other part's own transcript is untouched.
+  const part1 = merged.parts.find(p => p.partId === 'part-aaaaaaaa');
+  assert.strictEqual(part1.transcript[0].speaker, 'Speaker 1');
+});
+
 test('a structurally mismatched incoming transcript (stale snapshot) is entirely ignored, not partially applied', () => {
   const current = mergedMeeting([completedPart(), completedPart({ partId: 'part-cccccccc', order: 2, filename: 'c.m4a' })]);
   const incomingTranscript = [{ time: 0, speaker: 'Someone', text: 'a snapshot from before the merge existed' }];

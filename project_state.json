@@ -134,6 +134,13 @@
       "file": "js/app.js, js/summary-staleness.js",
       "status": "code_complete_pending_review",
       "note": "Architecture.md SW4.4/SW14/T-W5/T-W8/T-W14. UI only, no server file touched, backend already Reviewer-approved and committed (b5997d6). Added: manual Tinh chinh transcript button + status chip (single-meeting header) and per-part picker modal + per-part chip in transcript-part-divider + refiningParts progress line (multi-part); _pollRefineJob/_pollRefinePartsStatus as separate pollers (new _activeRefinePollers Map, do not touch meeting.status per WHY-W3/WHY-W8); js/summary-staleness.js gained isTranscriptStaleAfterRefine (new function, isPreMeetingInfoStale untouched) plus _refineStaleHint nudge in the Summary tab. No auto-trigger/setting added (E-W1 = manual only). npm test: 276 passing / 2 skipped / 0 failing (server-only suite, run as a no-op regression check since no server file changed). Protocol 7: NOT yet reviewed -- no Reviewer spawned in this session, docs/review-report.md not updated for this change. Do not treat as done until a Reviewer round runs."
+    },
+    {
+      "date": "2026-09-22",
+      "title": "fix-speaker-only-rename-silently-dropped-multipart-Bay-3",
+      "file": "server/meeting-parts.js, test/meeting-parts.test.js",
+      "status": "code_complete_pending_review",
+      "note": "Bug found by Tech Lead during unrelated research (Architecture.md SX, 'Bay 3'): applyTranscriptEdits only compared/wrote the text field, so a speaker-only rename (js/app.js _openSpeakerRenameModal, text unchanged) on a multi-part meeting was silently dropped by preserveServerOwnedFields on PUT /api/meetings -- no error surfaced. Fix: changed-detection and write-back now cover both text and speaker. Confirmed single-part meetings are NOT affected (server.js only calls preserveServerOwnedFields when current.parts.length > 0; single-part falls through to accepting the incoming transcript wholesale). Verified js/app.js's rename modal already sends the correct request shape (spreads segment, only overrides speaker) -- no client change needed. New test added and confirmed to FAIL on pre-fix code, PASS after. npm test: 284 passing / 2 skipped / 0 failing (was 283/2/0, +1 new test, 0 regressions). Protocol 7: NOT yet reviewed -- no Reviewer spawned in this session, docs/review-report.md not updated for this change. Do not treat as done until a Reviewer round runs."
     }
   ]
 }

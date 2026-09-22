@@ -2775,3 +2775,95 @@ từ hằng số thật đã đọc trực tiếp trong `server/refine.js`, khô
   Medium #1") — dễ đối chiếu khi audit lại sau này.
 - Không có sửa nào lan ra ngoài phạm vi 5 issue đã yêu cầu (đối chiếu diff không có thay đổi hành
   vi nào ở các phần chip/poller/nudge đã APPROVE ở vòng 1).
+
+# Review Report — 2026-09-22 (applyTranscriptEdits speaker-only-edit data loss fix)
+
+## Verdict: APPROVE
+
+## Bối cảnh
+Dev fix bug mất dữ liệu im lặng ở `server/meeting-parts.js` `applyTranscriptEdits`: hàm chỉ so
+sánh/ghi lại field `text` khi áp transcript edit về part gốc của meeting nhiều phần (multi-part).
+Đổi `speaker` mà không đổi `text` (tính năng "đổi tên Speaker sau khi ghi") → `changed === false`
+→ `rebuildMergedMeeting` không được gọi → edit bị bỏ qua hoàn toàn, không có lỗi nào báo ra, mất dữ
+liệu người dùng đã sửa. CHƯA COMMIT tại thời điểm review, đã tự verify bằng diff thật (không dựa
+báo cáo Dev).
+
+## Verify claim phạm vi bug (single-part KHÔNG bị ảnh hưởng)
+Đọc trực tiếp `server.js:2211-2229` và `server/meeting-parts.js:396-398`:
+```js
+// server.js — PUT /api/meetings
+if (current && Array.isArray(current.parts) && current.parts.length > 0) {
+  return preserveServerOwnedFields(current, incoming);   // multi-part → đi qua applyTranscriptEdits
+}
+// nếu current không có parts (single-part legacy) → rơi xuống nhánh khác,
+// KHÔNG gọi preserveServerOwnedFields/applyTranscriptEdits, incoming được nhận wholesale
+```
+```js
+// meeting-parts.js
+function preserveServerOwnedFields(current, incoming) {
+  if (!current || !Array.isArray(current.parts) || current.parts.length === 0) return incoming;
+  const withEdits = applyTranscriptEdits(current, incoming?.transcript);
+  ...
+}
+```
+Xác nhận đúng claim Dev: single-part meeting (không có `parts` array hoặc `parts.length === 0`)
+chấp nhận toàn bộ `incoming` nguyên vẹn (kể cả `speaker`), không đi qua `applyTranscriptEdits` —
+nên bug field-by-field này chưa từng ảnh hưởng single-part. Phạm vi fix (chỉ sửa
+`applyTranscriptEdits`) là đủ, không cần sửa thêm nhánh nào khác.
+
+## Verify fix — không có side effect xoá speaker hợp lệ
+Đọc kỹ đoạn fix:
+```js
+const incomingSpeaker = typeof incoming[i]?.speaker === 'string' ? incoming[i].speaker : target.speaker;
+```
+Fallback về `target.speaker` (giá trị cũ) khi `incoming[i].speaker` không phải string (undefined,
+null, thiếu field) — đúng pattern giống hệt `incomingText` đã có từ trước, không có caller nào bị
+phá vì thiếu field `speaker`. Kiểm tra các nơi client build lại `transcript` để gửi PUT
+(`js/app.js:4714-4720` rename speaker, `js/storage.js` normalize) — tất cả đều spread nguyên segment
+gốc (`{...seg, speaker: newName}` hoặc qua `segment()` normalize đầy đủ field), nên trong thực tế
+client luôn gửi `text` lẫn `speaker` đầy đủ; fallback chỉ là lưới an toàn cho input thiếu field,
+không đổi hành vi hiện tại. Không tìm thấy tình huống nào `incoming[i].speaker` là chuỗi rỗng hợp lệ
+bị hiểu nhầm — `typeof === 'string'` chấp nhận cả `''` là "có gửi", đúng ý đồ (client có thể chủ
+động xoá tên speaker về rỗng).
+
+## Tự verify test (không tin báo cáo Dev)
+1. `git stash` tách riêng code Dev đã sửa (`meeting-parts.js` về bản cũ), áp test mới
+   (`git apply --include='test/meeting-parts.test.js'`) lên code cũ → chạy
+   `node --test test/meeting-parts.test.js`: **test mới FAIL** đúng như claim (`actual: 'Speaker 1',
+   expected: 'Alice'` — speaker-only edit bị bỏ qua trên code cũ).
+2. Khôi phục lại toàn bộ thay đổi (`git checkout` bỏ test tạm, `git stash pop`) → chạy lại: **16/16
+   test pass**, bao gồm test mới và toàn bộ test cũ liên quan `applyTranscriptEdits`/multi-part
+   (stale snapshot, single-part untouched, edit text-only vẫn đúng).
+3. `npm test` (toàn bộ suite): **284 pass / 0 fail / 2 skip** (2 skip là whisper/google golden
+   fixture do thiếu API key, pre-existing, không liên quan fix này) — không regression ở phần khác.
+
+## Regression check
+- Test cũ `editing one segment's text in the incoming transcript writes it back to the correct
+  part` vẫn pass — case chỉ đổi `text` không đổi `speaker` vẫn hoạt động đúng.
+- Test `a stale COMPLETED client snapshot cannot wipe parts/duration/status on a multi-part
+  meeting` và `a structurally mismatched incoming transcript is entirely ignored` vẫn pass — guard
+  "shape mismatch → bỏ qua toàn bộ" không bị đổi bởi fix.
+- Test `a single-part meeting is untouched by preserveServerOwnedFields` vẫn pass — xác nhận thêm
+  lần nữa nhánh single-part không đi qua code vừa sửa.
+
+## Severity kết luận
+Đây là **data-loss bug nghiêm trọng nhưng đã được fix đúng và đủ trong cùng lượt này** — không cần
+escalate riêng qua `docs/escalation-log.md` (Circuit Breaker không kích hoạt, đây là vòng review
+đầu tiên cho bug này và fix pass ngay). Đáng ghi chú cho QA: cần thêm 1 lượt test tay trên UI thật
+("đổi tên Speaker sau khi ghi" trên bản ghi multi-part, KHÔNG sửa text nào) để xác nhận hành vi
+đúng ngoài phạm vi unit test, vì đây là tính năng đã merge trước đó và đã có ít nhất 1 lần chạy sai
+âm thầm trong production code (dù chưa rõ đã có user thật nào bị ảnh hưởng hay chưa, do bug không hề
+log lỗi).
+
+## External contract verification
+N/A — không đổi endpoint/tool bên ngoài nào; đây là fix logic thuần nội bộ trong
+`server/meeting-parts.js`.
+
+## Positive Notes
+- Dev tự viết test tái hiện đúng bug gốc (speaker-only edit) thay vì chỉ test happy path, và test
+  đặt tên rõ ràng trỏ về "Bẫy 3 repro" — dễ trace lại nguồn gốc bug khi audit sau này.
+- Fix giữ nguyên toàn bộ guard hiện có (shape-mismatch → bỏ qua toàn bộ, single-part bypass) — không
+  mở rộng phạm vi thay đổi ra ngoài đúng vấn đề đang sửa.
+- Dùng chung pattern `typeof ... === 'string' ? ... : target.<field>` nhất quán giữa `text` và
+  `speaker` — dễ đọc, dễ mở rộng nếu sau này có thêm field field-by-field khác cần fix tương tự
+  (ví dụ nếu sau này thêm edit field khác cho segment).

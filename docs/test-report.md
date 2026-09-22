@@ -856,3 +856,45 @@ Không phát hiện bug mới nào trong phạm vi 4 fix được giao re-test.
 - Dữ liệu test còn lại trên `/tmp/meetnote-qa-1rE6HB` (1 meeting `qa-bug001-silent-draft`, trạng
   thái `failed` — đúng như kỳ vọng vì đây là audio im lặng cố ý) **chưa dọn** — thư mục cách ly do
   PM tạo riêng, không phải `storage/` thật, để nguyên cho PM đối chiếu nếu cần.
+
+---
+
+# Test Report — 2026-09-22 (bổ sung): Refine-transcript E2E (Protocol 6.3)
+
+Feature: "Tinh chỉnh transcript" (nút bấm tay, batch re-transcribe sau khi ghi trực tiếp).
+Nguồn: `docs/Architecture.md` §W, `docs/review-report.md` (backend + UI đều APPROVE qua vòng
+2/3). Thực hiện bởi PM trực tiếp (không spawn QA agent riêng — QA agent không có browser tool
+trong project này, việc này bắt buộc lái UI thật qua trình duyệt), dùng dữ liệu thật của user,
+đã xin phép tường minh trước khi chạy (tốn phí Soniox thật).
+
+## Setup
+- Server khởi động qua `npm start`. Phát hiện phụ: có 1 tiến trình server CŨ đang chạy từ trước
+  (PID 1629, khởi động 16:23, **trước** khi các commit hôm nay được áp dụng) chiếm cổng 8765 —
+  gây 404 giả ở lần thử đầu (không phải bug thật, chỉ là code cũ chưa reload). Đã dừng tiến trình
+  cũ, khởi động lại — không phải hành động phá huỷ dữ liệu (server không giữ state ngoài file).
+- Meeting dùng để test: `261dac72-d997-42c0-bda1-fca84cffa1ed` ("Meeting — 20/09/2026 · 11:51"),
+  33 giây, single-part — chọn vì ngắn nhất trong 5 meeting thật hiện có, giảm chi phí Soniox.
+- Không có meeting multi-part nào trong dữ liệu thật hiện tại của user ⇒ nhánh multi-part của
+  tính năng này **chưa được verify qua UI thật**, chỉ có test tự động (`test/refine-routes.test.js`,
+  `test/refine.test.js`) — ghi nhận là giới hạn phạm vi test này, không phải PASS đầy đủ 100%.
+
+## Test Results
+
+| # | Test Case | Status | Severity | Notes |
+|---|-----------|--------|----------|-------|
+| 1 | Nút "Tinh chỉnh transcript" hiện đúng vị trí (cạnh Export/Delete) trong meeting detail | PASS | — | |
+| 2 | Bấm nút → gọi đúng `POST /api/meetings/:id/refine-transcript`, chip chuyển "⏳ Đang tinh chỉnh transcript…" | PASS | — | |
+| 3 | Transcript live vẫn đọc được bình thường trong lúc job đang chạy (không khoá UI) | PASS | — | |
+| 4 | Job hoàn tất → chip đổi "✓ Đã tinh chỉnh (bản đầy đủ)", toast xác nhận | PASS | — | |
+| 5 | Transcript thực sự được thay bằng bản batch mới (12 → 9 segments, nội dung khác) | PASS | — | Xác nhận qua UI lẫn đọc trực tiếp `storage/meetings.json` |
+| 6 | Reload trang (F5) → transcript mới **persist** đúng, không rơi về bản cũ | PASS | — | |
+| 7 | `meeting.transcriptSource` = `'batch-refined'`, `meeting.refine.status` = `'done'` | PASS | — | Đọc trực tiếp file lưu trữ |
+| 8 | Backup `liveTranscript` (E-W4/WHY-W4) còn nguyên vẹn sau refine, không bị mất | PASS | — | 12 segments, đúng bản live gốc |
+| 9 | Chi phí cộng dồn đúng (E-W1/W4.3): `usageBreakdown` có 2 entry (`live-realtime` + `batch-refine`), `sonioxUsage` = tổng | PASS | — | $0.0011 + $0.0009 ≈ $0.0020, khớp số hiển thị trên UI |
+
+## Summary
+- Total: 9, Passed: 9, Failed: 0
+- Giới hạn phạm vi: nhánh multi-part (per-part refine, modal chọn phần, `skipped[]`) chưa test qua
+  UI thật (không có meeting multi-part thật để dùng) — chỉ có bằng chứng từ test tự động.
+
+## Verdict: PASS (phạm vi single-part đã verify qua UI thật với dữ liệu thật; multi-part còn ở mức test tự động, chưa E2E thật)

@@ -106,6 +106,13 @@
       "status": "fixed_and_reviewed",
       "review": "APPROVE, docs/review-report.md; 1 Low found (re-shown panel didn't scroll to bottom) fixed same round",
       "note": "Follow-up to live-notes-panel-on-recording-screen same day. New global settings recordingShowLiveTranscript/recordingShowLiveTranslation (default true) persisted via existing Storage.saveSettings(). User confirmed: independent toggle per panel, not one combined switch."
+    },
+    {
+      "date": "2026-09-22",
+      "title": "T-W6-batch-soniox-sends-context-D-W1-D-W2-D-W3",
+      "file": "server/stt/soniox-context.js (new), server/stt/providers/soniox.js, server/stt/index.js, server.js, test/soniox-context.test.js (new)",
+      "status": "code_complete_pending_review",
+      "note": "Architecture.md SW5.4/SW6. npm test: 254 passing / 2 skipped / 0 failing. Protocol 7: Reviewer already APPROVEd this change (docs/review-report.md), but flagged Protocol 5.4 as still open pending a real-API smoke test. T-W7 (2026-09-22): ran createSonioxAdapter().transcribe() against the real Soniox API with meetingTitle/participants so `context` was actually attached -- request succeeded, no 400/422, valid transcript returned. Golden fixture tests/fixtures/soniox/real-transcribe-with-context.json captured. Protocol 5.4 gap now closed; see docs/CHANGELOG.md 2026-09-22 entry."
     }
   ]
 }

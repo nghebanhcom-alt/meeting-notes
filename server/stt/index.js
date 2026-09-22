@@ -99,7 +99,7 @@ function createSttService(deps) {
   // Transcribe stored audio. `audioMeta` ({ size, mimeType, filename }) is
   // inspected first so an oversized file is rejected before `loadAudio()` reads
   // it into memory (guards the Node process). `loadAudio` returns the bytes.
-  async function transcribe({ providerId, modelId, audioMeta, loadAudio, language, translationLanguage }) {
+  async function transcribe({ providerId, modelId, audioMeta, loadAudio, language, translationLanguage, meetingTitle, participants }) {
     const settings = await getSettings();
     const resolvedProvider = providerId || resolveDefaultProvider(settings);
     const adapter = getAdapter(resolvedProvider);
@@ -114,7 +114,7 @@ function createSttService(deps) {
     const buffer = await loadAudio();
     const audio = { buffer, mimeType: audioMeta?.mimeType, filename: audioMeta?.filename, size: audioMeta?.size ?? buffer.length };
     const raw = await enqueue(adapter.id, () =>
-      adapter.transcribe({ audio, language, translationLanguage, model })
+      adapter.transcribe({ audio, language, translationLanguage, model, meetingTitle, participants })
         .catch(error => { throw tagProvider(error, adapter.id); }));
 
     const normalized = normalizeResult(raw, adapter.id);

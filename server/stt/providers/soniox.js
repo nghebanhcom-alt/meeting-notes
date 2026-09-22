@@ -7,6 +7,7 @@
 
 const { STT_ERROR, sttError } = require('../contracts');
 const { PROVIDER_FORMATS } = require('../formats');
+const { buildSonioxContext } = require('../soniox-context');
 
 const API_BASE = 'https://api.soniox.com/v1';
 const MAX_UPLOAD_BYTES = 500 * 1024 * 1024;
@@ -108,7 +109,7 @@ function createSonioxAdapter(deps) {
     return { ok: true, message: 'Soniox connection succeeded.' };
   }
 
-  async function transcribe({ audio, language, translationLanguage }) {
+  async function transcribe({ audio, language, translationLanguage, meetingTitle, participants }) {
     const apiKey = await requireKey();
     if (audio.size > MAX_UPLOAD_BYTES) {
       throw sttError(STT_ERROR.AUDIO_TOO_LARGE, 'Audio upload must be smaller than 500 MB.', { provider: id });
@@ -126,11 +127,16 @@ function createSonioxAdapter(deps) {
 
       const sourceLanguage = toLangCode(language);
       const targetLanguage = toLangCode(translationLanguage);
+      const context = buildSonioxContext(
+        { title: meetingTitle, participants },
+        { onWarning: message => console.warn(`[soniox] ${message}`) }
+      );
       const config = {
         model: 'stt-async-v5',
         file_id: fileId,
         enable_language_identification: true,
         enable_speaker_diarization: true,
+        context,
         ...(sourceLanguage ? { language_hints: [sourceLanguage] } : {}),
         ...(targetLanguage && targetLanguage !== sourceLanguage
           ? { translation: { type: 'one_way', target_language: targetLanguage } }

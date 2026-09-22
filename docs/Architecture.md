@@ -1441,3 +1441,554 @@ Thứ tự: năng lực provider → contract dữ liệu → hàm thuần ghép
 ---
 
 ⏸ **CHECKPOINT 2 — CHỜ NGƯỜI DUYỆT.** Đây là thiết kế cho `import-phone-recording`. Cần quyết 7 điểm ở §V15 (E-V1 → E-V7) trước khi Dev bắt đầu. Dev **không** được implement TV17 và không được tuyên bố TV2/TV3 hoàn tất khi các nhãn `[UNVERIFIED]` ở §V12.4 chưa được gỡ theo đúng cách ghi ở đó.
+
+---
+
+# W. RESEARCH (2026-09-22) — Batch re-transcribe cho ghi trực tiếp + tinh chỉnh diarization Soniox
+
+> **Trạng thái: RESEARCH / THIẾT KẾ ĐỀ XUẤT — chưa được duyệt, Dev chưa implement.**
+> Phần này *append* vào tài liệu, không thay thế §1–§V16. Ký hiệu mục dùng tiền tố `W` để không đụng dãy `V`.
+> Mọi claim về hệ thống bên ngoài đều có nguồn ở §W9 (Protocol 5). Điểm nào không có nguồn → gắn `[UNVERIFIED]`.
+
+## W0. Hai câu hỏi được giao
+
+- **Việc 1** — Ghi trực tiếp (live WebSocket) đang cho transcript kém ổn định hơn đường upload file (batch). Có chuyển/bổ sung batch pipeline sau khi ghi xong được không?
+- **Việc 2** — Soniox diarization nhầm speaker trên 1 file liên tục. Có tham số nào tinh chỉnh không?
+
+**Kết luận sớm (2 dòng):** (1) Khả thi, và **rẻ hơn dự kiến** — file audio đầy đủ *đã* nằm sẵn trên server ngay sau khi lưu bản ghi, nên chỉ cần trigger lại pipeline batch đã có; rủi ro thật không nằm ở audio mà ở **quyền ghi field `transcript`** và **chi phí bị tính 2 lần**. (2) Soniox **không có** tham số `num_speakers`/sub-option nào; knob duy nhất có trong doc là **chạy async thay vì real-time** (doc nói thẳng async chính xác hơn) + **context `general` khai báo số/giới tính người nói** (đánh dấu *experimental*). Tức Việc 2 củng cố chính Việc 1.
+
+---
+
+## W1. Hiện trạng đã verify (đọc source trong phiên này, 2026-09-22)
+
+| # | Sự thật | Nguồn (file:dòng) |
+|---|---|---|
+| W1.1 | Live: `MediaRecorder.start(500)` → mỗi chunk vừa `push` vào `this.audioChunks` vừa bắn `onChunk` cho WebSocket | `js/recorder.js:156-172` |
+| W1.2 | Khi `stop()`: `new Blob(this.audioChunks, {type: mimeType})` → **file webm/opus hoàn chỉnh của cả phiên** đã được tạo sẵn ở client | `js/recorder.js:163-170` |
+| W1.3 | `_saveActiveRecording()` gọi `AudioStorage.save(meetingId, blob)` ⇒ **file đầy đủ đã được upload lên server** (`PUT /api/audio/:id`) rồi ghi `meeting.audioId` | `js/app.js:347-388`, `js/audio-storage.js:22-37` |
+| W1.4 | `PUT /api/audio/:id` stream thẳng ra đĩa, giới hạn `MAX_AUDIO_BYTES = 2GB`, tên file = hash SHA-256 | `server.js:51,449-470` |
+| W1.5 | Batch pipeline có sẵn: `POST /api/import-transcription` → tạo job `queued` → `pumpJobQueue()` → `runTranscriptionJob()` → `stt.transcribe()` → `mergeTranscriptionIntoMeeting()` → `finishJob()` | `server.js:1914-2009, 753-767, 819-880` |
+| W1.6 | `runTranscriptionJob` nạp audio bằng `openStoredAudio(job.partId \|\| job.meetingId)` — **đúng cái id mà ghi trực tiếp vừa lưu** | `server.js:821` |
+| W1.7 | **Chặn đường hiện tại:** `POST /api/import-transcription` trả **409 `MEETING_ALREADY_HAS_TRANSCRIPT`** nếu meeting đã có `transcript.length > 0` (BR-98). Bản ghi trực tiếp *luôn* rơi vào trường hợp này | `server.js:1938-1951` |
+| W1.8 | `mergeTranscriptionIntoMeeting` **ghi đè** `transcript`, `translations`, `duration`, `status`, `sonioxUsage` — không merge, không backup | `server.js:850-858` |
+| W1.9 | Guard của `PUT /api/meetings` chỉ chặn khi **`incoming.status === 'processing'`**. Một snapshot client cũ với `status: 'completed'` sẽ **ghi đè transcript** mà server vừa tinh chỉnh | `server.js:2053-2068` |
+| W1.10 | Live dùng `stt-rt-v5`, chỉ đặt `enable_speaker_diarization: true`, có gửi `context.general` (domain/topic/participants) | `js/transcriber.js:88-106, 197-212` |
+| W1.11 | Batch dùng `stt-async-v5`, `enable_speaker_diarization: true`, **không gửi `context`** | `server/stt/providers/soniox.js:129-138` |
+| W1.12 | Bitrate live/ghi trực tiếp = `audioBitsPerSecond: 32000`, mic bật `echoCancellation` + `noiseSuppression`, xin `sampleRate: 44100`; mix mic + system audio về **1 track mono-mix** qua `MediaStreamDestination` | `js/recorder.js:106-137, 151` |
+| W1.13 | Comment ngay tại chỗ đã tự gắn `[CHƯA VERIFY]` cho bitrate 32 kbps: chưa ai đo tác động lên độ chính xác STT | `js/recorder.js:146-151` |
+
+---
+
+## W2. Việc 1 — Trả lời từng câu hỏi
+
+### W2.1 Câu 1 — MediaRecorder ghi cả phiên thành 1 file rồi upload qua route batch?
+
+**Có, và về mặt kỹ thuật việc này app ĐÃ làm rồi** — không cần đổi `MediaRecorder`.
+
+- Nếu muốn **bỏ hẳn live**: bỏ tham số `timeslice` (`mediaRecorder.start()` không đối số). MDN: *"If this parameter isn't included, the entire media duration is recorded into a single `Blob`"*, `dataavailable` chỉ bắn khi `stop()`/`requestData()` (nguồn §W9-S5).
+- Nhưng **không cần** làm vậy: với `start(500)`, MDN khẳng định các chunk ghép lại thành **một file phát được**: `new Blob(chunks, { type: mediaRecorder.mimeType })` (§W9-S6) — chính là dòng `js/recorder.js:163-170`. Bằng chứng nội tại mạnh hơn doc: file ghép này đang được app dùng để **phát lại và export** từ trước tới nay.
+- ⇒ **Giữ nguyên `start(500)`** để live vẫn chạy, và file đầy đủ vẫn có. Đây là lý do phương án "song song" (W2.2) gần như không tốn gì thêm ở tầng ghi âm.
+
+**Giới hạn cần lưu ý (theo thứ tự sẽ chạm tới trước):**
+
+| Giới hạn | Giá trị | Nguồn | Ở 32 kbps tương đương |
+|---|---|---|---|
+| Soniox async **file duration** | **300 phút — cố định, không xin tăng được** | §W9-S3 | 5 giờ họp → quá hạn thì **không refine được**, phải báo người dùng |
+| `MAX_UPLOAD_BYTES` của adapter Soniox trong app | 500 MB | `server/stt/providers/soniox.js:12` | ~34 giờ |
+| `MAX_AUDIO_BYTES` của `PUT /api/audio` | 2 GB | `server.js:51` | — |
+| Soniox async: tổng lưu trữ file 10 GB / 1.000 file; pending ≤ 100; tổng transcription ≤ 2.000 | mặc định, xin tăng được | §W9-S3 | app đã `DELETE` file + transcription ở `finally` (`soniox.js:166-173`) ⇒ không tích luỹ |
+| **RAM trình duyệt giữ `audioChunks`** | `[UNVERIFIED]` | — | xem dưới |
+
+`[UNVERIFIED — W-U1]` Ngưỡng thật mà Chrome đẩy Blob từ RAM xuống đĩa (và hạn mức của nó) **chưa có nguồn**. Đây là **rủi ro đã tồn tại từ trước**, không phải do đề xuất này sinh ra (mảng `audioChunks` vốn đã giữ cả phiên trong bộ nhớ). Cách verify nếu cần chốt: ghi thử 3 giờ, mở `chrome://blob-internals` + Task Manager của Chrome, ghi lại RAM tab trước/sau. Dev **không** được viết con số nào vào code/doc trước khi đo.
+
+### W2.2 Câu 2 — Mất gì nếu bỏ live? Giữ song song có khả thi không?
+
+**Bỏ hẳn live sẽ mất (đo từ code, không suy đoán):**
+1. Transcript hiện ngay trong lúc họp (`js/app.js` render `_transcriptSegments` theo `Transcriber.onResult`).
+2. **Dịch trực tiếp** (`translation` channel của Soniox live — `js/transcriber.js:101-106, 229-251`).
+3. Panel ghi chú trực tiếp đối chiếu transcript (commit `8bd2f33`).
+4. Phản hồi "app đang nghe thấy tôi" — mất tín hiệu này thì lỗi mic chỉ lộ ra **sau khi họp xong**, hỏng nguyên cuộc họp. Đây là mất mát nghiêm trọng nhất, không phải tính năng cho vui.
+
+⇒ **Không đề xuất bỏ live.**
+
+**Phương án song song: KHẢ THI, và không cần buffer/upload gì thêm.** Chuỗi `W1.2 → W1.3` đã đặt file đầy đủ lên server ngay trong `_saveActiveRecording`. Phần còn thiếu **chỉ là**: (a) một đường trigger job batch không bị BR-98 chặn, (b) quy tắc ai được ghi field `transcript`, (c) UI báo trạng thái. Không đụng `recorder.js`, không đụng `transcriber.js`.
+
+### W2.3 Câu 3 — Ba rủi ro thật (không phải ở chỗ audio)
+
+| # | Rủi ro | Vì sao | Xử lý trong thiết kế |
+|---|---|---|---|
+| R-W1 | **Mất transcript live nếu batch lỗi** | `mergeTranscriptionIntoMeeting` ghi đè thẳng (W1.8) | Snapshot `liveTranscript`/`liveTranslations` **trước** khi tạo job; batch lỗi → giữ nguyên bản live, không đổi `status` |
+| R-W2 | **Client ghi đè transcript đã tinh chỉnh** | Guard `PUT /api/meetings` chỉ chặn `incoming.status === 'processing'` (W1.9); trong lúc refine, meeting vẫn `completed` ⇒ mọi thao tác sửa tiêu đề/tag của người dùng sẽ đẩy snapshot cũ đè lên | Mở rộng guard: khi `meeting.refine?.status === 'running'` → server giữ quyền sở hữu `transcript`/`translations`/`duration`/`sonioxUsage` bất kể `incoming.status` |
+| R-W3 | **Tính tiền 2 lần** | Live đã tính `sonioxUsage` (`js/app.js:368-375`); batch ghi đè `sonioxUsage` của mình (`server.js:835-858`) ⇒ hoặc mất chi phí live, hoặc báo thiếu 50% | Cộng dồn, có breakdown (W4.3). **Đây là quyết định của PM, không phải của Tech Lead** — xem E-W1 |
+
+---
+
+## W3. Kiến trúc đề xuất (phương án song song "live-then-refine")
+
+### W3.1 Sơ đồ
+
+```
+[Ghi trực tiếp]
+  MediaRecorder.start(500)
+    ├─ onChunk ──► Transcriber (WS realtime) ──► _transcriptSegments   (hiển thị ngay, KHÔNG đổi)
+    └─ audioChunks ─(stop)─► Blob đầy đủ
+                               │
+                               ▼  js/app.js `_saveActiveRecording`  (ĐÃ CÓ)
+                     AudioStorage.save(meetingId, blob)  →  storage/audio/<sha256(meetingId)>
+                               │
+                               ▼  MỚI: 1 lệnh gọi duy nhất
+                     POST /api/meetings/:id/refine-transcript
+                               │ server: snapshot live → tạo job {mode:'refine'}
+                               ▼
+                     pumpJobQueue → runTranscriptionJob   (pipeline batch ĐÃ CÓ)
+                               │ openStoredAudio(meetingId)  ← đúng file vừa lưu
+                               ▼
+                     applyRefineResult(meeting, result)   (writer MỚI, thuần)
+                               │
+                               ▼
+                     client poll /api/jobs/:id → reload → thay transcript trên UI
+```
+
+### W3.2 Bảng lineage (Protocol 6 — artifact bước N → input bước N+1)
+
+| Bước | Tạo ra (tên chính xác) | Bước sau đọc đúng cái nào |
+|---|---|---|
+| 1. `Recorder.onstop` | `blob` (`js/recorder.js:163`) | `_saveActiveRecording` nhận qua `await Recorder.stop()` |
+| 2. `AudioStorage.save(meetingId, blob)` | file `storage/audio/<sha256(meetingId)>.bin` + `.json` meta; `meeting.audioId = meetingId` | bước 4 đọc bằng **`openStoredAudio(job.meetingId)`** — cùng `meetingId`, không phải id khác |
+| 3. `POST /api/meetings/:id/refine-transcript` | `meeting.liveTranscript` (bản sao của `meeting.transcript`), `meeting.liveTranslations`, `meeting.refine = {status:'running', jobId, startedAt}`; job record `{id, meetingId, partId:'', mode:'refine', provider, model, language, translationLanguage, status:'queued'}` | `pumpJobQueue()` đọc `jobs.json`; `runTranscriptionJob(job)` đọc `job.mode` |
+| 4. `runTranscriptionJob` | `result = {transcript, translations, duration, model}` từ `stt.transcribe` | **writer chọn theo `job.mode`**: `mode==='refine'` → `applyRefineResult(meeting, result, usage)`; `mode` khác/không có → nhánh cũ nguyên vẹn |
+| 5. `applyRefineResult` | `meeting.transcript = result.transcript`; `meeting.translations`; `meeting.transcriptSource = 'batch-refined'`; `meeting.refine = {status:'done', finishedAt}`; `meeting.sonioxUsage` (tổng) + `meeting.usageBreakdown[]`; **`status` giữ nguyên `completed`** | client `_pollJobStatus` thấy `completed` → `_reloadMeetingsFromServer()` → render |
+| 6. Thất bại | `meeting.refine = {status:'failed', error}`; **`transcript` không đổi** (vẫn là bản live) | UI hiện "giữ bản trực tiếp", có nút "Thử lại" |
+
+**Test bắt buộc (Protocol 6.2):** phải assert **giá trị cụ thể** — `openStoredAudio` được gọi với đúng `meetingId` của meeting vừa ghi, và `applyRefineResult` nhận đúng object `result` mà `stt.transcribe` trả về. `assert_called()` suông = Reviewer flag.
+
+### W3.3 Protocol 8 — audit TỪNG bước pipeline batch hiện có với biến thể mới "audio từ ghi trực tiếp"
+
+Pipeline batch sinh ra cho biến thể "file người dùng import". Biến thể mới là "file do chính app ghi". Xét từng bước **đã có từ trước**:
+
+| Bước hiện có | Giải quyết vấn đề gì của biến thể cũ (import file) | Biến thể mới có vấn đề đó không? | Quyết định |
+|---|---|---|---|
+| Pre-flight định dạng (§V7, `formats.js`) | File người dùng có thể là `.m4a`, `.aac`, Google không nhận | Không — app tự sinh file, mime do `MediaRecorder.isTypeSupported` chọn. **Nhưng** `webm` chỉ chắc chắn được Soniox/Deepgram/Whisper nhận; Safari có thể ra `audio/mp4` (`recorder.js:140-144`) mà **Google `rejected`** (`formats.js:60-67`) | **GIỮ** bước kiểm tra — chạy trên mime thật của file đã lưu, không bỏ qua vì "file của mình chắc chắn ổn" |
+| Guard BR-98 `MEETING_ALREADY_HAS_TRANSCRIPT` | Chặn người dùng vô tình gắn file mới đè transcript đã xong | Có, nhưng **ngược dấu** — ở đây ghi đè là chủ đích, có snapshot backup | **KHÔNG nới lỏng guard cũ.** Dùng endpoint riêng có ngữ nghĩa riêng. Sửa guard cũ = mở lại đúng lỗ hổng BR-98 |
+| Dedupe `findActiveJob(meetingId, partId)` | Hai lần submit cùng meeting | Có (user bấm "Tinh chỉnh lại" 2 lần / reload trang) | **GIỮ** nguyên |
+| Hạn mức đồng thời `MAX_CONCURRENT_TRANSCRIPTIONS = 2` | RAM của tiến trình Node khi giữ audio lớn | Có, y hệt | **GIỮ** |
+| Watchdog `JOB_MAX_WALL_MS` / `sweepStuckJobs` | Job treo mãi ở `processing` | Có | **GIỮ**, nhưng nhánh xử lý lỗi phải ghi vào `meeting.refine`, **không** set `meeting.status='failed'` (bản ghi vẫn dùng được với transcript live) |
+| `recoverInterruptedJobs` khi restart | Job mất khi server tắt | Có | **GIỮ**, cùng ràng buộc field như trên |
+| Ghi `status: 'processing' / 'failed' / 'completed'` lên meeting | Meeting import **chưa có gì**, `status` là trạng thái duy nhất | **KHÔNG** — bản ghi trực tiếp đã `completed` và **dùng được ngay**. Dùng lại `status` sẽ làm bản ghi tốt trông như hỏng | **SKIP cho biến thể mới** — trạng thái riêng ở `meeting.refine.status` |
+| `sonioxUsage` ghi đè | Import file chỉ tốn 1 lần tiền | **KHÔNG** — live đã tốn tiền rồi | **SKIP ghi đè**, đổi sang cộng dồn (W4.3) |
+| `durationKindFor` / `duration = audio_duration_ms` | Import file không có thời lượng đáng tin ở client | Bản ghi trực tiếp **có** `Recorder.getElapsedSeconds()`; nhưng `audio_duration_ms` của Soniox là độ dài audio thật, vẫn đúng hơn cho tính tiền | **GIỮ**, nhưng phải kiểm: `duration` mới lệch > 10% so với live ⇒ ghi log, không âm thầm nuốt (dấu hiệu file hỏng) |
+| `context` gửi lên Soniox | Batch hiện **không** gửi `context` (W1.11) | Live **có** gửi và có `participants` sẵn trong meeting | **THÊM** — xem W5.4. Đây là điểm mà "dùng chung code" đang làm bản batch *tệ hơn* bản live |
+
+Bước nào chưa trả lời được ⇒ **SKIP mặc định**. Cách hiện thực đúng tinh thần Protocol 8.3: **khai báo năng lực trên chính job/mode** (bảng `JOB_MODES = { attach: {writer, ownsMeetingStatus: true, usage: 'replace'}, refine: {writer, ownsMeetingStatus: false, usage: 'accumulate'} }`), pipeline hỏi bảng đó — **không** rải `if (job.mode === 'refine')` khắp thân hàm.
+
+---
+
+## W4. API + Data model (delta)
+
+### W4.1 Endpoint mới
+
+```
+POST /api/meetings/:id/refine-transcript
+body: { provider?: string, model?: string, language?: string, translationLanguage?: string }
+200 { jobId, status }            // đã có job đang chạy (dedupe)
+201 { jobId, status: 'queued' | 'processing' }
+404 Meeting not found | audio không còn
+409 { error: { code: 'REFINE_ALREADY_RUNNING' } }
+422 { error: { code: 'REFINE_NOT_APPLICABLE' } }   // không có audioId, hoặc là bản ghi ghép (parts.length > 0)
+```
+Bắt buộc đi qua `hasTrustedHost` + `isTrustedApiRequest` như mọi route `/api/` khác (§V16). Không nhận đường dẫn file từ client — chỉ `:id`, audio vẫn định vị bằng `sha256(meetingId)`.
+
+### W4.2 Field mới trên Meeting (tất cả optional; thiếu = hành vi cũ)
+
+| Field | Kiểu | Ý nghĩa |
+|---|---|---|
+| `liveTranscript` | `Segment[]` | Bản live nguyên trạng, giữ lại để đối chiếu / rollback |
+| `liveTranslations` | `Segment[]` | Tương tự cho dịch trực tiếp (batch **không** tái tạo được nếu người dùng không chọn ngôn ngữ dịch) |
+| `transcriptSource` | `'live' \| 'batch-refined'` | Nguồn của `transcript` hiện tại; hiển thị nhãn provenance |
+| `refine` | `{ status: 'running'\|'done'\|'failed', jobId, startedAt, finishedAt, error }` | Trạng thái tinh chỉnh, **tách khỏi `meeting.status`** |
+
+### W4.3 Chi phí — cộng dồn thay vì ghi đè
+
+`usageBreakdown: [{ source: 'live-realtime', ... }, { source: 'batch-refine', ... }]`, `sonioxUsage` = tổng (giữ nguyên hình dạng để trang Usage hiện tại `js/app.js:643-671` không vỡ). **Thực tế người dùng trả tiền 2 lần cho cùng cuộc họp** — con số cụ thể theo bảng giá đang hardcode trong app (`server.js:834`: 0.10 USD/h, 0.16 USD/h khi có dịch) `[UNVERIFIED]` vì chưa đối chiếu trang giá chính thức trong phiên này. Đây là điểm **phải hỏi PM**, xem E-W1.
+
+### W4.4 UI
+
+- Meeting detail: chip `⟳ Đang tinh chỉnh transcript…` cạnh tiêu đề khi `refine.status === 'running'`; transcript live vẫn đọc được bình thường trong lúc đó.
+- Xong: transcript được thay + chip `✓ Đã tinh chỉnh (bản đầy đủ)`; toast một dòng. Nếu đã có summary sinh từ bản live ⇒ hiện nudge "transcript đã đổi, cân nhắc tạo lại tóm tắt" (cùng chỗ với `isPreMeetingInfoStale`, `js/summary-staleness.js` — **hàm thuần, thêm hàm mới chứ không sửa hàm cũ**).
+- Lỗi: chip `Giữ bản trực tiếp` + nút "Thử lại" (gọi lại đúng endpoint W4.1). **Không** dùng toast đỏ kiểu "Audio processing failed" của luồng import — ở đây không mất gì.
+- Reuse `_backgroundAudioTasks` + `_pollJobStatus`, nhưng cần biến thể `_pollRefineJob` vì nhánh `failed`/404 của hàm cũ đọc/ghi `meeting.status` (W3.3).
+- Cài đặt: công tắc **"Tự động tinh chỉnh transcript sau khi ghi xong"** (mặc định: xem E-W2).
+
+---
+
+## W5. Việc 2 — Soniox diarization: những gì doc chính thức thực sự nói
+
+### W5.1 Có tham số nào khác để tinh chỉnh diarization không? → **KHÔNG**
+
+Toàn bộ danh sách tham số của `POST /v1/transcriptions` (async) và của config WebSocket real-time đã được đọc trực tiếp (§W9-S1, S2, S7). Liên quan tới người nói **chỉ có đúng một** boolean `enable_speaker_diarization`. **Không tồn tại** `num_speakers`, `min_speakers`, `max_speakers`, hay bất kỳ sub-option nào. Ai đề xuất các tham số đó là đang nhớ nhầm sang provider khác.
+
+Những gì doc nói về độ chính xác:
+- *"Up to **15 different speakers** are supported per transcription session. Accuracy may decrease when many speakers have **similar voice characteristics**."* (§W9-S1)
+- *"For the most accurate and reliable speaker separation, use **asynchronous transcription** — it provides significantly higher diarization accuracy because the model has access to the full audio context."* (§W9-S1)
+- Real-time: *"Higher speaker attribution errors compared to async mode"*, *"Temporary speaker switches that stabilize as more context is available."* (§W9-S1)
+- Callout cảnh báo: *"Endpointing and manual finalization force tokens to finalize early, which reduces diarization accuracy. For the highest diarization accuracy, do not use endpoint detection."* (§W9-S1)
+
+**Áp vào MeetNote:** `js/transcriber.js` **không** bật `enable_endpoint_detection` và **không** gửi message `finalize` ⇒ app đang ở cấu hình tốt nhất có thể *cho real-time*. Không còn gì để chỉnh ở nhánh live. **Knob duy nhất còn lại đúng là chuyển sang async** — tức Việc 1.
+
+### W5.2 Knob thứ hai (experimental): khai báo người nói trong `context.general`
+
+Doc Context, mục **Experimental features → Improving speaker diarization** (§W9-S2):
+
+> *"Providing speaker information in `general` context can help the model more reliably separate voices."*
+
+Ví dụ chính thức, **nguyên văn**:
+```json
+{ "context": { "general": [
+  { "key": "setting",  "value": "Talk show interview" },
+  { "key": "topic",    "value": "How AI is transforming the modern business landscape" },
+  { "key": "speakers", "value": "2 speakers (1 male host, 1 female guest)" }
+] } }
+```
+Ràng buộc: `general` nên ≤ 10 cặp key-value; tổng context ≤ **8.000 token (~10.000 ký tự)**, vượt → lỗi `invalid_request` (§W9-S2).
+
+⚠️ Doc gắn nhãn **experimental** — nghĩa là *không* có cam kết. Dev **không** được ghi vào CHANGELOG rằng việc này "cải thiện diarization" nếu chưa đo A/B trên file thật của người dùng.
+
+### W5.3 Câu 2 — Format audio (sample rate / mono-stereo / bitrate) có được khuyến nghị chính thức không?
+
+**`[UNVERIFIED]` — Soniox KHÔNG công bố khuyến nghị nào về sample rate / bitrate / mono-stereo cho độ chính xác.** Đã kiểm toàn bộ `llms-full.txt` (2,0 MB, toàn bộ doc) cho các từ khoá `sample rate`, `bitrate`, `mono`, `stereo`, `16 kHz` (§W9-S4): mọi kết quả đều thuộc về **Text-to-Speech output**, hoặc về raw PCM streaming (`sample_rate`/`num_channels` là *bắt buộc khai báo* cho format không header — **thông tin giải mã, không phải khuyến nghị chất lượng**). Async thì: *"Soniox automatically detects audio formats for file transcription — no configuration required"* (§W9-S3).
+
+⇒ Không có cơ sở chính thức để nói 32 kbps hại (hay không hại) diarization. Nhãn `[CHƯA VERIFY]` mà chính code đã tự gắn (`js/recorder.js:146-151`) **vẫn đứng nguyên**. Nếu muốn chốt, cách duy nhất là đo: ghi cùng 1 đoạn họp ở 32 kbps và 96–128 kbps, chạy cùng `stt-async-v5`, đếm lỗi gán speaker. **Đừng đổi hằng số bitrate dựa trên cảm giác.**
+
+Một điểm **đáng ngờ hơn bitrate**, phát hiện khi đọc `recorder.js` (giả thuyết, **chưa verify**, nêu ra để đo chứ không để implement):
+- `echoCancellation: true` + `noiseSuppression: true` là xử lý tín hiệu do trình duyệt áp lên mic, được thiết kế cho hội thoại VoIP; chúng **biến đổi phổ giọng nói**.
+- Mic + system audio bị **trộn xuống một track duy nhất** (`recorder.js:127-132`). Hai nguồn âm học hoàn toàn khác nhau chồng lên nhau, và mọi người nói phía xa trong phòng đều đi chung một kênh mic.
+Cả hai đều là **giả thuyết `[UNVERIFIED — W-U2]`**: Soniox không nói gì về chúng. Giá trị của chúng là hướng dẫn *thí nghiệm*, không phải căn cứ để sửa code.
+
+### W5.4 Đề xuất cụ thể, ít rủi ro, áp cho Việc 2
+
+| # | Việc | Rủi ro | Căn cứ |
+|---|---|---|---|
+| D-W1 | **Batch cũng gửi `context`** như live đang gửi (domain/topic/participants) — hiện batch không gửi gì (W1.11) | Thấp; `context` là tham số chính thức của cả 2 API | §W9-S1/S2, `soniox.js:129-138` |
+| D-W2 | Thêm cặp `{ key: 'speakers', value: '<N> speakers' }` vào `context.general` khi meeting có danh sách người tham dự (N = `participants.length`) — đúng khuôn ví dụ chính thức | Thấp về kỹ thuật, **nhưng là feature experimental** ⇒ không hứa hẹn kết quả | §W9-S2 |
+| D-W3 | Cảnh báo khi > 15 người tham dự: diarization sẽ không tách nổi | Không | §W9-S1 |
+| D-W4 | **Chạy async cho bản ghi trực tiếp** (= Việc 1) — knob mạnh nhất và là khuyến nghị "best practice" viết thẳng trong doc | Xem W2.3 | §W9-S1 |
+
+### W5.5 Câu 3 — Ghi gián tiếp qua loa rồi thu bằng mic điện thoại, doc có cảnh báo không?
+
+**`[UNVERIFIED]` — Soniox docs không có câu nào nói riêng về kịch bản thu lại qua loa/echo/cross-talk.** Thứ gần nhất, và chỉ là mô tả năng lực model chứ không phải cảnh báo, là changelog `stt-rt-v5`: *"Better robustness on noisy audio, telephony, far-field microphones, accents, interruptions, **overlapping speech**, and mixed-language conversations"* (§W9-S8). Cảnh báo duy nhất có thật và liên quan là *"Accuracy may decrease when many speakers have similar voice characteristics"* (§W9-S1) — ghi qua loa khiến mọi giọng đi qua cùng một chuỗi loa→phòng→mic, làm các giọng **nghe giống nhau hơn**, nhưng **việc nối suy luận đó là của chúng ta, không phải của doc**. Không được trích như thể Soniox đã nói.
+
+⇒ Với người dùng: hướng dẫn thực dụng (ghi trực tiếp trên máy đang họp thay vì thu lại qua loa) là hợp lý, nhưng viết trong `HUONG-DAN-SU-DUNG.md` phải ở dạng kinh nghiệm của MeetNote, **không** gán cho Soniox.
+
+---
+
+## W6. Task Breakdown (nếu PM duyệt)
+
+| # | Task | File | Phụ thuộc | Acceptance |
+|---|---|---|---|---|
+| T-W1 | `server/refine.js` — writer thuần `applyRefineResult(meeting, result, usage)` + `markRefineRunning` / `markRefineFailed` + bảng `JOB_MODES` | mới | — | `node --test`: lỗi ⇒ `transcript` **không đổi**; thành công ⇒ `status` vẫn `completed`, `liveTranscript` còn nguyên, `usageBreakdown` có 2 mục |
+| T-W2 | `runTranscriptionJob` tra `JOB_MODES[job.mode]` thay vì ghi field cứng; `mode` vắng mặt = hành vi cũ y hệt | `server.js:819-880` | T-W1 | Test regression luồng import cũ vẫn xanh |
+| T-W3 | Endpoint `POST /api/meetings/:id/refine-transcript` (W4.1) | `server.js` | T-W1 | 409 khi đang chạy; 422 với bản ghi ghép; audio thiếu → 404; đi qua kiểm tra Host/Origin |
+| T-W4 | Mở rộng guard `PUT /api/meetings` cho `refine.status === 'running'` (R-W2) | `server.js:2044-2070` | T-W3 | Test: PUT snapshot cũ `status:'completed'` trong lúc refine **không** ghi đè `transcript` |
+| T-W5 | Client: gọi refine sau `_saveActiveRecording`, `_pollRefineJob`, chip trạng thái, nút Thử lại | `js/app.js` | T-W3 | Ghi 1 phút thật → transcript bị thay bằng bản async, live còn xem được trong lúc chờ |
+| T-W6 | Batch Soniox gửi `context` (D-W1/D-W2/D-W3) | `server/stt/providers/soniox.js`, có thể tách `server/stt/soniox-context.js` dùng chung với `js/transcriber.js:_buildContext` | — | Test thuần: ≤ 10 cặp `general`, tổng ≤ 10.000 ký tự, `speakers` chỉ xuất hiện khi biết số người |
+| T-W7 | Smoke test gọi Soniox thật (Protocol 5.4) + golden file capture vào `tests/fixtures/soniox/` | `test/` | T-W6 | Chạy xanh trên máy Dev; QA re-run trước khi duyệt; **mock viết tay = reject** |
+| T-W8 | Nudge "transcript đã đổi, tóm tắt có thể cũ" | `js/summary-staleness.js` (**thêm hàm**, không sửa `isPreMeetingInfoStale`), `js/app.js` | T-W5 | Test thuần; meeting chưa từng tóm tắt ⇒ không nudge (deny-by-default như R-AF) |
+| T-W9 | Chạy xuyên suốt với dữ liệu thật + **kiểm nội dung transcript cuối**, không chỉ `status` (Protocol 6.3) | QA | tất cả | Có log/ảnh chụp trong `docs/test-report.md` (APPEND, không ghi đè) |
+
+Thứ tự: T-W1 → T-W2 → T-W3/T-W4 → T-W5 → T-W6/T-W7 → T-W8 → T-W9.
+T-W6/T-W7 **độc lập** với phần còn lại — nếu PM muốn thắng nhanh, đây là miếng nhỏ nhất và cải thiện luôn cả luồng import file đang có.
+
+---
+
+## W7. Technical Decisions (WHY)
+
+| # | Quyết định | WHY |
+|---|---|---|
+| WHY-W1 | Không đổi `MediaRecorder`, không bỏ `timeslice` | File đầy đủ **đã có sẵn** (W1.2/W1.3). Bỏ timeslice chỉ để "sạch" sẽ giết live transcript mà không đổi lại được gì |
+| WHY-W2 | Endpoint riêng thay vì nới lỏng BR-98 | Guard BR-98 tồn tại để chặn ghi đè **vô ý**. Refine là ghi đè **có ý, có backup**. Trộn hai ngữ nghĩa vào một endpoint = mở lại lỗ hổng cũ cho tất cả caller |
+| WHY-W3 | `refine.status` riêng, không dùng `meeting.status` | Bản ghi trực tiếp **đã dùng được**. Đặt `status='processing'` biến bản ghi tốt thành "đang xử lý" trên toàn UI, và `status='failed'` khi batch lỗi là **nói dối** — bản live vẫn còn |
+| WHY-W4 | Giữ `liveTranscript` vĩnh viễn, không xoá sau khi refine xong | Async chính xác hơn *về trung bình*; vẫn có ca tệ hơn (file hỏng, phần đầu bị cắt). Không có bản đối chiếu thì không ai phát hiện được. Chi phí: vài KB JSON |
+| WHY-W5 | Năng lực khai báo trên `JOB_MODES` thay vì `if (mode === 'refine')` | Protocol 8.3 — đúng lý do mà pipeline được dùng chung ngay từ đầu |
+| WHY-W6 | Không chỉnh `audioBitsPerSecond`, không tắt `noiseSuppression` trong đợt này | Không có nguồn chính thức nào (W5.3). Sửa hằng số theo cảm giác rồi ghi vào CHANGELOG là đúng loại lỗi Protocol 5 sinh ra để chặn |
+
+---
+
+## W8. Escalation lên PM — không tự quyết
+
+| ID | Vấn đề | Đề xuất |
+|---|---|---|
+| **E-W1** ✅ **ĐÃ QUYẾT (PM, 2026-09-22): phương án (a)** | **Chi phí gấp đôi**: mỗi cuộc họp bị tính tiền cả live lẫn async | **Chốt: mặc định TẮT tự động tinh chỉnh; người dùng bấm tay nút "Tinh chỉnh transcript".** (Các hướng đã cân nhắc và **bị loại**: (b) mặc định BẬT có hiện chi phí ước tính; (c) chỉ tự chạy khi họp > N phút.) ⇒ W4.4 bỏ công tắc "tự động", thay bằng nút bấm tay; E-W2 trở nên không áp dụng |
+| **E-W2** | Nếu chọn (b), cần chốt giới hạn an toàn (vd. bỏ qua bản ghi > 300 phút vì Soniox chặn cứng) | Chốt ở checkpoint |
+| **E-W3** | Sau khi refine, **dịch trực tiếp** chỉ tái tạo được nếu người dùng đã chọn ngôn ngữ dịch; nếu không, `translations` mới sẽ rỗng | Không ghi đè `translations` bằng mảng rỗng: rỗng ⇒ giữ `liveTranslations`. Cần PM xác nhận đây là hành vi mong muốn |
+| ~~**E-W4**~~ ✅ **ĐÃ QUYẾT (PM, 2026-09-22) — không còn escalation** | Bản ghi **ghép nhiều phần** (`parts`) — refine từng phần hay cả bản? | **PM bác đề xuất "v1 không hỗ trợ" của Tech Lead: multi-part được hỗ trợ NGAY TỪ v1.** Thiết kế chi tiết ở **§W10–§W16** (chốt: refine **per-part**, không ghép audio). Đoạn "đề xuất 422 `REFINE_NOT_APPLICABLE` cho bản ghi ghép" ở **W4.1 không còn hiệu lực** — xem W13.1 |
+| **E-W5** | D-W2 (`speakers` trong context) là **experimental** theo doc Soniox | Làm vì rẻ, nhưng microcopy/CHANGELOG **không được** hứa "chính xác hơn" khi chưa đo A/B |
+
+---
+
+## W9. External Contracts + Nguồn xác thực (Protocol 5)
+
+Truy cập **2026-09-22**. Soniox docs cung cấp Markdown sạch bằng cách thêm `.mdx` vào URL (theo chính `https://soniox.com/docs/llms.txt`) — các nguồn dưới đây được **tải thật bằng `curl` trong phiên này**, không phải trí nhớ.
+
+| ID | Nguồn | Dùng để khẳng định |
+|---|---|---|
+| **S1** | `https://soniox.com/docs/stt/concepts/speaker-diarization.mdx` | Chỉ có `enable_speaker_diarization`; tối đa 15 speaker; async chính xác hơn real-time; endpointing/manual finalization làm giảm độ chính xác; giọng giống nhau ⇒ kém đi |
+| **S2** | `https://soniox.com/docs/stt/concepts/context.mdx` | 4 section `general/text/terms/translation_terms`; `general` ≤ ~10 cặp; tổng ≤ 8.000 token (~10.000 ký tự); mục **experimental** "Improving speaker diarization" + ví dụ key `speakers` |
+| **S3** | `https://soniox.com/docs/stt/async/async-transcription.mdx` + `.../async/limits-and-quotas.mdx` | Async nhận `file_id`/`audio_url`; tự nhận diện format (`aac, aiff, amr, asf, flac, mp3, ogg, wav, webm, m4a, mp4`); **file duration 300 phút cố định**; 10 GB / 1.000 file / 100 pending / 2.000 transcription |
+| **S4** | `https://soniox.com/docs/llms-full.txt` (2.056.801 byte, tải đầy đủ) — grep `sample rate\|bitrate\|mono\|stereo\|16 kHz\|far-field\|noisy` | **Không có** khuyến nghị chất lượng audio cho STT input ⇒ cơ sở cho `[UNVERIFIED]` ở W5.3 |
+| **S5** | `https://developer.mozilla.org/en-US/docs/Web/API/MediaRecorder/start` | Bỏ `timeslice` ⇒ cả phiên vào **một** Blob; `dataavailable` chỉ bắn khi `stop()`/`requestData()` |
+| **S6** | `https://developer.mozilla.org/en-US/docs/Web/API/MediaRecorder/dataavailable_event` | Các chunk ghép lại thành file phát được qua `new Blob(chunks, { type: mediaRecorder.mimeType })` |
+| **S7** | `https://soniox.com/docs/api-reference/stt/transcriptions/create_transcription` (qua `llms-full.txt`) — schema request đầy đủ | Danh sách tham số async đóng: `model, audio_url, file_id, language_hints, language_hints_strict, enable_speaker_diarization, enable_language_identification, translation, context, webhook_*, client_reference_id`. **Không có** tham số số lượng speaker |
+| **S8** | `https://soniox.com/docs/stt/models.mdx` | `stt-rt-v5` (real-time) + `stt-async-v5` (async) đang Active — **đúng 2 model app đang dùng**; changelog 16/06/2026 nêu "robustness on noisy audio, far-field microphones, overlapping speech" |
+| **S9** | Source trong repo, đọc trực tiếp 2026-09-22 | `js/recorder.js`, `js/transcriber.js`, `js/audio-storage.js`, `js/app.js`, `js/summary-staleness.js`, `server.js`, `server/stt/providers/soniox.js`, `server/stt/formats.js` — mọi dòng trích ở §W1 |
+
+### Danh sách `[UNVERIFIED]` — chặn đúng phần nào
+
+| ID | Nội dung | Chặn gì | Gỡ bằng cách |
+|---|---|---|---|
+| **W-U1** | Ngưỡng RAM/đĩa của Chrome cho Blob khi ghi nhiều giờ | Chặn **mọi phát biểu về thời lượng ghi tối đa an toàn** trong UI/doc. Không chặn T-W1→T-W8 | Ghi thử 3 giờ, đo bằng `chrome://blob-internals` + Task Manager |
+| **W-U2** | `noiseSuppression`/`echoCancellation`/mix-1-track ảnh hưởng diarization | Chặn **mọi thay đổi cấu hình `getUserMedia`/bitrate** | A/B trên cùng đoạn audio, đếm lỗi gán speaker |
+| **W-U3** | Giá 0,10 / 0,16 USD/h hardcode ở `server.js:834` | Chặn mọi microcopy mới nêu con số chi phí | Đối chiếu trang giá chính thức của Soniox |
+| **W-U4** | D-W2 có thực sự cải thiện diarization không (doc ghi *experimental*) | Chặn **câu chữ** hứa hẹn trong CHANGELOG/UI, **không** chặn việc implement | A/B trên file thật của người dùng |
+
+---
+
+⏸ **Cần người/PM duyệt trước khi Dev bắt đầu**: 5 điểm E-W1 → E-W5. Phần rẻ nhất và độc lập nhất (T-W6 + T-W7: gửi `context` cho batch Soniox) có thể tách ra làm trước.
+
+---
+
+# W-MP. Mở rộng §W — refine cho bản ghi ghép nhiều phần (multi-part)
+
+> Viết sau khi **PM duyệt §W tại ⏸ CHECKPOINT (Protocol 2), 2026-09-22**, với 2 quyết định: **E-W1 = (a)** (mặc định TẮT, nút bấm tay) và **E-W4 = hỗ trợ multi-part ngay từ v1** (khác đề xuất ban đầu của Tech Lead).
+> Phần này **append**, không sửa §W1–§W7 và **không đụng §W5** (kết quả verify Soniox diarization giữ nguyên). Hai dòng E-W1/E-W4 ở §W8 đã được đánh dấu "đã quyết" tại chỗ.
+> **Vẫn là thiết kế — Dev chưa được code phần multi-part cho tới khi PM duyệt §W10–§W16.**
+
+## W10. Đọc kỹ mô hình `parts` hiện tại (verify, không suy đoán — 2026-09-22)
+
+| # | Sự thật | Nguồn |
+|---|---|---|
+| W10.1 | `partId` nằm ở **`meeting.parts[i].partId`**, khuôn bắt buộc `/^part-[a-z0-9-]{8,64}$/` (`isValidPartId`) | `server/meeting-parts.js:19-23, 57-83` |
+| W10.2 | **Audio của mỗi part lưu ở CÙNG chỗ với audio của meeting**, chỉ khác giá trị id băm: `storage/audio/<sha256(partId)>.audio` + `.json`. Không có route riêng, không có thư mục riêng | `server.js:381-391, 946-970` (comment: *"`id` là meetingId (single-part) hoặc partId (multi-part) — cả hai cùng nằm ở path sha256(id)"*) |
+| W10.3 | Job đã có sẵn field `partId`; `runTranscriptionJob` nạp `openStoredAudio(job.partId \|\| job.meetingId)` ⇒ **hạ tầng chạy batch cho 1 part đã hoàn chỉnh từ v3.0** | `server.js:821`, `jobs.json` §V3.5 |
+| W10.4 | `meeting.transcript` của bản ghi ghép là **field DẪN XUẤT**, do `rebuildMergedMeeting` sinh ra từ `parts[]` mỗi lần có thay đổi. Nguồn sự thật là `parts[i].transcript` | `server/meeting-parts.js:162-180` |
+| W10.5 | `rebuildMergedMeeting` tính lại luôn `duration`, `durationEstimated`, `missingParts`, `sonioxUsage` (`aggregateUsage`), `status` (`overallStatus`) | `server/meeting-parts.js:169-179` |
+| W10.6 | `buildMergedTranscript` chèn `part-divider` trước mỗi part; part **không** `completed` thì chèn `part-gap` **thay cho toàn bộ nội dung** của part đó | `server/stt/merge.js:106-129` |
+| W10.7 | Mỗi segment ghép mang `partId` + `srcIndex`; `applyTranscriptEdits` dùng cặp này để ánh xạ edit của người dùng về đúng part, và **từ chối toàn bộ** nếu shape lệch | `server/meeting-parts.js:299-333` |
+| W10.8 | `PUT /api/meetings` đã **luôn** gọi `preserveServerOwnedFields` cho mọi meeting có `parts` — bất kể client gửi `status` gì | `server.js:2050-2052`, `meeting-parts.js:339-347` |
+| W10.9 | `retryPart` **xoá trắng** `transcript`/`translations` của part rồi đặt `status:'queued'` ngay lập tức | `server/meeting-parts.js:236-258` |
+| W10.10 | `markPartRunning` đặt `part.status='processing'` ⇒ qua `overallStatus` làm **cả meeting** thành `processing`, và qua `buildMergedTranscript` làm nội dung part đó **biến mất** khỏi transcript ghép, thay bằng dòng *"Phần N đang được tạo transcript…"* | `meeting-parts.js:260-266, 122-127`; `merge.js:78-80` |
+| W10.11 | `aggregateUsage` chỉ cộng `part.usage` của part `completed`; `part.usage` là **một object duy nhất** ⇒ ghi đè = mất chi phí lần chạy trước | `meeting-parts.js:132-157` |
+| W10.12 | Tối đa **10 part/meeting** (`MAX_PARTS_PER_MEETING`) | `meeting-parts.js:13` |
+| W10.13 | `GET /api/meetings/:id/parts` là poll rẻ, trả **danh sách field cố định** (`partId, order, filename, status, error, spanSeconds, offsetSeconds, hasTranscript, startedAt, endedAt`) — thêm trạng thái mới phải thêm vào đây thì client mới thấy | `server.js:1649-1666` |
+| W10.14 | Prompt cảnh báo nhãn người nói theo part: *"Speaker labels are per-part: «Speaker 1» in one part is NOT necessarily the same person as «Speaker 1» in another part…"*, **chỉ bật khi `partCount > 0`** | `server/llm/prompts.js:157-163` |
+| W10.15 | Client rename người nói cũng đã giới hạn theo `partId` (đổi nhãn chỉ trong cùng một part) | `js/app.js:4346-4390` |
+
+### W10.16 Một đính chính quan trọng về phạm vi (đọc trước khi thiết kế)
+
+**Bản ghi ghép hiện nay KHÔNG chứa audio ghi trực tiếp.** Ghi trực tiếp lưu vào `meeting.audioId` và **không tạo `parts`** (`js/app.js:358-362`); còn `parts` chỉ sinh ra từ luồng import file (`js/import.js:878, 948` + `POST /api/meetings/:id/parts`). Theo E-V4 (§V15) v1 cũng **không** cho biến bản ghi một phần thành bản ghi ghép.
+
+⇒ Với bản ghi ghép, transcript của **mọi** part vốn đã do **`stt-async-v5` (batch)** tạo ra (`soniox.js:130-138`). Nghĩa là **refine ở đây KHÔNG còn là "live → async"** như §W. Giá trị thật của refine cho multi-part là 3 thứ khác, và cần nói thẳng để PM biết mình đang duyệt cái gì:
+
+| Giá trị | Có thật không |
+|---|---|
+| **G1 — Chạy lại với cấu hình tốt hơn** (gửi `context` + gợi ý số người nói theo D-W1/D-W2/D-W3, hoặc đổi provider/model) | **Có.** Hôm nay batch không gửi `context` gì cả (W1.11) |
+| **G2 — Chạy lại KHÔNG mất dữ liệu** | **Có, và đây là lỗ hổng thật của bản hiện tại:** `retryPart` xoá trắng transcript **trước** khi chạy (W10.9). Chạy lại một part đã `completed` mà provider lỗi ⇒ **mất vĩnh viễn** transcript cũ. Refine sửa đúng chỗ này |
+| **G3 — Đường sẵn sàng cho tương lai** khi một phần ghi trực tiếp được nhập vào bản ghi ghép (E-V4 mở khoá ở v1.1) | Có, nếu dùng chung `JOB_MODES` |
+
+**Không** được viết trong CHANGELOG/UI rằng refine làm bản ghi ghép "chính xác hơn" — với multi-part, cải thiện (nếu có) đến từ G1, mà G1 dựa trên tính năng Soniox gắn nhãn *experimental* (W-U4). Câu chữ phải trung tính: *"Chạy lại transcript với ngữ cảnh cuộc họp"*.
+
+---
+
+## W11. Quyết định chính: refine **per-part**, KHÔNG ghép audio
+
+### W11.1 So sánh hai phương án
+
+| Tiêu chí | **A. Per-part** (mỗi part 1 job batch, merge bằng `rebuildMergedMeeting` đã có) | **B. Ghép audio rồi refine cả bản** |
+|---|---|---|
+| Hạ tầng cần thêm | **Không có gì mới**: `openStoredAudio(partId)`, `job.partId`, `applyPartResult`, `rebuildMergedMeeting` đều đã chạy production từ v3.0 (W10.1–W10.5) | Phải **nối/encode lại N file audio** thành 1 |
+| Phụ thuộc mới | Không | **Bắt buộc `ffmpeg`** — các part có container khác nhau (`webm`, `m4a`, `mp3`, `wav`, `aac`… §V7.1), **không thể nối byte**, phải decode+encode thật. Vi phạm baseline zero-dependency của `package.json`, thêm một `child_process.spawn` mới ⇒ phải soát lại §V16 (shell:false, đường dẫn binary tuyệt đối), và Protocol 5 đầy đủ cho ffmpeg (version, flag, exit code) |
+| **Giới hạn 300 phút/file của Soniox (cứng, không xin tăng được — §W9-S3)** | **Né được tự nhiên**: mỗi part là 1 file riêng, chỉ part nào tự nó > 300 phút mới hỏng | **Chạm trần dễ dàng**: 10 part × 40 phút = 400 phút ⇒ **hỏng cả bản ghi**, mà lỗi chỉ lộ ra sau khi đã tốn công encode |
+| Chi phí khi 1 part lỗi | Chỉ mất tiền của part đó; part khác vẫn giữ kết quả | Hỏng là hỏng nguyên bản ghi, tính tiền toàn bộ thời lượng |
+| Timeline / provenance | Giữ nguyên `offsetSeconds`, `part-divider`, `missingParts`, nghe lại audio từng part (`js/app.js:1763`), retry từng part | **Phá sạch**: transcript một khối không map ngược về part nào ⇒ `applyTranscriptEdits` (W10.7) và rename theo part (W10.15) **mất cơ sở**, `missingParts` vô nghĩa. Thực chất là vòng qua toàn bộ mô hình §V0 |
+| **Nhãn người nói nhất quán giữa các part** | **KHÔNG giải quyết** (xem W11.2) | Về lý thuyết **có** — Soniox nhìn thấy một dòng audio liên tục |
+| Độ phức tạp v1 | Nhỏ | Lớn |
+
+**CHỐT: phương án A (per-part).** Đổi lại ta **chấp nhận giữ nguyên hạn chế nhãn người nói giữa các part**. Phương án B không bị loại vì "khó" mà vì nó đánh đổi **một giới hạn cứng của nhà cung cấp (300 phút)** và **toàn bộ mô hình dữ liệu `parts`** để lấy một lợi ích mà chính doc Soniox chỉ mô tả ở mức *experimental*.
+
+### W11.2 Protocol 8 — refine CÓ giải quyết được vấn đề nhãn người nói ở `prompts.js:157-163` không?
+
+**KHÔNG. Và dòng cảnh báo đó phải giữ nguyên, không được xoá.**
+
+Lập luận có nguồn, không suy đoán:
+1. Soniox cấp nhãn speaker **theo từng transcription session** — doc ghi *"Up to 15 different speakers are supported per **transcription session**"* (§W9-S1). Không có tham số nào để ghim danh tính người nói xuyên nhiều session (toàn bộ schema request đã đọc, §W9-S7).
+2. Refine per-part = **N session độc lập**, y hệt lần chạy đầu ⇒ `Speaker 1` của part 1 và `Speaker 1` của part 2 vẫn không liên quan tới nhau.
+3. `context.general` (D-W2) có thể nói *có mấy người nói*, **không** gán được *ai là số mấy*. Doc không hứa điều đó, và đây là mục *experimental* (§W9-S2).
+
+⇒ Theo **Protocol 8.2 (deny-by-default)**: chưa có cách verify được để hợp nhất nhãn giữa các part ⇒ **SKIP**, giữ nguyên hành vi cũ. Cụ thể:
+- **Giữ nguyên từng chữ** dòng `partLines` ở `prompts.js:157-163`, và giữ điều kiện `partCount > 0`.
+- **Giữ nguyên** giới hạn rename theo part ở `js/app.js:4346-4390`.
+- Dev/QA: nếu sau refine mà thấy ai đó đề xuất xoá dòng cảnh báo ấy vì "giờ chạy async rồi nên chuẩn" ⇒ **Reviewer reject** (Protocol 5: claim không nguồn).
+- Nếu về sau thật sự cần nhãn nhất quán, đó là **feature riêng** (phương án B + ffmpeg + verify lại toàn bộ), không phải hệ quả miễn phí của refine.
+
+### W11.3 Protocol 8 — audit các bước pipeline cho biến thể mới "job refine trên một part"
+
+Nối tiếp bảng §W3.3, chỉ xét các bước **đặc thù multi-part**:
+
+| Bước hiện có | Giải quyết vấn đề gì của biến thể cũ (part vừa import, **chưa có** transcript) | Biến thể mới (part **đã có** transcript tốt) có vấn đề đó không? | Quyết định |
+|---|---|---|---|
+| `retryPart` xoá trắng `transcript` trước khi chạy (W10.9) | Part cũ không có gì để mất; xoá cho sạch | **KHÔNG** — part đã có transcript dùng được | **SKIP** — refine dùng writer riêng, **không** gọi `retryPart` |
+| `markPartRunning` → `part.status='processing'` (W10.10) | Báo cho người dùng part đang chạy lần đầu | **KHÔNG** — nó kéo `overallStatus` cả meeting về `processing` và **thay nội dung part bằng dòng "đang được tạo transcript…"** ⇒ người dùng đang đọc transcript bỗng thấy nó biến mất | **SKIP** — dùng `part.refine.status='running'`, giữ `part.status='completed'` |
+| `applyPartResult` ghi đè `transcript` + `usage` | Lần đầu, không có gì bị ghi đè | Có ghi đè thật | **THAY** bằng `applyPartRefineResult`: chỉ ghi khi thành công, giữ `previousTranscript`, **cộng dồn** usage |
+| `markPartFailed` → `status='failed'` | Part lần đầu lỗi thì đúng là hỏng, vào `missingParts` | **KHÔNG** — refine lỗi thì part cũ vẫn nguyên vẹn, đưa vào `missingParts` là **báo sai** và còn kích hoạt `summaryNeedsMissingPartConfirm` (`meeting-parts.js:118`) | **SKIP** — ghi `part.refine.status='failed'`, `part.status` không đổi |
+| `rebuildMergedMeeting` sau mỗi thay đổi | Giữ transcript ghép/duration/usage không lệch nhau | **CÓ, y hệt** — bắt buộc | **GIỮ**: mọi writer refine vẫn kết thúc bằng `rebuildMergedMeeting` (§V4.1 "bước nối quan trọng nhất") |
+| `preserveServerOwnedFields` ở `PUT /api/meetings` (W10.8) | Snapshot client cũ ghi đè dữ liệu server sở hữu | **CÓ** — và **tin tốt: multi-part đã được bảo vệ sẵn** vì guard này chạy cho mọi meeting có `parts`, không phụ thuộc `status` | **GIỮ** — ⇒ **R-W2 (§W2.3) chỉ là vấn đề của bản ghi MỘT phần**. Cần bổ sung: thêm `parts[i].refine` và `previousTranscript` vào phạm vi server-owned để `applyTranscriptEdits` không làm rơi chúng |
+| `aggregateUsage` chỉ đọc `part.usage` (W10.11) | 1 part = 1 lần chạy = 1 chi phí | **KHÔNG** — refine tạo lần chạy thứ 2 | **SỬA**: `part.usage` giữ vai trò "lần chạy gần nhất" cho tương thích ngược, thêm `part.usageBreakdown[]`; `aggregateUsage` cộng theo breakdown khi có, nếu không thì rơi về hành vi cũ |
+| Dedupe `findActiveJob(meetingId, partId)` | 2 lần submit cùng part | **CÓ** | **GIỮ** nguyên — chính là khoá chống bấm 2 lần cho refine |
+| Hạn mức đồng thời = 2 | RAM của tiến trình Node | **CÓ, và nặng hơn**: 10 part có thể cùng xếp hàng | **GIỮ** — `pumpJobQueue` xếp hàng sẵn, không cần cơ chế mới |
+| Pre-flight định dạng | Part import có thể là định dạng provider không nhận | **CÓ** — chính file đó, đổi provider khi refine thì bảng `formats.js` đổi theo | **GIỮ** |
+
+Hiện thực: mở rộng bảng `JOB_MODES` của §W3.3 thay vì rải `if`:
+```
+JOB_MODES = {
+  attach: { writerSingle, writerPart: applyPartResult,       ownsMeetingStatus: true,  ownsPartStatus: true,  usage: 'replace'    },
+  refine: { writerSingle, writerPart: applyPartRefineResult, ownsMeetingStatus: false, ownsPartStatus: false, usage: 'accumulate' }
+}
+```
+`pumpJobQueue` (`server.js:758-760`) hiện gọi `markPartRunning` **vô điều kiện khi `job.partId`** — phải đổi thành hỏi `JOB_MODES[job.mode].ownsPartStatus` (Protocol 8.3: hỏi năng lực, không rẽ nhánh theo tên).
+
+---
+
+## W12. Data model — delta cho multi-part
+
+Thêm vào **`meeting.parts[i]`** (tất cả optional; thiếu = hành vi cũ, và `normalizePart` phải giữ chúng nguyên vẹn qua mỗi lần chuẩn hoá — nhớ bẫy `clampNullableNonNegativeNumber` ở `meeting-parts.js:34-42`: đừng để `undefined` biến thành giá trị mặc định sai):
+
+| Field | Kiểu | Ý nghĩa |
+|---|---|---|
+| `refine` | `{ status: 'running'\|'done'\|'failed', jobId, startedAt, finishedAt, error }` | Trạng thái refine của **riêng part này**, tách khỏi `part.status` |
+| `previousTranscript` | `Segment[]` | Bản transcript **trước** lần refine gần nhất (vai trò tương đương `liveTranscript` của bản một phần, W4.2) |
+| `previousTranslations` | `Segment[]` | Tương tự |
+| `transcriptSource` | `'original' \| 'refined'` | Provenance hiển thị ở header của part |
+| `usageBreakdown` | `Array<usage>` | Mọi lần chạy đã tính tiền cho part này; `part.usage` = phần tử cuối (tương thích ngược với `aggregateUsage`) |
+
+**Mức meeting**: **không** thêm `liveTranscript`/`transcriptSource` cho bản ghi ghép — `meeting.transcript` là field dẫn xuất (W10.4), backup phải nằm ở part. Thêm duy nhất một field dẫn xuất tiện cho UI, do `rebuildMergedMeeting` tính:
+- `refiningParts: number[]` — danh sách `order` của các part đang refine (rỗng ⇒ không có gì chạy).
+
+**Bất biến bắt buộc (Reviewer kiểm):**
+1. Trong suốt vòng đời refine, `part.status` **luôn** giữ nguyên giá trị trước đó ⇒ `overallStatus`, `missingParts`, `buildMergedTranscript` không đổi hành vi ⇒ **người dùng đọc transcript liên tục không gián đoạn**.
+2. Refine **thất bại** ⇒ `parts[i]` khác y hệt trước khi chạy, ngoài `refine` và `usageBreakdown`.
+3. Refine **thành công** ⇒ `previousTranscript` khác rỗng, và `rebuildMergedMeeting` đã chạy trong **cùng một** transaction `mutateMeeting` (`server.js:790-800`) — không bao giờ ghi part rồi rebuild ở lượt ghi khác.
+
+### W12.1 Bảng lineage multi-part (Protocol 6)
+
+| Bước | Tạo ra (tên chính xác) | Bước sau đọc đúng cái nào |
+|---|---|---|
+| 1. `POST …/refine-transcript` với `partIds:[p1,p2]` | Với **mỗi** part: `parts[i].refine={status:'running',jobId}`, `parts[i].previousTranscript = parts[i].transcript` (bản sao, **chụp trước khi có bất kỳ ghi nào**); N job `{id, meetingId, partId:<p_k>, mode:'refine', status:'queued'}` | `pumpJobQueue()` đọc `jobs.json`; **`job.partId` là khoá duy nhất** dẫn tới audio |
+| 2. `pumpJobQueue` | job đổi `status='processing'`; **KHÔNG** gọi `markPartRunning` (vì `ownsPartStatus === false`) | `runTranscriptionJob(job)` |
+| 3. `runTranscriptionJob` | `audio = openStoredAudio(job.partId)` ⇒ file `storage/audio/<sha256(job.partId)>.audio` — **đúng part đó, không phải meeting, không phải part 1** (bẫy đã được ghi sẵn ở `server.js:815-818`) | `stt.transcribe({ audioMeta: audio.meta, loadAudio: audio.load, … })` |
+| 4. `stt.transcribe` | `result = {transcript, translations, duration, durationKind, model, provider}` | `applyPartRefineResult(meeting, job.partId, {...result, usage})` |
+| 5. `applyPartRefineResult` | `parts[i].transcript = result.transcript`; `transcriptSource='refined'`; `refine.status='done'`; `usageBreakdown.push(usage)`; **rồi `rebuildMergedMeeting`** ⇒ `meeting.transcript/duration/sonioxUsage/missingParts/refiningParts` được tính lại | Client `GET /api/meetings/:id/parts` thấy `refine` đổi ⇒ gọi `/api/data` lấy nội dung |
+| 6. Thất bại | `parts[i].refine={status:'failed',error}`; `transcript` **không đổi**; vẫn `rebuildMergedMeeting` (để `refiningParts` cập nhật) | UI hiện "giữ bản cũ" + nút Thử lại cho **đúng part đó** |
+
+**Test bắt buộc (Protocol 6.2 — đây là chỗ dễ sai nhất của multi-part):** với bản ghi 3 part, refine part 2 ⇒ assert `openStoredAudio` được gọi **đúng một lần** và **với đúng `p2`** (không phải `meetingId`, không phải `p1`); assert `applyPartRefineResult` nhận **đúng object `result`** do `stt.transcribe` trả về; assert transcript của part 1 và part 3 **không đổi một byte**. Mẫu có sẵn: `test/parts-routes.test.js` đã đếm số lần gọi `stt.transcribe` cho `retryPart`.
+
+---
+
+## W13. API — cập nhật W4.1
+
+### W13.1 `POST /api/meetings/:id/refine-transcript` (thay thế phiên bản ở §W4.1)
+
+```
+body: {
+  partIds?: string[],          // CHỈ multi-part. Thiếu/rỗng = mọi part đủ điều kiện
+  provider?, model?, language?, translationLanguage?
+}
+
+// Bản ghi MỘT phần (không có parts) — y như §W4.1:
+201 { mode: 'single', jobId, status }
+200 { mode: 'single', jobId, status }            // dedupe
+
+// Bản ghi GHÉP:
+201 { mode: 'parts', jobs: [ { partId, jobId, status } ], skipped: [ { partId, reason } ] }
+409 { error: { code: 'REFINE_ALREADY_RUNNING' } }        // MỌI part yêu cầu đều đang chạy
+422 { error: { code: 'REFINE_NO_ELIGIBLE_PARTS' } }      // không part nào đủ điều kiện
+400 { error: { code: 'PART_NOT_FOUND' } }                // partIds có id lạ
+404                                                      // meeting/audio không còn
+```
+- `REFINE_NOT_APPLICABLE` của §W4.1 **bị bỏ** đối với bản ghi ghép (E-W4 đã quyết). Vẫn giữ cho bản ghi **không có audio** (`audioId` rỗng và không có part nào).
+- **Part đủ điều kiện** = `status === 'completed'` **và** `refine?.status !== 'running'` **và** audio còn tồn tại (`openStoredAudio(partId)` không ném 404). Part `failed`/`dropped`/`queued`/`processing` ⇒ vào `skipped` kèm `reason` — chúng thuộc về nút **"Thử lại"** cũ (`POST …/parts/:partId/retry`), không phải refine. **Hai nút, hai ngữ nghĩa, không gộp.**
+- Mỗi part đủ điều kiện ⇒ **một job riêng**. Không có job "tổng"; tiến độ = hợp của N job (đúng mô hình §V10 và hạn mức đồng thời 2).
+- Bảo mật: route chỉ nhận `:id` + `partIds` đã qua `isValidPartId`; audio vẫn định vị bằng `sha256(partId)`, **không** nối chuỗi vào đường dẫn (BR-111, §V16). Vẫn qua `hasTrustedHost` + `isTrustedApiRequest`.
+- **Không thêm subprocess nào** (hệ quả trực tiếp của việc loại phương án B).
+
+### W13.2 `GET /api/meetings/:id/parts` — thêm field vào projection
+
+Projection hiện là **danh sách cố định** (W10.13) — không thêm thì client poll mãi không thấy gì. Thêm đúng 2 field:
+```
+refine: part.refine || null,
+transcriptSource: part.transcriptSource || 'original'
+```
+và ở cấp meeting: `refiningParts: meeting.refiningParts || []`. Vẫn **không** trả transcript (giữ poll rẻ, §V6.6).
+
+### W13.3 `GET /api/jobs/:id` — không đổi
+
+Client multi-part đã poll theo **meeting** (`GET …/parts`), không theo từng job (§V11#24). Refine dùng lại đúng poller đó ⇒ 10 part = **1 request/chu kỳ**, không phải 10.
+
+---
+
+## W14. UI — delta multi-part (tiếp W4.4)
+
+- **Nút bấm tay, mặc định TẮT tự động** (E-W1 = (a)). Bản ghi ghép: một nút **"Tinh chỉnh transcript"** ở đầu danh sách phần → mở hộp chọn phần (mặc định **tick tất cả phần đã xong**), hiện rõ: số phần, tổng thời lượng, **và cảnh báo tính tiền lại** (W-U3 chặn nêu con số tiền cụ thể cho tới khi đối chiếu bảng giá).
+- Mỗi part đang refine: chip `⟳ đang chạy lại` **ngay trên header của part đó**; transcript của part **vẫn đọc được bình thường** (bất biến W12#1). Xong → `✓ đã chạy lại`; lỗi → `giữ bản cũ` + nút Thử lại cho riêng part đó.
+- Chỉ báo tác vụ nền: "Đang tinh chỉnh 2/3 phần" (đọc `refiningParts`).
+- **Không** dùng nhánh lỗi kiểu `_pollJobStatus` cũ (nó đọc/ghi `meeting.status`, W3.3).
+- Nudge tóm tắt cũ (T-W8) dùng chung, kích hoạt khi **bất kỳ** part nào refine xong.
+- **Không** đổi UI rename người nói (W11.2 — vẫn theo part).
+
+---
+
+## W15. Task Breakdown — cập nhật §W6 cho nhánh multi-part
+
+Các task §W6 giữ nguyên. Thay đổi/bổ sung:
+
+| # | Task | File | Phụ thuộc | Acceptance |
+|---|---|---|---|---|
+| T-W1 *(mở rộng)* | `server/refine.js`: thêm `applyPartRefineResult`, `markPartRefineRunning`, `markPartRefineFailed` — **hàm thuần, meeting-in → meeting-out**, luôn kết thúc bằng `rebuildMergedMeeting` | `server/refine.js` | — | `node --test`: 3 bất biến ở §W12 được assert riêng từng cái |
+| T-W2 *(mở rộng)* | `JOB_MODES` có `ownsPartStatus`; `pumpJobQueue` **hỏi bảng** thay vì gọi `markPartRunning` vô điều kiện | `server.js:753-767, 819-880` | T-W1 | Test hồi quy: import multi-part cũ (`mode` vắng mặt) chạy **y hệt** trước |
+| T-W10 **(mới)** | `normalizePart` giữ được `refine`/`previousTranscript`/`previousTranslations`/`transcriptSource`/`usageBreakdown` qua mọi lần chuẩn hoá lặp lại | `server/meeting-parts.js:57-83` | — | Test: `normalizePart(normalizePart(x))` bất biến (bẫy W10.9-style đã từng gây bug `clampNullableNonNegativeNumber`) |
+| T-W11 **(mới)** | `aggregateUsage` cộng theo `usageBreakdown` khi có, rơi về `part.usage` khi không | `server/meeting-parts.js:132-157` | T-W10 | Test: part chạy 2 lần ⇒ `sonioxUsage.estimatedCostUsd` = tổng 2 lần, **không** phải lần cuối |
+| T-W12 **(mới)** | `preserveServerOwnedFields`/`applyTranscriptEdits` không làm rơi field mới; edit transcript **trong lúc** refine chạy vẫn áp đúng part | `server/meeting-parts.js:299-347` | T-W10 | Test: PUT snapshot client trong lúc `refine.status==='running'` ⇒ `refine` + `previousTranscript` còn nguyên |
+| T-W3 *(mở rộng)* | Endpoint W13.1 với nhánh `mode:'parts'`, `skipped[]`, dedupe theo từng part | `server.js` | T-W1, T-W10 | 409/422/400 đúng bảng; 3 part ⇒ tạo đúng 3 job có `partId` khác nhau |
+| T-W13 **(mới)** | Projection `GET …/parts` + `refiningParts` | `server.js:1649-1666`, `meeting-parts.js:162-180` | T-W3 | Client poll thấy được trạng thái refine mà **không** tải transcript |
+| T-W5 *(mở rộng)* | UI §W14 (hộp chọn phần, chip theo part, chỉ báo "2/3 phần") | `js/app.js`, có thể `js/parts.js` | T-W13 | Chạy thật: refine part 2 của bản ghi 3 phần ⇒ part 1/3 hiển thị **không gián đoạn**, part 2 được thay khi xong |
+| T-W14 **(mới, Protocol 8)** | **Test canh giữ**: khẳng định `prompts.js` vẫn phát dòng cảnh báo nhãn người nói khi `partCount > 0`, kể cả sau refine — **cả `buildSummaryPrompt` lẫn `buildChunkPrompt`/`buildSynthesisPrompt`** (2 luồng tách biệt, CLAUDE.md) | `test/prompts*.test.js` | — | Test đỏ nếu ai đó xoá dòng đó |
+| T-W7 *(mở rộng)* | Smoke test Soniox thật: chạy trên **một part** và assert nhãn speaker của part khác **không** bị ảnh hưởng; golden file vào `tests/fixtures/soniox/` | `test/` | T-W6 | Protocol 5.4; **mock viết tay = reject** |
+| T-W9 *(mở rộng)* | QA chạy xuyên suốt bản ghi ghép **thật** ≥ 3 phần: refine 1 phần, kiểm **nội dung transcript cuối** + `sonioxUsage` cộng dồn + `missingParts` không đổi | QA | tất cả | Ghi vào `docs/test-report.md` — **APPEND, không ghi đè** |
+
+Thứ tự: T-W10 → T-W1 → T-W2 → T-W11/T-W12 → T-W3 → T-W13 → T-W5 → T-W14 → T-W6/T-W7 → T-W8 → T-W9.
+**T-W6 + T-W7** (gửi `context` cho batch Soniox) vẫn là miếng độc lập, rẻ nhất, và giờ **có giá trị gấp đôi**: nó chính là nội dung của G1 (W10.16) — thứ duy nhất khiến refine một part đã `completed` có khả năng cho kết quả khác lần chạy đầu. **Nếu không làm T-W6 trước, refine multi-part gần như chỉ chạy lại y hệt cấu hình cũ và tốn tiền vô ích.** Đề xuất: T-W6/T-W7 lên **đầu hàng đợi**, trước cả T-W3.
+
+---
+
+## W16. Technical Decisions bổ sung (WHY) + escalation còn lại
+
+| # | Quyết định | WHY |
+|---|---|---|
+| WHY-W7 | Per-part, không ghép audio | Giới hạn **300 phút/file cứng** của Soniox (§W9-S3) khiến ghép audio là đánh đổi tệ; ghép còn kéo theo `ffmpeg` (dependency + subprocess + Protocol 5 mới) và phá mô hình `parts` (timeline, edit theo part, retry theo part) |
+| WHY-W8 | Refine **không** đụng `part.status` | `part.status` là input của `overallStatus` + `buildMergedTranscript` (W10.10). Dùng lại nó khiến transcript đang đọc **biến mất** và cả bản ghi trông như đang lỗi/đang xử lý |
+| WHY-W9 | Không tái sử dụng `retryPart` | `retryPart` xoá trắng transcript trước khi chạy (W10.9) — đúng cho "part chưa bao giờ xong", sai cho "part đã xong". Hai nút, hai ngữ nghĩa |
+| WHY-W10 | Backup ở **part**, không ở meeting | `meeting.transcript` của bản ghi ghép là field dẫn xuất (W10.4); backup ở đó sẽ bị `rebuildMergedMeeting` ghi đè ở lần rebuild kế tiếp |
+| WHY-W11 | Giữ nguyên cảnh báo nhãn người nói ở `prompts.js` | Protocol 8.2 deny-by-default: không có nguồn nào cho thấy hợp nhất được nhãn giữa các session (W11.2) |
+| WHY-W12 | N job thay vì 1 job tổng | Dedupe, watchdog, hạn mức đồng thời, retry đều đã hoạt động ở mức **job/part**. Job tổng phải viết lại cả bốn thứ đó |
+
+**Escalation còn lại sau quyết định của PM:**
+
+| ID | Vấn đề | Đề xuất |
+|---|---|---|
+| ~~E-W1~~, ~~E-W4~~ | — | ✅ đã quyết, xem §W8 |
+| **E-W2** | Giới hạn an toàn khi tự động chạy | **Không còn áp dụng** — E-W1=(a) đã bỏ chế độ tự động. Vẫn giữ 1 kiểm tra kỹ thuật: part nào tự nó > **300 phút** ⇒ `skipped` với `reason:'PART_TOO_LONG'` (giới hạn cứng của Soniox, §W9-S3) |
+| **E-W3** | `translations` rỗng sau refine (người dùng không chọn ngôn ngữ dịch) | Vẫn mở. Áp dụng **cùng một luật cho cả 2 nhánh**: kết quả `translations` rỗng ⇒ **giữ** `previousTranslations`, không ghi đè bằng mảng rỗng |
+| **E-W5** | D-W2 là *experimental* | Vẫn mở, và **nặng hơn với multi-part**: nếu T-W6 không làm trước, refine một part đã `completed` chỉ là chạy lại cấu hình cũ ⇒ tốn tiền mà gần như không đổi kết quả. Đề nghị PM chốt: **T-W6 nằm trong phạm vi v1** |
+| **E-W6** *(mới)* | Refine **không** làm nhãn người nói nhất quán giữa các part (W11.2) — nếu đây chính là nỗi đau người dùng đang gặp với bản ghi ghép thì refine **không chữa được** | Cần PM/BA hỏi lại người dùng: nhầm speaker đang xảy ra **trong cùng một phần** (refine + D-W1/D-W2 có cửa) hay **giữa các phần** (chỉ phương án B ghép audio mới giải quyết, chi phí lớn hơn hẳn, nên là feature riêng). **Không tự chọn thay người dùng** |
+
+---
+
+⏸ **CHECKPOINT (Protocol 2) — CHỜ PM DUYỆT §W10–§W16.** Dev **chưa** được bắt đầu phần multi-part. Cần chốt **E-W3**, **E-W5** (T-W6 có nằm trong v1 không) và **E-W6** (nỗi đau thật là trong-part hay giữa-part). Mọi nhãn `[UNVERIFIED]` ở §W9 vẫn nguyên hiệu lực.

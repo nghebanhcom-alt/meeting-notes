@@ -1,0 +1,40 @@
+{
+  "_capturedAt": "2026-09-22",
+  "_capturedBy": "Dev, T-W7 smoke test for T-W6 batch `context` (Protocol 5.4)",
+  "_method": "Real Soniox API key already present in this dev machine's macOS Keychain (account soniox-api-key, never read/printed by this process). Generated a real ~5.6s Vietnamese speech WAV on-device via `say -v Linh -o sample.wav --data-format=LEI16@16000 \"Xin chao cac ban, hom nay chung ta hop de ban ve ke hoach quy bon.\"`. Called server/stt/providers/soniox.js's createSonioxAdapter().transcribe() DIRECTLY (temporary script, not committed) with meetingTitle='Q4 Planning Sync' and participants=['Nguyen Van A','Tran Thi B','Le Van C'] so buildSonioxContext() (server/stt/soniox-context.js) produced a non-empty `context` object and it was sent as part of the real POST /v1/transcriptions body. The call completed with no error (no 400/422 from Soniox rejecting the context schema) and returned a valid transcript — this is the object transcribe() returned, unmodified.",
+  "input": {
+    "text": "Xin chao cac ban, hom nay chung ta hop de ban ve ke hoach quy bon.",
+    "voice": "Linh (vi_VN, macOS `say`)",
+    "sampleRateHz": 16000,
+    "format": "wav",
+    "meetingTitle": "Q4 Planning Sync",
+    "participants": ["Nguyen Van A", "Tran Thi B", "Le Van C"],
+    "contextSentToSoniox": {
+      "general": [
+        { "key": "domain", "value": "Business meeting" },
+        { "key": "topic", "value": "Q4 Planning Sync" },
+        { "key": "speakers", "value": "3 speakers" },
+        { "key": "participants", "value": "Nguyen Van A, Tran Thi B, Le Van C" }
+      ]
+    }
+  },
+  "raw": {
+    "transcript": [
+      { "text": "Xin chào các bạn, hôm nay chúng ta họp để bàn về kế hoạch của bảng.", "time": 0.27, "speaker": "Speaker 1", "language": "vi" }
+    ],
+    "translations": [],
+    "duration": 5,
+    "durationKind": "audio-length",
+    "model": "stt-async-v5"
+  },
+  "expectedNormalized": {
+    "transcript": [
+      { "text": "Xin chào các bạn, hôm nay chúng ta họp để bàn về kế hoạch của bảng.", "time": 0.27, "speaker": "Speaker 1", "language": "vi" }
+    ],
+    "translations": [],
+    "duration": 5,
+    "durationKind": "audio-length",
+    "model": "stt-async-v5",
+    "provider": "soniox"
+  }
+}

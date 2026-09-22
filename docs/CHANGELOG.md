@@ -1691,3 +1691,57 @@ calling the existing helper (`js/storage.js:272`).
   as the old hardcoded `action.done = true`.
 - `npm test`: 243 passing / 2 skipped (no API key, Protocol 5.4) / 0 failing.
 - `npm test`: 243 passing / 2 skipped (unrelated) / 0 failing, before and after the scroll fix.
+
+## 2026-09-22 — T-W6: batch Soniox now sends `context` (D-W1/D-W2/D-W3)
+
+Implemented T-W6 from `docs/Architecture.md` §W5.4/§W6. Batch transcription
+(`server/stt/providers/soniox.js`) previously sent no `context` at all (§W1.11), unlike the
+live websocket path (`js/transcriber.js:_buildContext`).
+
+- `server/stt/soniox-context.js` (new): `buildSonioxContext({ title, participants }, { onWarning })`
+  — pure function, same `general` shape as the live path (`domain`/`topic`/`participants`), plus:
+  - D-W2: a `{ key: 'speakers', value: '<N> speakers' }` pair when `participants` is non-empty,
+    matching the official Soniox example verbatim (§W5.2). Labelled experimental in the doc — no
+    comment/log here claims it improves accuracy (E-W5).
+  - D-W3: calls `onWarning(message)` (never throws) when participants > 15, since Soniox only
+    supports up to 15 speakers per session.
+  - Hard caps enforced regardless of input size: `general` ≤ 10 pairs, total context ≤ ~10,000
+    chars. Over budget → drops the `participants` pair first, keeps `speakers`/`topic` (never
+    sends an oversized request that Soniox would reject with `invalid_request`).
+- `server/stt/providers/soniox.js`: `transcribe()` now accepts `meetingTitle`/`participants` and
+  passes `buildSonioxContext(...)` as `context` in the `/v1/transcriptions` POST body.
+- `server/stt/index.js`: `transcribe()` threads `meetingTitle`/`participants` through to the
+  adapter (other adapters destructure and ignore the extra fields, unaffected).
+- `server.js` (`runTranscriptionJob`): loads the meeting via `readJson(MEETINGS_FILE, [])` and
+  passes `meeting.title`/`meeting.participants` into `stt.transcribe(...)`. Same meeting-level
+  fields are used regardless of `job.partId` (participants don't vary per part).
+- `test/soniox-context.test.js` (new, 11 cases, pure `node --test`, no network): covers D-W1
+  (domain/topic present with no participants), D-W2 (`speakers` only appears when participants
+  are known, blank names filtered before counting), D-W3 (warns at >15, not at exactly 15, never
+  throws without a callback), and both hard caps (pair count, total char budget, `speakers`/
+  `topic` kept over `participants` when truncating).
+- Out of scope (per task boundary): T-W7 (golden-file smoke test against the real Soniox API) —
+  not started.
+- `npm test`: 254 passing / 2 skipped (no API key, Protocol 5.4) / 0 failing.
+
+## 2026-09-22 — T-W7: real-API smoke test for Soniox batch `context` (Protocol 5.4)
+
+- Verified the Soniox API key already present in this dev machine's macOS Keychain (account
+  `soniox-api-key`, per `server/stt/index.js`'s `SECRET_CONFIG`) — confirmed present, never
+  read/printed by any committed code.
+- Generated a real ~5.6s Vietnamese WAV on-device (`say -v Linh --data-format=LEI16@16000`,
+  matches `PROVIDER_FORMATS.soniox.accepted` in `server/stt/formats.js`), stored only in the
+  session scratchpad (not committed).
+- Called `server/stt/providers/soniox.js`'s `createSonioxAdapter().transcribe()` directly (temp
+  script, deleted after the run — not committed) with `meetingTitle: 'Q4 Planning Sync'` and 3
+  fake `participants`, so `buildSonioxContext()` (`server/stt/soniox-context.js`) produced a
+  non-empty `context` and it was actually sent in the real `/v1/transcriptions` POST body.
+- Result: request succeeded end-to-end (upload → create transcription with `context` → poll →
+  fetch transcript → cleanup), no 400/422 from Soniox rejecting the `context` shape, and a valid
+  Vietnamese transcript came back. This confirms T-W6's `context` field is accepted by the real
+  API, closing the Protocol 5.4 gap the Reviewer flagged.
+- New golden fixture: `tests/fixtures/soniox/real-transcribe-with-context.json` (raw response +
+  `normalizeResult()` output, `_capturedBy`/`_method` document exactly how it was captured, same
+  format as `tests/fixtures/soniox/real-transcribe-vi.json`). No new automated test added against
+  it per task scope — the fixture itself is the Protocol 5.4 evidence; `npm test` unaffected
+  (still 254 passing / 2 skipped / 0 failing).

@@ -2168,3 +2168,154 @@ N/A — không liên quan external dependency.
 - Chọn tái dùng `toggleActionItem()` thay vì tạo thêm `setActionItemDone()` mới — đơn giản hơn gợi
   ý ban đầu của Reviewer, và vẫn đúng vì đã verify được invariant "modal chỉ chứa item false" giữ
   cho phép toggle tương đương set true trong ngữ cảnh gọi hiện tại.
+
+# Review Report — 2026-09-22 (T-W6: Batch Soniox gửi `context`)
+
+## Verdict: APPROVE
+
+Đọc `git diff`/`git status` thật (không tin mô tả Dev) trên: `server/stt/soniox-context.js` (mới),
+`server/stt/providers/soniox.js`, `server/stt/index.js`, `server.js` (`runTranscriptionJob`),
+`test/soniox-context.test.js` (mới), `docs/CHANGELOG.md`. Đối chiếu với Architecture.md §W5.1–W5.4,
+§W6 (bảng task T-W6/T-W7), §W9-S1/S2.
+
+## Issues Found
+
+### Critical
+(none)
+
+### High
+- [ ] `server/stt/providers/soniox.js:129-138` + `server/stt/soniox-context.js` — T-W6 bắt đầu gửi
+  field `context` thật lên `POST /v1/transcriptions` trong mọi job batch production (không phải
+  đường phụ, đây là request chính của mọi lần transcribe qua Soniox từ giờ trở đi), nhưng T-W7
+  (smoke test thật + golden file, Protocol 5.4) **chưa làm** — CHANGELOG tự ghi rõ "Out of scope:
+  T-W7 ... not started", `test/soniox-context.test.js:4` cũng tự ghi "Soniox smoke test is T-W7,
+  out of scope here". Shape `context.general` (mảng key/value, ≤10 cặp, ≤~10.000 ký tự) được lấy
+  từ đọc trực tiếp doc chính thức (§W9-S1/S2, không phải `[UNVERIFIED]`) nên **không** vi phạm
+  Process gate của Protocol 5 (không implement trên contract còn treo `[UNVERIFIED]`, không phải
+  mock viết tay không golden file — 11 test đều là pure-logic assertion trên hàm nội bộ, không giả
+  lập response Soniox). Nhưng Protocol 5 mục 4 vẫn đòi "bắt buộc chạy xanh ở máy Dev **trước khi
+  đóng task**" cho mọi external dependency mới đụng tới — ở đây task "đóng" theo nghĩa merge/deploy
+  code đổi request thật thì chưa nên coi là xong cho tới khi T-W7 chạy ít nhất 1 lần thật.
+  → Gợi ý: merge được (T-W6 tự nó đúng, có test thuần đầy đủ, đúng acceptance trong bảng W6), nhưng
+  **không deploy/bật đường batch Soniox cho user thật cho tới khi T-W7 chạy xanh** trên máy Dev với
+  API key thật, và golden file phải được lưu vào `tests/fixtures/soniox/` như Architecture yêu cầu.
+  Nếu PM/Dev coi đây là 2 task tách biệt có thể ship riêng, ít nhất phải ghi rõ trong
+  `project_state.json`/PRD rằng T-W6 merged nhưng feature "gửi context" chưa go-live cho tới khi có
+  T-W7 xanh — tránh tình huống "đã merge" bị hiểu nhầm thành "đã an toàn với Soniox thật".
+
+### Medium
+- [ ] `server/stt/soniox-context.js:61-77` (`enforceLimits`) — invariant nêu trong comment dòng
+  48-50 ("keep 'speakers' and 'topic' first") không được code bảo đảm tuyệt đối: vòng `while` ở
+  dòng 72-75 pop từ cuối mảng `[...kept, ...rest]`, nên nếu tổng độ dài của riêng `speakers` +
+  `topic` từng vượt `MAX_CONTEXT_CHARS` (hiện không xảy ra vì `topic` bị cap ở 500 ký tự và
+  `speakers` luôn ngắn, nhưng cap đó nằm ở hàm khác, không phải invariant được `enforceLimits` tự
+  verify), `topic` vẫn có thể bị pop dù comment nói "giữ trước". Không phải bug thực tế với dữ liệu
+  hiện tại (đã verify bằng tay: `title` cap 500 ký tự ở dòng 22, `speakers` value cực ngắn), nhưng
+  là **implicit coupling** giữa 2 hàm không được test/assert tường minh. Gợi ý: thêm 1 assertion
+  hoặc comment ở đầu `buildSonioxContext` nói rõ vì sao `topic`/`speakers` không bao giờ đủ lớn để
+  bị `enforceLimits` pop, hoặc test riêng case pathological (title dài kịch cap + rất nhiều
+  participants) để khẳng định `speakers`/`topic` sống sót — hiện có test `hard cap: total context
+  stays within...` (`test/soniox-context.test.js:89-98`) dùng `hugeTitle = 'T'.repeat(9_500)` khá
+  gần biên nhưng không test trường hợp `topic` alone gần chạm `MAX_CONTEXT_CHARS`.
+- [ ] `server/stt/soniox-context.js:42` vs `js/transcriber.js:203-206` — batch cap `participants`
+  join ở `slice(0, 20_000)` (không giới hạn số người trước khi join), còn live path cap ở
+  `slice(0, 100)` người trước khi join và `slice(0, 2000)` ký tự sau khi join. Hai cap khác nhau
+  đáng kể (20k vs 2k ký tự) dù cùng mục đích và cùng comment "same shape as the live path" trong
+  CHANGELOG. Không phải bug (mỗi bên có `enforceLimits`/budget riêng của nó và batch có
+  `MAX_CONTEXT_CHARS` tổng thể chặn ở tầng sau), nhưng gây khó hiểu khi đọc code nếu không biết 2
+  file độc lập — gợi ý ghi chú rõ trong comment vì sao hai con số cap khác nhau, hoặc rút cap batch
+  xuống gần giá trị live để giảm bất ngờ.
+
+### Low
+- [ ] `server.js:822-824` (`runTranscriptionJob`) — mỗi job giờ gọi thêm 1 lần
+  `readJson(MEETINGS_FILE, [])` đầy đủ (đọc lại toàn bộ file JSON meetings) chỉ để lấy
+  `title`/`participants` của đúng 1 meeting. Không phải vấn đề đúng/sai (đã trace: `job.meetingId`
+  dùng để tìm đúng meeting cha, đúng như comment nói, kể cả khi job chạy cho 1 `partId` — xem mục
+  Data lineage bên dưới), chỉ là 1 I/O read thêm mỗi job; với file `meetings.json` lớn có thể là
+  overhead nhỏ nhưng đáng lưu ý nếu sau này có nhiều job chạy song song (đã có
+  `MAX_CONCURRENT_TRANSCRIPTIONS = 2` nên rủi ro thấp). Không chặn approve.
+
+## Data lineage (Protocol 6) — trace bằng tay
+`runTranscriptionJob` (`server.js:819-834`): `audio = openStoredAudio(job.partId || job.meetingId)`
+— giữ nguyên logic cũ, dùng `partId` khi có để load đúng audio của phần đó (multi-part). Dòng mới
+thêm: `meetings = readJson(MEETINGS_FILE, [])` rồi `meeting = meetings.find(m => m.id ===
+job.meetingId)` — **luôn dùng `job.meetingId`**, không phải `job.partId`, để tìm meeting. Đây là
+đúng theo comment dòng 822-823 ("title/participants are meeting-level (same across parts)") và
+đúng theo Architecture (participants là field ở meeting cha, không lặp lại theo từng part). Đã xác
+nhận: kể cả khi job thuộc 1 part cụ thể (`job.partId` khác `job.meetingId`), `meeting.title`/
+`meeting.participants` vẫn lấy từ đúng meeting cha (multi-part), không lấy nhầm field của part
+hay của job khác — không có lỗi silent-wrong-source ở đây. `meeting` có thể `undefined` nếu
+meeting bị xoá giữa chừng (race hiếm) → `meeting?.title`/`meeting?.participants` là `undefined` →
+`buildSonioxContext` xử lý graceful (title fallback "Meeting", participants rỗng), không throw,
+không crash job — đã verify trong `soniox-context.js:18-26`.
+
+`server/stt/index.js:102/117` → `server/stt/providers/soniox.js:112` → `buildSonioxContext(...)`
+tại dòng 130-133: nhận đúng `meetingTitle`/`participants` được thread xuyên suốt từ
+`runTranscriptionJob`, không bị đổi tên/đổi field giữa các tầng. Adapter khác (`google.js:89`,
+`deepgram.js:102`, `whisper.js:71`) chỉ destructure `{ audio, language, model }` — 2 field mới
+(`meetingTitle`, `participants`) bị bỏ qua hoàn toàn, không side effect, đã verify bằng grep chữ ký
+`transcribe()` của cả 4 provider.
+
+## Nội dung ràng buộc Soniox — đối chiếu Architecture §W5.2/§W9-S2
+`MAX_GENERAL_PAIRS = 10`, `MAX_CONTEXT_CHARS = 10_000` (`soniox-context.js:12-13`) khớp đúng con số
+Architecture ghi ("`general` nên ≤ 10 cặp key-value; tổng context ≤ 8.000 token (~10.000 ký tự)").
+`speakers` value dùng đúng khuôn `"<N> speakers"` như ví dụ chính thức trích trong §W5.2. Cả 2 nơi
+(Architecture và code) đều lấy từ cùng 1 nguồn đã đọc trực tiếp doc Soniox (§W9-S1/S2) trong phiên
+Tech Lead trước đó — không phải Dev tự suy đoán số liệu.
+
+## D-W2 experimental — không hứa hẹn sai
+Verify: comment dòng 16-17 và dòng 37 trong `soniox-context.js` gọi rõ `speakers` là "experimental"
+D-W2, không có chữ nào trong code/comment/CHANGENOG khẳng định "cải thiện độ chính xác". CHANGELOG
+(`docs/CHANGELOG.md`, mục 2026-09-22) viết "Labelled experimental in the doc — no comment/log here
+claims it improves accuracy (E-W5)" — đúng yêu cầu W5.2/E-W5. D-W3 cảnh báo >15 người dùng
+`console.warn` qua callback `onWarning`, không throw, không chặn transcription — đúng tinh thần
+"cảnh báo, không phải hard block" ghi ở Architecture.
+
+## Bảo mật
+Không có endpoint mới (đúng — thay đổi chỉ ở tầng transcribe nội bộ, không đụng route `/api/*`,
+không cần qua lại `isTrustedApiRequest`/`hasTrustedHost`). Không ghi API key ra file/trả về client
+(không đụng tới keychain logic). Không có `child_process.spawn` mới. ID audio vẫn dùng
+`openStoredAudio(job.partId || job.meetingId)` như cũ (hash-based), không đổi. `title`/
+`participants` là user input đi vào chuỗi gửi lên Soniox (outbound 3rd-party API, không phải
+injection nội bộ) — đã kiểm việc cắt chuỗi (`slice`) không gây JSON malformed: `context` được gửi
+qua `JSON.stringify` chuẩn của `fetch`/`sonioxJson` (không tự ráp JSON string tay), nên kể cả
+`slice()` cắt giữa 1 surrogate pair (emoji trong tên người) sinh ra lone surrogate, `JSON.stringify`
+vẫn escape hợp lệ (`\udXXX`) — không tạo JSON hỏng cú pháp, chỉ có thể làm 1 ký tự hiển thị sai,
+không phải lỗi bảo mật hay crash.
+
+## Provider khác không bị ảnh hưởng
+Xác nhận bằng grep chữ ký `transcribe()` — `google.js`, `deepgram.js`, `whisper.js` chỉ destructure
+`{ audio, language, model }`, không có `meetingTitle`/`participants` trong signature → 2 field mới
+truyền xuống bị JS bỏ qua tự nhiên, không cần code phòng thủ thêm. Đúng như Dev báo cáo.
+
+## Test
+Tự chạy `npm test`: **254 passing / 2 skipped (whisper/google golden fixture — thiếu API key, đã
+biết từ trước, không liên quan T-W6) / 0 failing**. 11 test mới trong
+`test/soniox-context.test.js` đều là pure-logic (không network, không mock Soniox response) — đúng
+tinh thần "không viết mock giả lập response thật" vì hàm này không gọi Soniox, chỉ build request
+body; phần cần mock/golden file thật (response Soniox) là T-W7, chưa tới lượt.
+
+## External contract verification
+**NO — chỉ theo Architecture.md** (shape `context.general`, cap 10 cặp/10.000 ký tự lấy từ
+Architecture §W9-S1/S2, vốn đã được Tech Lead đọc trực tiếp doc Soniox trong phiên trước — không
+phải Dev tự đọc lại trong phiên này). T-W7 (smoke test gọi Soniox thật + golden file) **chưa chạy**
+— xem issue High ở trên. Đây không phải vi phạm Process gate (contract không mang nhãn
+`[UNVERIFIED]`, không có mock viết tay giả lập response), nhưng là điều kiện cần trước khi
+feature này go-live với user thật.
+
+## Positive Notes
+- Tách `soniox-context.js` thành pure function độc lập, dễ test, đúng gợi ý trong Architecture
+  ("có thể tách server/stt/soniox-context.js") — không nhét logic build context thẳng vào
+  `soniox.js`.
+- Comment trong code trỏ thẳng về đúng section Architecture (`T-W6`, `§W5.4/§W6`, `D-W1/D-W2/D-W3`)
+  — dễ trace ngược khi cần đối chiếu lại quyết định.
+- CHANGELOG tự giác ghi rõ "Out of scope: T-W7 ... not started" thay vì im lặng bỏ qua — đúng tinh
+  thần minh bạch Protocol 1/5, giúp Reviewer/QA không bị đánh lừa là feature đã hoàn chỉnh.
+- `enforceLimits` có chiến lược ưu tiên rõ ràng (drop `participants` trước, giữ `speakers`/`topic`)
+  thay vì cắt cứng theo thứ tự mảng gốc — đúng tinh thần "giữ tín hiệu quan trọng nhất khi phải cắt
+  bớt" dù còn 1 edge case lý thuyết chưa được assert tường minh (xem Medium).
+- Test D-W3 kiểm cả biên chính xác (15 không warn, 16 warn) thay vì chỉ test 1 giá trị — đúng thói
+  quen test boundary tốt.
+- `runTranscriptionJob` xử lý `meeting` có thể `undefined` một cách graceful thay vì giả định luôn
+  tồn tại — tránh crash job vì lý do phụ (context) trong khi phần chính (transcribe audio) vẫn nên
+  chạy được.

@@ -819,13 +819,19 @@ async function finishJob(job, patch) {
 async function runTranscriptionJob(job) {
   try {
     const audio = await openStoredAudio(job.partId || job.meetingId);
+    // title/participants are meeting-level (same across parts) — only used
+    // to build the Soniox `context` (T-W6); other providers ignore them.
+    const meetings = await readJson(MEETINGS_FILE, []);
+    const meeting = meetings.find(m => m.id === job.meetingId);
     const result = await stt.transcribe({
       providerId: job.provider,
       modelId: job.model,
       audioMeta: audio.meta,
       loadAudio: audio.load,
       language: job.language,
-      translationLanguage: job.translationLanguage
+      translationLanguage: job.translationLanguage,
+      meetingTitle: meeting?.title,
+      participants: meeting?.participants
     });
 
     const provider = result.provider || job.provider || 'soniox';

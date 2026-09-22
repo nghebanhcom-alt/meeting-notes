@@ -17,7 +17,7 @@
     "architecture_v3": "docs/Architecture.md §V (660-1443)"
   },
   "iterations": {
-    "dev_reviewer": 1,
+    "dev_reviewer": 2,
     "dev_qa": 1
   },
   "status": "in_progress",
@@ -127,6 +127,13 @@
       "file": "server.js, test/parts-routes.test.js",
       "status": "fix_applied_pending_reviewer_round_2",
       "note": "Fixes sole Medium from docs/review-report.md 2026-09-22 round. Added part.refine, part.transcriptSource, meeting.refiningParts to the GET /api/meetings/:id/parts projection (minimal addition, no other field touched). npm test: 276 passing / 2 skipped / 0 failing (1 new test, 0 regressions). Protocol 3: Dev-Reviewer round 1/3 used. NOT self-declared done -- awaiting real Reviewer pass."
+    },
+    {
+      "date": "2026-09-22",
+      "title": "T-W5-T-W8-T-W14-refine-transcript-UI-manual-button-chips-poller-nudge",
+      "file": "js/app.js, js/summary-staleness.js",
+      "status": "code_complete_pending_review",
+      "note": "Architecture.md SW4.4/SW14/T-W5/T-W8/T-W14. UI only, no server file touched, backend already Reviewer-approved and committed (b5997d6). Added: manual Tinh chinh transcript button + status chip (single-meeting header) and per-part picker modal + per-part chip in transcript-part-divider + refiningParts progress line (multi-part); _pollRefineJob/_pollRefinePartsStatus as separate pollers (new _activeRefinePollers Map, do not touch meeting.status per WHY-W3/WHY-W8); js/summary-staleness.js gained isTranscriptStaleAfterRefine (new function, isPreMeetingInfoStale untouched) plus _refineStaleHint nudge in the Summary tab. No auto-trigger/setting added (E-W1 = manual only). npm test: 276 passing / 2 skipped / 0 failing (server-only suite, run as a no-op regression check since no server file changed). Protocol 7: NOT yet reviewed -- no Reviewer spawned in this session, docs/review-report.md not updated for this change. Do not treat as done until a Reviewer round runs."
     }
   ]
 }

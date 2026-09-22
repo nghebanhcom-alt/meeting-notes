@@ -1909,3 +1909,123 @@ touched here.
 - Not self-declared "done" — this is Dev round 2 of the Dev↔Reviewer cycle (Protocol 3, round
   1/3 used by the original Medium finding), awaiting a real Reviewer pass before being reported
   as closed.
+
+## 2026-09-22 — T-W5/T-W8/T-W14 UI: manual "Tinh chỉnh transcript" button, chips, poller, nudge
+
+UI-only change on top of the already-approved-and-committed backend (`b5997d6`,
+`server/refine.js`, `POST /api/meetings/:id/refine-transcript`, `GET
+/api/meetings/:id/parts` refine fields). No server file touched, no test in
+`test/*.test.js` added on purpose (project convention — no jsdom, `js/*.js` has
+no automated test harness, per prior note).
+
+- `js/app.js` — `_renderMeetingDetail`:
+  - Single-meeting (no `parts`, has `audioId`): "Tinh chỉnh transcript" button next to
+    Export/Delete in the header (`#refine-transcript-btn`, disabled while
+    `meeting.refine.status === 'running'`), plus a status chip next to the existing
+    status badges (`_refineStatusChipHtml`) — running (`⟳ Đang tinh chỉnh
+    transcript…`) / done (`✓ Đã tinh chỉnh (bản đầy đủ)`) / failed (`Giữ bản trực
+    tiếp` + inline `Thử lại` button, `#refine-retry-btn`). No chip when
+    `meeting.refine` doesn't exist yet (never refined).
+  - Multi-part (`caps.multiPart`): "Tinh chỉnh transcript" button in the per-part
+    playback card (`#refine-parts-btn`, `_renderPartsPlaybackCard`), shown only when
+    at least one part is `completed`. Opens `_openRefinePartsModal` — a picker with
+    one checkbox per part, default-ticked for every part eligible right now
+    (`completed` + not already refining), disabled+labelled with the reason
+    otherwise (never omitted, so the user sees why a part can't be picked). Submits
+    `POST …/refine-transcript` with `{ partIds }` (§W13.1 `mode:'parts'`).
+  - Per-part refine chip (`_partRefineChipHtml`) rendered inline inside that part's
+    `.transcript-part-divider` (looked up by the divider segment's existing
+    `partId` field, §`server/stt/merge.js` `dividerSegment`) — same
+    running/done/failed vocabulary as the single-meeting chip, failed state gets its
+    own `data-action="retry-refine-part"` button that retries just that one part.
+  - `Đang tinh chỉnh N/M phần…` line in the parts playback card, read from
+    `meeting.refiningParts` (§W13.2) — cheap, no transcript fetch needed.
+- `js/app.js` — pollers, deliberately NOT reusing `_pollJobStatus`/`_pollPartsStatus`
+  (both read/write `meeting.status`, which refine must never touch — WHY-W3/WHY-W8):
+  - `_pollRefineJob(meetingId, jobId)`: single-meeting variant polling `GET
+    /api/jobs/:id`. On 404 falls back to reading `meeting.refine.status` directly
+    (re-submitting on 404, like the old poller does, would be wrong here — R-W1
+    already guarantees the live transcript survived regardless of outcome, so
+    there's nothing to "recover").
+  - `_pollRefinePartsStatus(meetingId)`: multi-part variant polling the existing
+    `GET …/parts` projection, stops when `refiningParts` is empty.
+  - Both use a new `_activeRefinePollers` Map, separate from `_activePollers`, so a
+    refine poll and an unrelated transcription poll for the same `meetingId` can
+    never clobber each other's `setTimeout` handle.
+  - Failure path uses `toast(..., 'info')`, never the red `'error'` toast the legacy
+    import flow uses for "Audio processing failed" — per W4.4, nothing is lost on a
+    failed refine (the live transcript is untouched), so an alarming red toast would
+    misrepresent the situation.
+- `js/summary-staleness.js` — **added** `isTranscriptStaleAfterRefine(meeting)`
+  (did not touch `isPreMeetingInfoStale`, per explicit instruction). Compares
+  `meeting.summaryGeneration.generatedAt` against every refine `finishedAt` that
+  actually replaced a transcript (`status === 'done'`) — the single-meeting
+  `meeting.refine` and every `part.refine` for merged recordings (§W14: nudge fires
+  when *any* part finishes refining). Deny-by-default: no summary yet, or no refine
+  ever finished, → `false`, same discipline as the existing function (never a
+  false-positive nudge).
+- `js/app.js` — `_refineStaleHint(meeting)`, rendered in the Summary tab right above
+  `#summary-provenance` (same placement pattern as `_preMeetingStaleHint` in the
+  Pre-meeting info card): one line, "Transcript đã được tinh chỉnh sau lần tạo tóm
+  tắt này — cân nhắc Regenerate để dùng bản đầy đủ."
+- Explicitly did NOT add: any "auto-refine after recording" trigger or settings
+  toggle — E-W1 chose (a), manual button only, and Architecture.md's W4.4 note about
+  an automatic-refine setting toggle is superseded by that decision (§W8/E-W1 in
+  Architecture.md marks it "bỏ công tắc 'tự động'").
+- `npm test`: **276 passing / 2 skipped (no API key, Protocol 5.4) / 0 failing** — no
+  server file was touched by this task, this run is a regression check only.
+- Not self-declared "done" — Protocol 7 requires a real Reviewer pass (this is
+  UI-only behavior change, not comment/docs-only, so the Reviewer gate is not
+  exempt) before this is reported as ready.
+
+## 2026-09-22 — Refine-transcript UI: fixes for Reviewer round 2 (5 issues)
+
+Fixes for `docs/review-report.md` "Refine-transcript UI" REQUEST_CHANGES round. All 5
+issues addressed in `js/app.js` and `test/summary-staleness.test.js`; no backend file
+touched.
+
+- **High #1 (`skipped[]` silent failure)** — `_startPartsRefine` now reads
+  `body.skipped` from the `POST …/refine-transcript` `{mode:'parts', jobs[],
+  skipped[]}` response and, when non-empty, shows a `warning` toast naming each
+  skipped part (`Phần N`) with a Vietnamese reason via new
+  `_refineSkipReasonVi(reason)` (`PART_TOO_LONG`, `AUDIO_NOT_FOUND`,
+  `ALREADY_RUNNING`, `PART_NOT_COMPLETED`) — separate from the later completion
+  toast, so "hoàn tất" never implies every requested part actually ran.
+  `_openRefinePartsModal` also pre-checks eligibility client-side: added
+  `App.REFINE_PART_MAX_SECONDS = 300 * 60` (comment ties it to
+  `MAX_REFINE_PART_SECONDS` in `server/refine.js`) and disables + labels
+  `(quá 300 phút, không tinh chỉnh được)` for any part whose `duration` exceeds it,
+  instead of letting the user tick it and finding out only from the server's
+  `skipped[]`. `AUDIO_NOT_FOUND` still can't be predicted client-side (no disk
+  access from the browser) — that one only surfaces via the post-submit toast, as
+  intended.
+- **High #2 (no resume poller after reload)** — added `_resumeRefiningJobs()`,
+  called from `App.init()` right after `_resumeProcessingJobs()`. Scans
+  `Storage.getAllMeetings()` for `meeting.refine.status === 'running'` (resumes
+  `_pollRefineJob(id, meeting.refine.jobId)`) or `meeting.refiningParts.length > 0`
+  (resumes `_pollRefinePartsStatus(id)`), skipping any meeting that already has an
+  active poller. Mirrors `_resumeProcessingJobs`'s scan pattern exactly so a
+  refine started right before F5/tab-close no longer leaves the "Đang tinh chỉnh…"
+  chip frozen forever.
+- **High #3 (missing test for `isTranscriptStaleAfterRefine`)** — added 7 test
+  cases to `test/summary-staleness.test.js` mirroring the existing
+  `isPreMeetingInfoStale` coverage style: stale after Generate, not-stale before
+  Generate, deny-by-default when never summarized, deny-by-default when never
+  refined, ignores a still-`running` refine, multi-part "one part stale is enough",
+  multi-part "all parts before Generate → not stale".
+- **Medium #1 (misleading success toast on partial part failure)** —
+  `_pollRefinePartsStatus` now snapshots the `partId`s that were `refine.status
+  === 'running'` at poll-start (`trackedPartIds`), and on completion counts how
+  many of *those* ended up `'failed'` (ignoring unrelated stale failures from a
+  prior, un-retried batch). Toast becomes `warning` "Tinh chỉnh xong — N phần giữ
+  bản cũ do lỗi." when `failedCount > 0`, `success` otherwise.
+- **Medium #2 (§W14 missing "N phần · tổng X phút" summary line)** —
+  `_openRefinePartsModal` adds a `#refine-parts-summary` line below the checkbox
+  list, recomputed live on every checkbox `change` from each row's
+  `data-span-seconds`, reusing `Utils.formatDurationHuman` (same helper/format
+  `js/import.js`'s multi-part picker already uses).
+- `npm test`: **283 passing / 2 skipped (no API key, Protocol 5.4) / 0 failing**
+  (was 276/2/0 before this round — +7 new tests, no backend file touched so no
+  regression risk there).
+- Not self-declared "done" — Protocol 3 round 2/3; Reviewer must re-approve before
+  this is reported as ready.

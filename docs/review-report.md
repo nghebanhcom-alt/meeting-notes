@@ -2549,3 +2549,229 @@ N/A — không có thay đổi liên quan tool bên ngoài trong vòng fix này.
   ngược bằng cách để nguyên test cũ vẫn xanh thay vì sửa nó.
 - Test mới cover cả 2 nhánh (đang refine / chưa từng refine) trong cùng 1 test, đúng tinh thần
   kiểm tra giá trị cụ thể thay vì chỉ "route trả 200".
+
+---
+
+# Review Report — 2026-09-22 (Refine-transcript UI, `js/app.js` + `js/summary-staleness.js`)
+
+Phạm vi: UI cho "Tinh chỉnh transcript" (single-meeting + multi-part), CHƯA COMMIT tại thời điểm
+review. Backend liên quan (`server.js` refine-transcript endpoint, `server/refine.js`) đã
+APPROVE ở vòng review trước (b5997d6) — không review lại phần đó ở đây trừ khi UI đọc sai field.
+Đối chiếu trực tiếp với `git diff -- js/app.js js/summary-staleness.js` (không tin mô tả Dev) và
+Architecture.md §W4.4/§W13/§W14.
+
+## Verdict: REQUEST_CHANGES
+
+## Issues Found
+
+### Critical
+(không có)
+
+### High
+- [ ] `js/app.js` `_openRefinePartsModal`/`_startPartsRefine` (khoảng dòng 2013–2075): modal chọn
+  phần chỉ tính "đủ điều kiện" bằng `part.status === 'completed' && !running` — **không** kiểm
+  tra `part.duration > MAX_REFINE_PART_SECONDS` (giới hạn 300 phút của Soniox, đã enforce ở
+  backend `server.js:2039` với reason `PART_TOO_LONG`) và không thể biết trước
+  `AUDIO_NOT_FOUND`. Một phần quá dài vẫn hiện ra **được tick sẵn, không cảnh báo**. Sau khi
+  submit, backend trả 201 với `skipped: [{partId, reason}]` cho đúng phần đó (theo W13.1), nhưng
+  `_startPartsRefine` (dòng ~2065–2075) chỉ kiểm tra `!response.ok` rồi coi là thành công tuyệt
+  đối — **không bao giờ đọc `body.skipped`**. Kết quả: người dùng chọn 3 phần, 1 phần bị skip
+  server-side, UI đóng modal, gọi `_pollRefinePartsStatus`, và khi xong chỉ hiện toast "Tinh
+  chỉnh transcript hoàn tất" — không có gì báo phần bị skip chưa từng chạy. Đây đúng là điều mục
+  #4 trong yêu cầu review đã chỉ ra cần đối chiếu `skipped[]` thật, và hiện tại UI bỏ qua hoàn
+  toàn field đó. Gợi ý sửa: sau khi `_startPartsRefine` nhận response 201, nếu `body.skipped`
+  không rỗng, toast liệt kê rõ phần nào bị bỏ qua kèm lý do (map `reason` sang tiếng Việt); đồng
+  thời ở modal, disable + hiện lý do trước cho phần vượt 300 phút bằng cách so `part.duration`
+  với hằng số (cần export `MAX_REFINE_PART_SECONDS` dùng chung hoặc hardcode đồng bộ, có comment
+  trỏ về `server/refine.js`).
+
+- [ ] `js/app.js` `_pollRefinePartsStatus` (khoảng dòng 4870–4913, phần mới đè lên bằng
+  `_activeRefinePollers`) không có đối trọng với `_resumeProcessingJobs` (dòng 4926). Pattern cũ
+  (`_activePollers`) được resume lại đúng cách sau khi reload trang nếu `meeting.status ===
+  'processing'` (dòng 4928–4952). Refine job hoàn toàn thiếu cơ chế tương đương: nếu người dùng
+  bấm "Tinh chỉnh transcript" rồi F5/đóng tab trong lúc job còn `running`, sau khi tải lại trang
+  sẽ **không có poller nào chạy lại** — `_activeRefinePollers` khởi tạo rỗng lúc `App.init()` và
+  không gì gọi `_pollRefineJob`/`_pollRefinePartsStatus` cho các meeting đang có
+  `refine.status==='running'` hoặc `refiningParts.length>0`. Chip vẫn hiện "Đang tinh chỉnh…"
+  đúng lúc tải trang (vì đọc từ storage), nhưng sẽ đứng yên mãi mãi cho tới khi người dùng tự tay
+  F5 lại đúng lúc job đã xong ở server — không có toast, không tự cập nhật. Gợi ý sửa: thêm
+  `_resumeRefiningJobs()` (song song `_resumeProcessingJobs`), gọi trong `App.init()`, quét
+  `Storage.getAllMeetings()` cho `meeting.refine?.status === 'running'` (gọi lại
+  `_pollRefineJob(id, meeting.refine.jobId)`) và `meeting.refiningParts?.length > 0` (gọi lại
+  `_pollRefinePartsStatus(id)`).
+
+- [ ] `test/summary-staleness.test.js` không có bất kỳ test nào cho `isTranscriptStaleAfterRefine`
+  (đã xác nhận bằng `git status`/`grep` — file test này **không nằm trong danh sách file đã sửa**
+  của commit chưa lên, và `grep isTranscriptStaleAfterRefine test/` không ra kết quả nào). Trong
+  khi Architecture §W6 T-W8 ghi rõ acceptance criteria: *"Test thuần; meeting chưa từng tóm tắt ⇒
+  không nudge (deny-by-default như R-AF)"* — đúng kiểu test đã có sẵn cho hàm chị em
+  `isPreMeetingInfoStale` ngay trong cùng file (5 test case, bao gồm đúng case "no summaryGeneration
+  yet -> never stale"). Hàm mới copy gần như y hệt discipline deny-by-default nhưng không có test
+  đi kèm để canh giữ nó — nếu ai đó sau này đổi field name (`finishedAt` → `completedAt` chẳng
+  hạn) sẽ không có gì đỏ báo hiệu. Gợi ý sửa: thêm tối thiểu 4 test theo đúng mẫu của
+  `isPreMeetingInfoStale`: (1) refine.finishedAt sau generatedAt ⇒ stale, (2) trước ⇒ không stale,
+  (3) chưa từng summarize ⇒ không stale, (4) case multi-part: 1 trong nhiều `part.refine` sau
+  generatedAt ⇒ stale dù các part khác không.
+
+### Medium
+- [ ] `js/app.js` `_pollRefinePartsStatus` (dòng ~4896–4906): khi `refiningCount` về 0, luôn hiện
+  toast `success` "Tinh chỉnh transcript hoàn tất" bất kể có part nào kết thúc ở `refine.status
+  === 'failed'` hay không (per-part fail vẫn hợp lệ theo W14 — "lỗi ⇒ chip giữ bản cũ + nút Thử
+  lại cho riêng part đó", tức có thể tất cả phần đều fail mà "hoàn tất" job-wise vẫn đúng nghĩa
+  hết-running). Toast "hoàn tất" nghe như mọi thứ đã thành công, gây hiểu lầm khi thực chất
+  1+ phần bị fail và giữ nguyên bản cũ. Gợi ý sửa: sau khi reload, đếm số part có
+  `refine.status==='failed'` trong danh sách vừa refine; nếu >0, đổi toast sang `warning`/`info`
+  với nội dung kiểu "Tinh chỉnh xong N/M phần, M-N phần giữ bản cũ".
+
+- [ ] `js/app.js` `_openRefinePartsModal` (dòng ~2013–2045): Architecture §W14 yêu cầu hộp chọn
+  phần "hiện rõ: số phần, tổng thời lượng, và cảnh báo tính tiền lại". Modal hiện tại có cảnh báo
+  tính tiền (đúng, không nêu số tiền cụ thể — đúng W-U3) nhưng **không có dòng tổng hợp** "N phần
+  · tổng X phút" nào — chỉ có thời lượng lẻ từng dòng checkbox. Không chặn dùng được nhưng thiếu
+  đúng nội dung spec liệt kê tường minh. Gợi ý sửa: thêm 1 dòng tính tổng
+  `spanSeconds` của các phần đang tick (có thể cập nhật live theo checkbox, hoặc đơn giản là tổng
+  tất cả phần eligible mặc định) ngay trên nút xác nhận.
+
+### Low
+(không có mục mới — vấn đề Low về race condition dedupe multi-part đã ghi ở vòng review backend
+trước đó vẫn treo, không thuộc phạm vi UI này)
+
+## External contract verification
+N/A — không gọi trực tiếp tool/API bên thứ 3 nào mới trong 2 file UI này; toàn bộ field đọc
+(`meeting.refine`, `part.refine`, `refiningParts`, response `{mode, jobId, status}` /
+`{mode:'parts', jobs[], skipped[]}`) đã đối chiếu trực tiếp với `server.js`/`server/refine.js`
+thật (dòng 1941–2090, 1670–1684) chứ không suy đoán theo Architecture.md — khớp đúng field name
+và status code cho các nhánh đã kiểm (200/201/404/409/422 single + parts). Baseline bảo mật
+(Host/Origin check, hash tên file) không bị đụng vì không có endpoint/subprocess/file I/O mới ở
+2 file này.
+
+## Kết quả khác
+- `npm test`: tự chạy lại, kết quả **278 tests, 276 pass, 0 fail, 2 skip** — khớp đúng số Dev báo
+  cáo. (Lưu ý: bộ test này không cover `js/*.js` client-side — dự án không có test runner cho
+  frontend, đúng theo CLAUDE.md — nên số này không chứng minh gì cho các issue High/Medium ở
+  trên, toàn bộ đều phát hiện bằng đọc code trực tiếp.)
+- Đối chiếu `isTranscriptStaleAfterRefine` với `isPreMeetingInfoStale`: xác nhận **không sửa**
+  `isPreMeetingInfoStale` (diff chỉ thêm hàm mới + export thêm trong object `SummaryStaleness`,
+  không đụng dòng nào của hàm cũ) — đúng yêu cầu tường minh đã giao, điểm 3 trong "Trọng tâm
+  review" PASS.
+- Transcript live không bị khoá trong lúc chờ refine: xác nhận không có thay đổi nào disable/ẩn
+  phần render transcript chính khi `refine.status==='running'` — chỉ nút "Tinh chỉnh transcript"
+  bị disable, đúng §W4.4 "transcript live vẫn đọc được bình thường trong lúc đó". Điểm 5 PASS.
+- XSS/innerHTML: mọi text động mới thêm vào `innerHTML` (`part.partId` trong `data-*` attribute,
+  tên hiển thị) đều qua `Utils.escapeHtml`; text tĩnh (nhãn lý do "chưa có transcript xong", "đang
+  tinh chỉnh") không chứa dữ liệu người dùng nên an toàn dù không escape. Toast dùng
+  `textContent`/`createTextNode` (`App.toast`, dòng 462–478), không phải `innerHTML`, nên message
+  toast (kể cả khi lồng `meeting.title`) an toàn tuyệt đối kiểu injection dù không escape. Điểm 6
+  PASS.
+- `_activeRefinePollers` là Map riêng biệt, không đè lên `_activePollers` (đã verify: 2 Map khác
+  nhau, key cùng là `meetingId` nhưng dùng cho 2 mục đích khác, đúng comment giải thích trong diff
+  dòng 15–19) — không có xung đột `setTimeout` handle giữa import đang chạy và refine đang chạy
+  cùng lúc trên cùng 1 meetingId. Nửa đầu điểm 2 trong "Trọng tâm review" PASS; nửa sau (dọn dẹp
+  khi rời trang / resume sau reload) FAIL — xem issue High #2 ở trên.
+
+## Positive Notes
+- Comment giải thích WHY rất kỹ và chính xác — đối chiếu code thật thì đúng những gì comment mô
+  tả (ví dụ dòng 12–17: lý do cần Map `_activeRefinePollers` riêng; dòng 4798 khu vực: lý do
+  `_pollRefineJob` không thể tái dùng `_pollJobStatus` vì đụng `meeting.status`). Không có trường
+  hợp "comment nói dối" nào phát hiện được khi đối chiếu.
+- Đúng data model: mọi field đọc (`meeting.refine.status/finishedAt`, `part.refine`,
+  `meeting.refiningParts`, response `mode`/`jobId`/`jobs`/`skipped`) khớp 100% với những gì
+  `server.js`/`server/refine.js` thực sự trả về — không có field tưởng tượng nào.
+- Không thêm toggle "tự động" nào, đúng quyết định E-W1 (a) đã chốt ở checkpoint; không đụng
+  `isPreMeetingInfoStale`; toast lỗi dùng `info` chứ không phải `error` đỏ — cả 3 điểm này Dev báo
+  cáo đều khớp với diff thật.
+- `_openRefinePartsModal` disable đúng các phần không phải `completed` kèm lý do (dù chưa đầy đủ
+  mọi lý do backend có — xem issue High #1), không âm thầm ẩn chúng đi — giữ đúng tinh thần "hiện
+  rõ lý do" của W14 cho phần lớn trường hợp thường gặp.
+
+---
+
+# Review Report — 2026-09-22 (vòng 2/3, fix 5 issue refine-transcript UI)
+
+Phạm vi: `git diff -- js/app.js js/summary-staleness.js test/summary-staleness.test.js` so với
+vòng 1 (CHƯA COMMIT). Trace tay từng issue, không tin nguyên văn báo cáo Dev.
+
+## Verdict: APPROVE
+
+## Verify từng issue vòng 1
+
+- **High #1 (skipped[] + pre-check duration)** — FIX ĐÚNG. `REFINE_PART_MAX_SECONDS: 300 * 60`
+  (dòng ~24 `js/app.js`) khớp chính xác `MAX_REFINE_PART_SECONDS = 300 * 60` ở
+  `server/refine.js:22` (đối chiếu trực tiếp source, không suy đoán) — không có lệch số nào gây
+  modal cho tick nhầm phần backend sẽ từ chối, hay chặn nhầm phần hợp lệ. `_openRefinePartsModal`
+  giờ tính `tooLong = Number(part.duration) > this.REFINE_PART_MAX_SECONDS` và disable kèm lý do
+  "(quá 300 phút, không tinh chỉnh được)". `_startPartsRefine` đọc `body.skipped` sau khi có
+  response, map từng `reason` qua `_refineSkipReasonVi` (bảng switch khớp đúng 4 reason code thật
+  của `server.js`: `PART_TOO_LONG`/`AUDIO_NOT_FOUND`/`ALREADY_RUNNING`/`PART_NOT_COMPLETED`, dòng
+  2037-2043) rồi toast `warning` liệt kê rõ phần nào bị bỏ qua + lý do — không còn "hoàn tất" giả
+  khi có phần bị skip.
+
+- **High #2 (`_resumeRefiningJobs`)** — FIX ĐÚNG, đã trace tay. Gọi trong `App.init()` ngay sau
+  `_resumeProcessingJobs()` (dòng 48). Thân hàm: `if (this._activeRefinePollers.has(meeting.id))
+  continue;` đặt **trước** cả 2 nhánh resume — đúng thứ tự để tránh double-poll. Do
+  `_activeRefinePollers` là Map rỗng tại thời điểm `App.init()` chạy (chưa ai bấm nút refine nào
+  trước khi hàm này chạy trong cùng lượt tải trang), check này về bản chất luôn true lúc gọi —
+  nhưng đúng và cần thiết cho đúng 1 tình huống thật: nếu 1 meeting vừa có `refine.status ===
+  'running'` (single) **và đồng thời** `refiningParts.length > 0` (multi-part) — tình huống không
+  nên xảy ra thực tế cho cùng 1 meeting (`caps.multiPart` chỉ 1 trong 2 kiểu) nhưng nếu dữ liệu
+  bất thường xảy ra, nhánh `continue` sau khi xử lý nhánh `running` (dòng "if (meeting.refine?
+  ... continue;") ngăn hàm rơi tiếp xuống nhánh `refiningParts` và gọi 2 poller cùng lúc cho cùng
+  1 `meetingId` — đúng tinh thần "1 setTimeout handle / meetingId" mà Map thiết kế để đảm bảo.
+  Claim "tránh double-poll" của Dev verify đúng.
+
+- **High #3 (test `isTranscriptStaleAfterRefine`)** — FIX ĐÚNG VÀ ĐỦ. 7 test case mới trong
+  `test/summary-staleness.test.js`, cover đúng các nhánh deny-by-default yêu cầu gốc: (1) refine
+  sau Generate ⇒ stale, (2) trước ⇒ không, (3) **chưa từng summarize** (không có
+  `summaryGeneration`) ⇒ không stale dù có refine done — đúng R-AF, (4) **chưa từng refine** (không
+  `meeting.refine`, không `parts`) ⇒ không stale, (5) refine đang `running` (chưa `done`) ⇒ bị bỏ
+  qua đúng logic, (6)+(7) multi-part: 1 trong nhiều part refine sau Generate ⇒ stale dù các part
+  khác không, và toàn bộ part refine trước Generate ⇒ không stale. Đây đúng 2 case "khó" (deny-by-
+  default cho case chưa từng summarize/chưa từng refine) mà yêu cầu review vòng 2 nhắc kiểm tra kỹ
+  — không chỉ test happy path.
+
+- **Medium #1 (toast warning khi có phần failed)** — FIX ĐÚNG, cách dùng `trackedPartIds` snapshot
+  hợp lý hơn cả mức yêu cầu tối thiểu. `_pollRefinePartsStatus` snapshot
+  `trackedPartIds = Set(...)` từ các part đang `refine.status === 'running'` **tại thời điểm bắt
+  đầu poll** (trước khi vòng lặp `poll()` chạy lần đầu) — nên khi tính `failedCount` lúc kết thúc,
+  chỉ đếm phần nằm trong đúng batch vừa refine, không tính nhầm 1 phần `failed` cũ từ lần retry
+  trước mà người dùng chưa bấm "Thử lại". Đã trace: biến `trackedPartIds` được đóng (closure) đúng
+  1 lần mỗi lượt gọi `_pollRefinePartsStatus`, không bị ghi đè giữa các lần gọi chồng lấn vì mỗi
+  lần gọi tạo closure `poll` riêng.
+
+- **Medium #2 (dòng tổng hợp N phần/tổng thời lượng)** — FIX ĐÚNG. Thêm `#refine-parts-summary`,
+  cập nhật qua `updateSummary()` gắn listener `change` trên từng checkbox, gọi lần đầu ngay sau khi
+  render modal — đúng yêu cầu "cập nhật live theo checkbox".
+
+## Điểm kiểm thêm theo yêu cầu round 2
+
+1. **Không double-poll khi đã có poller active** — xác nhận đúng như phân tích High #2 ở trên.
+2. **`REFINE_PART_MAX_SECONDS` khớp server** — xác nhận khớp tuyệt đối (`300 * 60` cả 2 phía,
+   đối chiếu trực tiếp `server/refine.js:22`).
+3. **Test mới cover đúng deny-by-default, không chỉ case dễ** — xác nhận đủ (test case 3 và 4 ở
+   trên chính là 2 nhánh "chưa từng" bắt buộc).
+4. **Toast warning mới dùng đúng `textContent`/escape** — xác nhận: toast mới
+   (`Bỏ qua N phần không tinh chỉnh được — …`, `Tinh chỉnh transcript xong — N phần giữ bản cũ do
+   lỗi.`) đều gọi qua `this.toast(message, type)` chưa đổi (vẫn `text.textContent = String(message)`
+   ở dòng 462-478, không có diff nào ở hàm `toast` chính nó) — an toàn injection dù `label` trong
+   `_startPartsRefine` lấy trực tiếp từ `item.partId` (dữ liệu server, không escape) vì đường đi
+   cuối cùng vẫn là `textContent`, không phải `innerHTML`.
+
+## Kết quả khác
+- `npm test`: tự chạy lại, kết quả **285 tests, 283 pass, 0 fail, 2 skip** — khớp đúng số Dev báo
+  cáo (276→283, tăng đúng 7 test mới của High #3).
+- Không phát sinh vấn đề mới nào trong lúc trace các đoạn code sửa (không có regression ở phần
+  chip/poller cũ, `_bindRefineActions` không đổi cách bind ngoài phạm vi 5 issue).
+
+## External contract verification
+N/A — không đổi endpoint/tool bên ngoài nào ở vòng fix này; `REFINE_PART_MAX_SECONDS` copy giá trị
+từ hằng số thật đã đọc trực tiếp trong `server/refine.js`, không suy đoán.
+
+## Positive Notes
+- Cả 5 issue đều fix đúng trọng tâm, không né tránh bằng cách sửa test cho dễ pass hay nới lỏng gì.
+- `trackedPartIds` snapshot (Medium #1) là một chi tiết đúng-vấn-đề hơn cả những gì issue gốc yêu
+  cầu — Dev tự nhận ra rủi ro "part failed cũ chưa retry bị tính nhầm" mà bản thân yêu cầu review
+  không nêu rõ, và xử lý bằng snapshot thay vì so sánh state hiện tại (tránh đúng loại lỗi thời
+  điểm/race dễ gặp trong code polling).
+- Comment mới đều trỏ thẳng tới đúng review issue tương ứng ("Reviewer High #1/#2", "Reviewer
+  Medium #1") — dễ đối chiếu khi audit lại sau này.
+- Không có sửa nào lan ra ngoài phạm vi 5 issue đã yêu cầu (đối chiếu diff không có thay đổi hành
+  vi nào ở các phần chip/poller/nudge đã APPROVE ở vòng 1).

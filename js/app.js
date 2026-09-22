@@ -12,12 +12,21 @@ const App = {
   _recordingSaveInProgress: false,
   _backgroundAudioTasks: new Map(),
   _activePollers: new Map(),
+  // Separate from `_activePollers` (transcription jobs) — a meeting can be
+  // refining while a completely unrelated import is still transcribing, and
+  // the two pollers must never clobber each other's setTimeout handle for
+  // the same meetingId (§W4.4/§W14).
+  _activeRefinePollers: new Map(),
   _selectedMeetingIds: new Set(),
   _themeMedia: null,
   _pendingAutoStartMeetingId: null,
   SONIOX_REALTIME_USD_PER_HOUR: 0.12,
   SONIOX_ASYNC_USD_PER_HOUR: 0.10,
   SONIOX_ASYNC_TRANSLATION_USD_PER_HOUR: 0.16,
+  // Must mirror `MAX_REFINE_PART_SECONDS` in server/refine.js (Soniox async's
+  // fixed 300-minute file-duration limit) — lets the picker disable a
+  // too-long part up front instead of letting the server silently skip it.
+  REFINE_PART_MAX_SECONDS: 300 * 60,
 
   /* ──────────────────────────────────────────
      Initialization
@@ -36,6 +45,7 @@ const App = {
     this.navigate(hash);
     this._migrateLegacyAudio();
     this._resumeProcessingJobs();
+    this._resumeRefiningJobs();
 
     // Listen for hash changes
     window.addEventListener('hashchange', () => {
@@ -1478,9 +1488,11 @@ const App = {
     // for real meeting content (UX §7 `.transcript-gap`). A plain segment
     // (every segment of a single-part meeting) renders EXACTLY as before —
     // test hồi quy for the "1 part = unchanged" acceptance criterion.
+    const partsById = new Map((meeting.parts || []).map(p => [p.partId, p]));
     const transcriptHtml = (meeting.transcript || []).map((seg, i) => {
       if (seg.kind === 'part-divider') {
-        return `<div class="transcript-part-divider" data-index="${i}">${Utils.escapeHtml(seg.text)}</div>`;
+        const refineChip = this._partRefineChipHtml(partsById.get(seg.partId));
+        return `<div class="transcript-part-divider" data-index="${i}">${Utils.escapeHtml(seg.text)}${refineChip ? ` ${refineChip}` : ''}</div>`;
       }
       if (seg.kind === 'part-gap') {
         return `<div class="transcript-gap" data-index="${i}">${Utils.escapeHtml(seg.text)}</div>`;
@@ -1550,6 +1562,7 @@ const App = {
               ${statusBadge}
               ${meeting.source === 'import' ? '<span class="badge badge-primary" title="Bản ghi nhập từ file ghi âm ngoài">Nhập từ file</span>' : ''}
               ${caps.multiPart && (meeting.missingParts || []).length > 0 ? `<span class="badge badge-warning">Thiếu ${(meeting.missingParts || []).length} phần</span>` : ''}
+              ${!caps.multiPart ? this._refineStatusChipHtml(meeting.refine) : ''}
             </div>
             <div class="meeting-detail-meta">
               <span>📅 ${Utils.formatDate(meeting.date)}${this._dateVsCreatedAtHint(meeting) ? ` · <span class="text-tertiary" style="font-size:0.85em;">${Utils.escapeHtml(this._dateVsCreatedAtHint(meeting))}</span>` : ''}</span>
@@ -1567,6 +1580,11 @@ const App = {
             ${participantChips ? `<div class="flex flex-wrap gap-2" style="margin-top: var(--space-3);">${participantChips}</div>` : ''}
           </div>
           <div class="flex gap-2">
+            ${!caps.multiPart && meeting.audioId ? `
+              <button class="btn btn-secondary btn-sm" id="refine-transcript-btn" type="button" title="Chạy lại transcript qua pipeline batch, chính xác hơn bản trực tiếp" ${meeting.refine?.status === 'running' ? 'disabled' : ''}>
+                Tinh chỉnh transcript
+              </button>
+            ` : ''}
             <button class="btn btn-secondary btn-sm" id="detail-export-md" title="Export Markdown">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
               Export
@@ -1710,6 +1728,7 @@ const App = {
                 </button>
               </div>
             </div>
+            ${this._refineStaleHint(meeting)}
             <p class="text-xs text-tertiary" id="summary-provenance" style="margin-bottom: var(--space-1);">${this._summaryProvenance(meeting)}</p>
             <p class="text-xs" id="summary-preset-badge" style="margin-bottom: var(--space-4);"></p>
             <div class="card" id="summary-content" style="line-height: var(--leading-relaxed);">
@@ -1753,6 +1772,34 @@ const App = {
   // queued/processing so a job in flight never gets its part moved under
   // it) and is where "+ Thêm phần" (Q9) lives, since both act on this same
   // list of parts.
+  // W4.4 chip for single-meeting `meeting.refine` — the multi-part
+  // equivalent is `_partRefineChipHtml`, one per part divider.
+  _refineStatusChipHtml(refine) {
+    if (!refine || !refine.status) return '';
+    if (refine.status === 'running') return '<span class="badge badge-warning">⟳ Đang tinh chỉnh transcript…</span>';
+    if (refine.status === 'done') return '<span class="badge badge-success">✓ Đã tinh chỉnh (bản đầy đủ)</span>';
+    if (refine.status === 'failed') {
+      return '<span class="badge badge-warning">Giữ bản trực tiếp</span> ' +
+        '<button class="btn btn-ghost btn-sm" id="refine-retry-btn" type="button">Thử lại</button>';
+    }
+    return '';
+  },
+
+  // Multi-part equivalent, rendered inline in a part's transcript-part-divider
+  // (§W14 — "ngay trên header của part đó"). `part` may be undefined for a
+  // stray partId (shouldn't happen, but divider lookups stay defensive).
+  _partRefineChipHtml(part) {
+    const refine = part && part.refine;
+    if (!refine || !refine.status) return '';
+    if (refine.status === 'running') return '<span class="badge badge-warning">⟳ đang chạy lại</span>';
+    if (refine.status === 'done') return '<span class="badge badge-success">✓ đã chạy lại</span>';
+    if (refine.status === 'failed') {
+      return `<span class="badge badge-warning">giữ bản cũ</span> ` +
+        `<button class="btn btn-ghost btn-sm" data-action="retry-refine-part" data-part="${Utils.escapeHtml(part.partId)}" type="button">Thử lại</button>`;
+    }
+    return '';
+  },
+
   _renderPartsPlaybackCard(meeting) {
     const parts = [...(meeting.parts || [])].sort((a, b) => a.order - b.order);
     const canReorder = meeting.status !== 'processing' && parts.length > 1;
@@ -1768,12 +1815,22 @@ const App = {
         ` : ''}
       </div>
     `).join('');
+    // §W14: default TẮT tự động (E-W1) — the only entry point for
+    // multi-part refine is this button, which opens the per-part picker
+    // (`_openRefinePartsModal`). Needs at least one 'completed' part to be
+    // worth showing at all.
+    const hasRefinableParts = parts.some(p => p.status === 'completed');
+    const refiningCount = (meeting.refiningParts || []).length;
     return `
       <div class="card" style="margin-bottom: var(--space-6);">
         <div class="flex justify-between items-center" style="margin-bottom:var(--space-3);">
           <p class="text-sm text-secondary" style="margin:0;">Nghe lại từng phần</p>
-          ${meeting.status !== 'processing' ? '<button class="btn btn-secondary btn-sm" id="add-part">+ Thêm phần</button>' : ''}
+          <div class="flex gap-2">
+            ${hasRefinableParts ? '<button class="btn btn-secondary btn-sm" id="refine-parts-btn" type="button">Tinh chỉnh transcript</button>' : ''}
+            ${meeting.status !== 'processing' ? '<button class="btn btn-secondary btn-sm" id="add-part">+ Thêm phần</button>' : ''}
+          </div>
         </div>
+        ${refiningCount > 0 ? `<p class="text-xs text-tertiary" id="refine-parts-progress" style="margin-bottom:var(--space-3);">⟳ Đang tinh chỉnh ${refiningCount}/${parts.length} phần…</p>` : ''}
         <div class="flex flex-col gap-2">${rows}</div>
       </div>
     `;
@@ -1928,6 +1985,271 @@ const App = {
 
     // TV18 (Q9) — add a part to an already-completed merged meeting.
     document.getElementById('add-part')?.addEventListener('click', () => Import.open({ attachMeetingId: meetingId, mode: 'appendPart' }));
+  },
+
+  // §W4.4/§W14 — manual "Tinh chỉnh transcript" entry points. Single-meeting
+  // uses POST …/refine-transcript with no partIds (W13.1 mode:'single');
+  // multi-part opens a picker first, since one meeting can have many
+  // eligible parts and W14 requires an explicit per-part choice (E-W1: no
+  // auto-trigger, ever).
+  _bindRefineActions(meetingId) {
+    const startSingleRefine = async btn => {
+      if (btn) btn.disabled = true;
+      try {
+        const response = await fetch(`/api/meetings/${encodeURIComponent(meetingId)}/refine-transcript`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}'
+        });
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(body.error?.message || 'Không bắt đầu tinh chỉnh transcript được.');
+        await this._reloadMeetingsFromServer();
+        this._pollRefineJob(meetingId, body.jobId);
+        this.navigate(`meeting/${meetingId}`, { force: true });
+      } catch (error) {
+        this.toast(error.message, 'error');
+        if (btn) btn.disabled = false;
+      }
+    };
+
+    document.getElementById('refine-transcript-btn')?.addEventListener('click', event => startSingleRefine(event.currentTarget));
+    document.getElementById('refine-retry-btn')?.addEventListener('click', event => startSingleRefine(event.currentTarget));
+
+    document.getElementById('refine-parts-btn')?.addEventListener('click', () => this._openRefinePartsModal(meetingId));
+
+    document.querySelectorAll('[data-action="retry-refine-part"]').forEach(btn => btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      try {
+        await this._startPartsRefine(meetingId, [btn.dataset.part]);
+      } catch (error) {
+        this.toast(error.message, 'error');
+        btn.disabled = false;
+      }
+    }));
+  },
+
+  // §W14 — picker modal, default-ticks every part eligible right now
+  // (`completed`, not already refining, not longer than Soniox's 300-minute
+  // async limit — E-W2). Parts that are queued/processing/failed/dropped
+  // belong to the "Thử lại" button instead (W13.1 — "hai nút, hai ngữ nghĩa,
+  // không gộp"), so they are shown as disabled rows, not omitted, to explain
+  // why they can't be picked. Mirrors the server's own eligibility checks
+  // (server.js's refine-transcript route) so a user rarely has to discover a
+  // rejection only after submitting — but the server is still the source of
+  // truth (`skipped[]` handled in `_startPartsRefine`) for reasons this
+  // picker can't know ahead of time, like a missing audio file on disk.
+  _openRefinePartsModal(meetingId) {
+    const meeting = Storage.getMeeting(meetingId);
+    if (!meeting) return;
+    const parts = [...(meeting.parts || [])].sort((a, b) => a.order - b.order);
+    const rows = parts.map(part => {
+      const running = part.refine?.status === 'running';
+      const tooLong = Number(part.duration) > this.REFINE_PART_MAX_SECONDS;
+      const eligible = part.status === 'completed' && !running && !tooLong;
+      const reason = running
+        ? '(đang tinh chỉnh)'
+        : tooLong
+          ? '(quá 300 phút, không tinh chỉnh được)'
+          : (part.status !== 'completed' ? '(chưa có transcript xong)' : '');
+      return `
+        <label class="checkbox" style="opacity:${eligible ? '1' : '0.6'};">
+          <input type="checkbox" data-refine-part="${Utils.escapeHtml(part.partId)}" data-span-seconds="${part.spanSeconds || 0}" ${eligible ? 'checked' : 'disabled'}>
+          <span class="checkbox-label">Phần ${part.order} · ${Utils.formatDurationHuman(part.spanSeconds || 0)} ${reason}</span>
+        </label>
+      `;
+    }).join('');
+
+    this.showModal(`
+      <div class="modal-header"><h3>Tinh chỉnh transcript</h3><button class="btn btn-ghost btn-icon" onclick="App.closeModal()">✕</button></div>
+      <p class="text-sm text-secondary">Chạy lại transcript của các phần đã chọn qua pipeline batch (chính xác hơn bản trực tiếp). Việc này sẽ tính phí thêm một lần nữa cho các phần được chọn.</p>
+      <div class="flex flex-col gap-2" style="margin:var(--space-4) 0;">${rows}</div>
+      <p class="text-sm text-secondary" id="refine-parts-summary" style="margin-bottom:var(--space-3);"></p>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="App.closeModal()">Hủy</button>
+        <button class="btn btn-primary" id="confirm-refine-parts">Tinh chỉnh transcript đã chọn</button>
+      </div>
+    `);
+
+    // §W14 — "hiện rõ số phần, tổng thời lượng" before confirming; recomputed
+    // live as the user ticks/unticks rows.
+    const checkboxes = [...document.querySelectorAll('[data-refine-part]')];
+    const summaryEl = document.getElementById('refine-parts-summary');
+    const updateSummary = () => {
+      const checked = checkboxes.filter(el => el.checked);
+      const totalSeconds = checked.reduce((sum, el) => sum + (Number(el.dataset.spanSeconds) || 0), 0);
+      if (!summaryEl) return;
+      summaryEl.textContent = checked.length > 0
+        ? `${checked.length} phần · tổng ${Utils.formatDurationHuman(totalSeconds)}`
+        : 'Chưa chọn phần nào.';
+    };
+    checkboxes.forEach(el => el.addEventListener('change', updateSummary));
+    updateSummary();
+
+    document.getElementById('confirm-refine-parts')?.addEventListener('click', async () => {
+      const partIds = checkboxes.filter(el => el.checked).map(el => el.dataset.refinePart);
+      if (partIds.length === 0) { this.toast('Chọn ít nhất 1 phần.', 'warning'); return; }
+      try {
+        await this._startPartsRefine(meetingId, partIds);
+        this.closeModal();
+      } catch (error) {
+        this.toast(error.message, 'error');
+      }
+    });
+  },
+
+  // Vietnamese copy for the `skipped[].reason` codes server.js's
+  // refine-transcript route (`mode:'parts'`) can return — kept in sync with
+  // that route's `skipped.push({ partId, reason })` call sites.
+  _refineSkipReasonVi(reason) {
+    switch (reason) {
+      case 'PART_TOO_LONG': return 'phần dài hơn 300 phút, không tinh chỉnh được';
+      case 'AUDIO_NOT_FOUND': return 'không tìm thấy file âm thanh gốc trên máy';
+      case 'ALREADY_RUNNING': return 'đang được tinh chỉnh rồi';
+      case 'PART_NOT_COMPLETED': return 'chưa có transcript hoàn chỉnh';
+      default: return 'không đủ điều kiện tinh chỉnh';
+    }
+  },
+
+  async _startPartsRefine(meetingId, partIds) {
+    const response = await fetch(`/api/meetings/${encodeURIComponent(meetingId)}/refine-transcript`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ partIds })
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.error?.message || 'Không tinh chỉnh được các phần đã chọn.');
+    await this._reloadMeetingsFromServer();
+    // W13.1 contract: `{mode:'parts', jobs[], skipped[]}` — a 2xx response
+    // does NOT mean every requested part started (Reviewer High #1). Surface
+    // skipped parts explicitly instead of letting the later "hoàn tất" toast
+    // imply total success.
+    if (Array.isArray(body.skipped) && body.skipped.length > 0) {
+      const meeting = Storage.getMeeting(meetingId);
+      const detail = body.skipped.map(item => {
+        const part = meeting?.parts?.find(p => p.partId === item.partId);
+        const label = part ? `Phần ${part.order}` : item.partId;
+        return `${label}: ${this._refineSkipReasonVi(item.reason)}`;
+      }).join('; ');
+      this.toast(`Bỏ qua ${body.skipped.length} phần không tinh chỉnh được — ${detail}`, 'warning');
+    }
+    this._pollRefinePartsStatus(meetingId);
+    this.navigate(`meeting/${meetingId}`, { force: true });
+  },
+
+  // Single-meeting refine poller (T-W5) — a variant of `_pollJobStatus`, NOT
+  // a reuse: that function's `failed`/404 branches read/write `meeting.status`
+  // (W3.3), but refine tracks its own state in `meeting.refine` and must
+  // never touch `meeting.status` (WHY-W3).
+  _pollRefineJob(meetingId, jobId) {
+    if (this._activeRefinePollers.has(meetingId)) clearTimeout(this._activeRefinePollers.get(meetingId));
+    let delay = 3000;
+    const maxDelay = 10000;
+
+    const poll = async () => {
+      try {
+        if (!jobId) { this._activeRefinePollers.delete(meetingId); return; }
+        const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`);
+        const job = await response.json().catch(() => ({}));
+
+        if (response.status === 404) {
+          // R-W1 guarantees the live transcript survives either outcome, so
+          // unlike `_pollJobStatus` there is nothing to recover by
+          // re-submitting — just trust `meeting.refine`, which the server
+          // already wrote before the job could ever finish.
+          await this._reloadMeetingsFromServer();
+          const current = Storage.getMeeting(meetingId);
+          if (current?.refine?.status === 'running') {
+            delay = Math.min(delay * 1.5, maxDelay);
+            this._activeRefinePollers.set(meetingId, setTimeout(poll, delay));
+            return;
+          }
+          this._activeRefinePollers.delete(meetingId);
+          this._finishSingleRefinePoll(meetingId);
+          return;
+        }
+        if (!response.ok) throw new Error(job.error?.message || 'Could not check refine status.');
+
+        if (job.status === 'completed' || job.status === 'failed') {
+          await this._reloadMeetingsFromServer();
+          this._activeRefinePollers.delete(meetingId);
+          this._finishSingleRefinePoll(meetingId);
+          return;
+        }
+
+        delay = Math.min(delay * 1.5, maxDelay);
+        this._activeRefinePollers.set(meetingId, setTimeout(poll, delay));
+      } catch {
+        delay = Math.min(delay * 2, maxDelay);
+        this._activeRefinePollers.set(meetingId, setTimeout(poll, delay));
+      }
+    };
+
+    this._activeRefinePollers.set(meetingId, setTimeout(poll, delay));
+  },
+
+  _finishSingleRefinePoll(meetingId) {
+    const meeting = Storage.getMeeting(meetingId);
+    if (!meeting) return;
+    if (meeting.refine?.status === 'done') {
+      this.toast('Đã tinh chỉnh transcript xong.', 'success');
+    } else if (meeting.refine?.status === 'failed') {
+      // W4.4: no red "Audio processing failed" toast — R-W1 guarantees
+      // nothing was lost, the live transcript is still exactly what it was.
+      this.toast('Không tinh chỉnh được transcript — vẫn giữ bản trực tiếp.', 'info');
+    }
+    if (this.currentRoute === 'meeting' && this.currentMeetingId === meetingId) {
+      this.navigate(`meeting/${meetingId}`, { force: true });
+    }
+  },
+
+  // Multi-part refine poller — reuses the same cheap `GET …/parts` projection
+  // as `_pollPartsStatus` (§W13.3: "10 part = 1 request/chu kỳ"), but reads
+  // `refiningParts` instead of `status`/`missingParts` and is a separate
+  // function (not a reused branch) because it must NOT touch
+  // `_backgroundAudioTasks`' "transcribing" phase semantics — a refine job is
+  // not the initial transcription (WHY-W8).
+  _pollRefinePartsStatus(meetingId) {
+    if (this._activeRefinePollers.has(meetingId)) clearTimeout(this._activeRefinePollers.get(meetingId));
+    let delay = 3000;
+    const maxDelay = 10000;
+    // Snapshot which parts are 'running' right NOW, before the loop starts,
+    // so the completion toast only judges the parts from *this* refine batch
+    // — not a stale 'failed' part from an earlier, unrelated retry that the
+    // user hasn't dismissed/retried yet (Reviewer Medium #1).
+    const startingParts = Storage.getMeeting(meetingId)?.parts || [];
+    const trackedPartIds = new Set(
+      startingParts.filter(part => part.refine?.status === 'running').map(part => part.partId)
+    );
+
+    const poll = async () => {
+      try {
+        const response = await fetch(`/api/meetings/${encodeURIComponent(meetingId)}/parts`);
+        if (response.status === 404) { this._activeRefinePollers.delete(meetingId); return; }
+        const data = await response.json();
+        const refiningCount = Array.isArray(data.refiningParts) ? data.refiningParts.length : 0;
+
+        if (refiningCount > 0) {
+          delay = Math.min(delay * 1.5, maxDelay);
+          this._activeRefinePollers.set(meetingId, setTimeout(poll, delay));
+          return;
+        }
+
+        this._activeRefinePollers.delete(meetingId);
+        await this._reloadMeetingsFromServer();
+        const meeting = Storage.getMeeting(meetingId);
+        const parts = Array.isArray(meeting?.parts) ? meeting.parts : [];
+        const failedCount = parts.filter(part => trackedPartIds.has(part.partId) && part.refine?.status === 'failed').length;
+        if (failedCount > 0) {
+          this.toast(`Tinh chỉnh transcript xong — ${failedCount} phần giữ bản cũ do lỗi.`, 'warning');
+        } else {
+          this.toast(`Tinh chỉnh transcript hoàn tất — ${meeting?.title || meetingId}`, 'success');
+        }
+        if (this.currentRoute === 'meeting' && this.currentMeetingId === meetingId) {
+          this.navigate(`meeting/${meetingId}`, { force: true });
+        }
+      } catch {
+        delay = Math.min(delay * 2, maxDelay);
+        this._activeRefinePollers.set(meetingId, setTimeout(poll, delay));
+      }
+    };
+
+    this._activeRefinePollers.set(meetingId, setTimeout(poll, delay));
   },
 
   // TV18 (BR-121) — computes the full permutation client-side (js/parts.js,
@@ -2587,6 +2909,13 @@ const App = {
     return '<p class="text-xs text-tertiary" style="margin-bottom: var(--space-3);">ℹ️ Thông tin cuộc họp có thể mới hơn lần tạo tóm tắt gần nhất — Generate lại nếu muốn AI dùng thông tin mới.</p>';
   },
 
+  // §W4.4/T-W8: shown in the Summary tab once a refine (single-meeting or
+  // any part) finished AFTER the current summary was generated.
+  _refineStaleHint(meeting) {
+    if (!SummaryStaleness.isTranscriptStaleAfterRefine(meeting)) return '';
+    return '<p class="text-xs text-tertiary" style="margin-bottom: var(--space-3);">ℹ️ Transcript đã được tinh chỉnh sau lần tạo tóm tắt này — cân nhắc Regenerate để dùng bản đầy đủ.</p>';
+  },
+
   _bindPreMeetingInfo(meetingId) {
     const suggestionEl = document.getElementById('lead-by-suggestion');
     const updateLeadBySuggestion = () => {
@@ -2738,6 +3067,9 @@ const App = {
 
     // Multi-part progress/error card actions (TV12)
     this._bindMultiPartActions(meetingId);
+
+    // Refine transcript — manual button, single-meeting + multi-part (§W4.4/§W14)
+    this._bindRefineActions(meetingId);
 
     // Tags (T14, BR-68..BR-70)
     this._bindTagEditor(meetingId);
@@ -4688,6 +5020,25 @@ const App = {
         this._backgroundAudioTasks.set(meeting.id, { filename: meeting.sourceFilename || meeting.title, phase: 'transcribing' });
         this._renderBackgroundTaskIndicator();
         this._processUploadedRecording(meeting, meeting.createdAt, meeting.sourceFilename || meeting.title);
+      }
+    }
+  },
+
+  // Counterpart to `_resumeProcessingJobs` for §W4.4/§W14 refine jobs
+  // (Reviewer High #2) — without this, a refine started right before a
+  // reload/F5 leaves `_activeRefinePollers` empty forever: the "Đang tinh
+  // chỉnh…" chip (rendered straight from storage) stays frozen with no
+  // poller alive to ever clear it or toast completion.
+  _resumeRefiningJobs() {
+    const meetings = Storage.getAllMeetings();
+    for (const meeting of meetings) {
+      if (this._activeRefinePollers.has(meeting.id)) continue;
+      if (meeting.refine?.status === 'running') {
+        this._pollRefineJob(meeting.id, meeting.refine.jobId);
+        continue;
+      }
+      if ((meeting.refiningParts || []).length > 0) {
+        this._pollRefinePartsStatus(meeting.id);
       }
     }
   }

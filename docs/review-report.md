@@ -3042,3 +3042,103 @@ Protocol 7 nếu commit chung.
   cơ chế lưu trữ bên dưới — không có regression về hành vi quan sát được từ phía user, đã tự phát hiện
   và sửa luôn một side-effect tinh vi (pre-fill input phải đọc qua resolver, không đọc thẳng
   `seg.speaker` nữa, nếu không sẽ luôn hiện "Speaker 1" ở lần sửa tên thứ 2).
+
+# Review Report — 2026-09-23 (hotfix: missing browser global trong js/speaker-names.js)
+
+## Verdict: APPROVE
+
+## Bối cảnh
+Commit `28a515b` (speaker-naming, đã APPROVE ở review trước) chỉ tạo `module.exports` cho
+`js/speaker-names.js`, không tạo object toàn cục `SpeakerNames` cho trình duyệt. `index.html`
+load file này qua `<script src="js/speaker-names.js?...">` thường (không phải ES module), và
+`js/app.js` (9 call site: dòng 1156, 1163, 1170, 1250, 1602, 4821, 4850...) cùng `js/export.js`
+(3 call site: dòng 111, 165, 214) đều gọi `SpeakerNames.resolveSpeakerLabel`/`assignSpeakerName`
+ở top-level identifier — không có global này thì mọi trang meeting detail crash ngay khi load
+với `ReferenceError: SpeakerNames is not defined`. PM tự phát hiện bằng cách mở app thật qua
+browser, không phải qua `node --test`.
+
+## Verify
+
+1. **Diff đúng như mô tả, không có gì ngoài dự kiến** — `git diff HEAD -- js/speaker-names.js`
+   chỉ có 2 thay đổi: thêm dòng `const SpeakerNames = { resolveSpeakerLabel, assignSpeakerName,
+   listAssignedLabels };` trước khối `if (typeof module !== 'undefined' ...)`, và đổi
+   `module.exports = { ... }` (object literal trùng lặp) thành `module.exports = SpeakerNames;`.
+   Không đụng logic nghiệp vụ (`resolveSpeakerLabel`, `assignSpeakerName`, `listAssignedLabels`
+   giữ nguyên 100%).
+
+2. **Pattern khớp đúng convention hiện có của project** — đã đọc trực tiếp
+   `js/summary-staleness.js` (dòng 55-59: `const SummaryStaleness = { isPreMeetingInfoStale,
+   isTranscriptStaleAfterRefine }; if (typeof module !== 'undefined' && module.exports) {
+   module.exports = SummaryStaleness; }`) và `js/meeting-date.js` (dòng 27-31: `const MeetingDate
+   = { isPlausibleMeetingDate, FUTURE_GRACE_MS, MIN_PLAUSIBLE_MS }; if (...) { module.exports =
+   MeetingDate; }`). Cả hai file đều theo đúng cấu trúc: khai báo `const <PascalCaseName> = {...}`
+   trước, rồi mới gán vào `module.exports` bên trong guard — đây chính là "dual mode" convention
+   chuẩn của mọi file JS thuần trong project (comment ở đầu 2 file này còn ghi rõ "dual mode like
+   js/meeting-types.js so `node --test` can exercise it directly"). Fix của PM tuân thủ đúng
+   convention này, không phải cách làm tự nghĩ ra riêng.
+
+3. **`node --test test/speaker-names.test.js` xanh 11/11** — `module.exports` vẫn hoạt động
+   đúng cho Node vì `SpeakerNames` (object) được gán y hệt nội dung object literal cũ, chỉ đổi
+   cách khai báo trung gian.
+
+4. **Baseline bảo mật MeetNote**: fix này không chạm `/api/*`, không chạm keychain/API key,
+   không chạm filesystem path từ ID client, không chạm `child_process.spawn` — N/A, không có gì
+   để kiểm.
+
+## Issues Found
+Không có issue Critical/High/Medium/Low nào cho bản thân fix 1 dòng này — đây là thay đổi tối
+thiểu, đúng phạm vi, đúng convention, có test xanh xác nhận không phá gì.
+
+## Bài học quy trình (gap trong review trước — không phải lỗi kỹ thuật của fix này)
+
+Bug "thiếu global `SpeakerNames`" lẽ ra phải bị bắt ở review commit `28a515b`, nhưng đã lọt qua
+vì review đó (đúng theo checklist hiện có) chỉ chạy `node --test`. `node --test` không thể phát
+hiện loại lỗi này vì nó chạy trong môi trường Node thuần — `module.exports` tồn tại, test xanh,
+nhưng **không ai chạy qua browser thật**, nơi `<script>` tag thường không cung cấp `module`/
+`require`, và mã tiêu thụ (`js/app.js`, `js/export.js`) trông cậy vào global do chính file này
+tự tạo ra (không phải `import`/`require` tường minh, nên compiler/linter cũng không bắt được vì
+project không có build step/TypeScript/linter cấu hình — CLAUDE.md của MeetNote ghi rõ "không
+build step, không linter cấu hình sẵn").
+
+Đây là biến thể client-side (browser wiring) của đúng tinh thần Protocol 6 (Cross-Step Data
+Lineage): 2 "bước" ở đây là "file A export ra global" và "file B tiêu thụ global đó" — về nguyên
+tắc là một dạng lineage giữa producer/consumer, chỉ khác là xảy ra ở tầng load-script của trình
+duyệt thay vì data truyền qua tham số hàm. `node --test` chỉ verify được "logic bên trong file A
+đúng khi đứng riêng" — không verify được "file A có thực sự expose đúng thứ mà file B cần" khi
+cả hai cùng chạy trong ngữ cảnh thật (browser, cùng load qua `<script>` tag theo thứ tự trong
+`index.html`).
+
+**Đề xuất cho review tương lai** (áp dụng cho mọi file `js/*.js` thuần theo pattern dual-mode
+này — `js/meeting-types.js`, `js/summary-staleness.js`, `js/meeting-date.js`,
+`js/speaker-names.js`, và các file tương lai theo cùng pattern): khi review một file JS thuần
+mới/sửa đổi có object global cho browser + `module.exports` cho Node, Reviewer phải xác nhận
+tường minh **cả hai** nhánh:
+  (a) `node --test` xanh (nhánh Node) — như hiện tại đang làm, đủ.
+  (b) File có thực sự khai báo `const <Name> = {...}` (hoặc tương đương) làm biến toàn cục
+      TRƯỚC — không chỉ export nội bộ trong khối `module.exports` — VÀ ít nhất 1 lần grep xem
+      những file nào gọi `<Name>.<method>` trong toàn bộ `js/` để đối chiếu tên global khớp
+      chính xác (case-sensitive) với tên các call site đó.
+  (c) Lý tưởng: ít nhất 1 lần mở app thật qua browser (`npm start` → mở
+      `http://127.0.0.1:8765`, vào 1 trang có dùng file đó, mở DevTools Console kiểm tra không
+      có `ReferenceError`) trước khi APPROVE feature mới đụng tới file `js/*.js` thuần lần đầu
+      — không bắt buộc lặp lại mỗi commit nhỏ sau đó nếu không đổi phần export/global, nhưng bắt
+      buộc ít nhất 1 lần cho mỗi file mới hoặc mỗi lần đổi cấu trúc export/import của file đó.
+
+Ghi nhận: đây không phải lỗi của Dev khi viết `28a515b` hay của Reviewer khi APPROVE nó — checklist
+review lúc đó không có bước này, và `node --test` là công cụ test tự động duy nhất project có.
+Đây là gap trong quy trình (project chưa có công cụ test tự động cho tầng browser-integration),
+không phải vi phạm kỷ luật của ai. Bài học nên được cân nhắc đẩy vào CLAUDE.md của MeetNote (mục
+"Bảo mật — điểm cần Reviewer luôn kiểm tra" hoặc một mục review checklist mới riêng cho
+`js/*.js`) để review tương lai không lặp lại gap này.
+
+## External contract verification
+N/A — không có external tool/API contract nào liên quan tới fix này.
+
+## Positive Notes
+- Fix đúng phạm vi tối thiểu (2 dòng thay đổi), không tiện tay sửa/refactor thêm gì khác.
+- PM đã tự làm đúng việc "verify bằng cách chạy app thật" mà chính gap này chỉ ra là còn thiếu ở
+  quy trình review — phát hiện bug đúng cách, không chỉ dựa vào `node --test`.
+- Chọn đúng convention có sẵn trong project (`summary-staleness.js`, `meeting-date.js`) thay vì
+  tự nghĩ ra cách export mới — giữ codebase nhất quán.
+- `js/speaker-names.js` gốc vẫn giữ đầy đủ comment giải thích business rule (X4.1.4, X1.7...),
+  không bị fix này làm mất ngữ cảnh.

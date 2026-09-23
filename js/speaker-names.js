@@ -67,6 +67,8 @@ function listAssignedLabels(speakerNames) {
   });
 }
 
+const SpeakerNames = { resolveSpeakerLabel, assignSpeakerName, listAssignedLabels };
+
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { resolveSpeakerLabel, assignSpeakerName, listAssignedLabels };
+  module.exports = SpeakerNames;
 }

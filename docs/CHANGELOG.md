@@ -2066,3 +2066,108 @@ no error surfaced to the user.
   this fix — +1 new test, no other test touched).
 - Not self-declared "done" — Protocol 7 requires a Reviewer pass on this change before it's reported
   as ready; none has run yet in this session.
+
+---
+
+## 2026-09-23 — T-X1 → T-X5: live speaker naming (§X, checkpoint approved 2026-09-23)
+
+Implements the "(b) bản nhẹ an toàn" design approved after M-X1's real measurement (§X11): let the
+user assign a name to a `Speaker N` label while a meeting is being recorded (and keep the pre-existing
+post-hoc rename after recording), but never treat the label as a reliable person identity — the
+original raw label always stays visible next to the assigned name, and refine invalidates it.
+T-X6 (chip shortcut) and T-X7 (QA end-to-end pass) are explicitly OUT of this Dev pass per §X10 E-X7
+and Protocol 7 (QA is a separate role).
+
+**T-X1 — `js/speaker-names.js` (new).** Three pure functions per §X5.2:
+`resolveSpeakerLabel(rawLabel, speakerNames, partId?)`, `assignSpeakerName(speakerNames, rawLabel,
+name, meta, partId?)`, `listAssignedLabels(speakerNames)`. Empty/whitespace name deletes the key
+(reverts to raw label); unknown key passes the raw label through unchanged; input map is never
+mutated. `test/speaker-names.test.js` (new) covers the pure logic and, per Protocol 5.3, also derives
+raw speaker labels from the real captured golden fixtures (`tests/fixtures/soniox/live-final-tokens-
+synth-3voices.jsonl` / `-reentry.jsonl`, §X11.8) instead of hand-picking `"1"/"2"/"3"`.
+
+**Deviation from the literal §X5.2 signature (flagged for Tech Lead review, not silently decided):**
+added an optional `partId` parameter, composing the map key as `` `${partId}::${rawLabel}` `` when a
+segment carries a `partId`. §X5.1's own example key (`meeting.speakerNames["Speaker 1"]`) is flat, but
+the ALREADY-SHIPPED post-hoc rename (`js/app.js` `_openSpeakerRenameModal`, pre-this-change) explicitly
+scopes a rename to segments sharing the same `partId` — its own code comment says "Speaker 1" in part A
+and part B are independent diarization runs, not the same person. A flat map would have silently
+regressed that already-QA'd behavior on merged (multi-part) meetings. Segments with no `partId` (a
+live, still-recording session; a single-part meeting) key on the raw label alone, byte-for-byte the
+§X5.2 example — so this only changes behavior for merged recordings, where the old behavior is
+preserved rather than broken. Needs Tech Lead sign-off that this reading is correct.
+
+**T-X2 — resolver used at all 3 places (Protocol 6), no silent divergence:**
+- Live panel (`js/app.js` `addTranscriptSegment`, original channel only — translation keeps its plain
+  label).
+- Meeting detail transcript tab (`js/app.js` `_renderMeetingDetail`).
+- Export/copy (`js/export.js` `toMarkdown`/`toPlainText`/`copyTranscript`), which used to print
+  `seg.speaker` raw. `test/export-markdown.test.js` updated to load the real `js/speaker-names.js` as
+  `global.SpeakerNames` (not a hand-written stub) and asserts the resolved `"<name> · <rawLabel>"` text
+  appears in all formats.
+
+**T-X3 — inline naming while recording (§X4.1), `js/app.js` `_bindRecording`/`addTranscriptSegment`:**
+tapping a `Speaker N` label in the live panel replaces it in place with a small `<input class="input">`
+(no modal, doesn't pause Recorder/Transcriber). Enter commits, Escape/blur cancels. Auto-scroll of the
+transcript panel is suspended (`autoScrollSuspended` flag) while the input is focused — the exact
+detail §X4.1.2 calls out as easiest to miss (new segments would otherwise keep shoving the open input
+off-screen). A `settled` guard prevents the input's own removal-triggered `blur` from re-running
+`cancel()` right after a successful `commit()` (would have silently reverted the just-typed name back
+to the placeholder). Assigning a name updates every existing block sharing that raw label immediately
+(hồi tố, §X5.3) via `document.querySelectorAll('.transcript-speaker[data-speaker-raw="..."]')`.
+
+**X11.7 merge hint (not in the original §X4, added by the M-X1 measurement):** a small dismissible-free
+text line under the transcript ("có thể 2 người bị gộp chung 1 nhãn") appears once the number of
+distinct `Speaker N` labels seen is less than `meeting.participants.length`. This is a hint only, never
+blocking — matches §X11.7's correction that the real failure mode measured was label MERGING, not
+renumbering.
+
+**T-X4 — persistence.** `saveSpeakerNames()` writes `meeting.speakerNames` through the existing
+`Storage.saveMeeting` → `PUT /api/meetings` path already used for notes/status during recording (X1.11)
+— no new server route, confirmed unnecessary by X1.10 (a client-owned meeting-level field survives all
+3 guard branches in `server.js`'s merge, and `preserveServerOwnedFields` in `server/meeting-parts.js`
+for the multi-part case).
+
+**T-X5 — `server/refine.js`: `applyRefineResult` (single-meeting) and `applyPartRefineResult`
+(multi-part) now move `speakerNames` to `speakerNamesStale` instead of leaving it in place (§X5.4(a),
+the option explicitly rejected: keep-as-is risks a confidently-wrong name after refine renumbers).
+Deny-by-default (§Protocol 8.2): a meeting that never had `speakerNames` gets no `speakerNamesStale`
+and no banner. For the multi-part case, ONLY the refined part's composite-keyed entries go stale — a
+name assigned in an unrelated, un-refined part is left untouched (verified with a dedicated test, not
+assumed safe from "same shared code"). `js/app.js` `_renderMeetingDetail` renders a warning card above
+the transcript when `meeting.speakerNamesStale` is non-empty, listing the old names and pointing at
+tapping the `Speaker N` label to re-assign.
+
+**`_openSpeakerRenameModal` refactor (E-X4, highest-risk change — touches shipped/QA'd code,
+`49c6aa3`).** Changed from overwriting `seg.speaker` in place to calling
+`SpeakerNames.assignSpeakerName` into `meeting.speakerNames` (with the same partId scoping as T-X1).
+`segment.speaker` (the raw label) is never mutated anymore. Re-assigning a label that was in
+`speakerNamesStale` clears just that one stale key (the rest of the stale banner, if any, stays until
+addressed). UX preserved: same modal, same "cannot be empty" guard, same "applies to every line
+labeled X" copy — except the modal's input now pre-fills with the CURRENTLY assigned name (resolved via
+`SpeakerNames`) instead of whatever string happened to be sitting in `seg.speaker` (which, under the
+old overwrite-in-place design, WAS the previously assigned name; under the new design `seg.speaker` is
+always the untouched raw label, so the old pre-fill logic would have regressed to showing "Speaker 1"
+forever on a second edit without this change).
+
+**Consequence for the X1.9 "Bẫy 3" bug** (`server/meeting-parts.js` `applyTranscriptEdits`, fixed
+separately in `49c6aa3`): this rename no longer sends a modified `speaker` field through
+`PUT /api/meetings` at all — only the meeting-level `speakerNames` map changes, which
+`preserveServerOwnedFields` already passes through untouched (X1.10). So `applyTranscriptEdits`'s
+`speaker`-comparison branch is no longer exercised BY THIS FEATURE. **Not removed**: the adjacent
+contenteditable transcript-TEXT edit on the same route still relies on the same function for its own
+`text` comparison, and this Dev pass did not verify there is no other caller relying on the `speaker`
+branch specifically — flagged for Tech Lead/Reviewer to confirm before anyone considers deleting it.
+
+**Tests:** `test/speaker-names.test.js` (new, 11 tests), `test/refine.test.js` (+4 tests for T-X5,
+asserting the exact moved-map VALUE per Protocol 6, not just "the field changed"),
+`test/export-markdown.test.js` (+1 test). `npm test`: 302 tests, 297 passing / 2 skipped (pre-existing,
+no API key) / 3 failing — all 3 failures reproduced identically on a clean `git stash` of this change
+(pre-existing flaky network/port tests in `test/stt-formats.test.js` and `test/refine-routes.test.js`,
+unrelated to this feature; confirmed by running the suite before and after with `git stash`).
+
+**Not done in this pass (explicitly out of scope per the task brief):** T-X6 (chip shortcut, cut per
+E-X7), T-X7 (QA end-to-end pass on a real recording — QA's job, not Dev's).
+
+Protocol 7: **NOT yet reviewed** — no Reviewer spawned in this session, `docs/review-report.md` not
+updated for this change. Do not treat as done until a Reviewer round runs.

@@ -1,0 +1,290 @@
+[
+  {
+    "turn": 1,
+    "speaker": "A",
+    "voice": "Daniel",
+    "startMs": 0,
+    "endMs": 6411,
+    "text": "Good morning everyone, thanks for joining the weekly product sync. Let us start with the release status."
+  },
+  {
+    "turn": 2,
+    "speaker": "B",
+    "voice": "Samantha",
+    "startMs": 6661,
+    "endMs": 11619,
+    "text": "Sure. The mobile release went out on Tuesday and adoption is around forty percent so far."
+  },
+  {
+    "turn": 3,
+    "speaker": "A",
+    "voice": "Daniel",
+    "startMs": 11869,
+    "endMs": 17451,
+    "text": "Forty percent in three days is better than last quarter. Any crash reports worth escalating?"
+  },
+  {
+    "turn": 4,
+    "speaker": "C",
+    "voice": "Aman",
+    "startMs": 17701,
+    "endMs": 22688,
+    "text": "We saw a spike on Android fourteen devices, mostly around the camera permission dialog."
+  },
+  {
+    "turn": 5,
+    "speaker": "B",
+    "voice": "Samantha",
+    "startMs": 22938,
+    "endMs": 27894,
+    "text": "That matches the support tickets. Roughly thirty users reported the same freeze yesterday."
+  },
+  {
+    "turn": 6,
+    "speaker": "A",
+    "voice": "Daniel",
+    "startMs": 28144,
+    "endMs": 33650,
+    "text": "Alright, let us treat that as a blocker for the next patch. Who can own the investigation?"
+  },
+  {
+    "turn": 7,
+    "speaker": "C",
+    "voice": "Aman",
+    "startMs": 33900,
+    "endMs": 38200,
+    "text": "I can take it. I already have a reproduction on a physical Pixel device in the lab."
+  },
+  {
+    "turn": 8,
+    "speaker": "B",
+    "voice": "Samantha",
+    "startMs": 38450,
+    "endMs": 42428,
+    "text": "I will pair with you in the afternoon. I have the logs from the failing sessions."
+  },
+  {
+    "turn": 9,
+    "speaker": "A",
+    "voice": "Daniel",
+    "startMs": 42678,
+    "endMs": 48393,
+    "text": "Great. Next topic, the pricing experiment. What did the first week of data show us?"
+  },
+  {
+    "turn": 10,
+    "speaker": "B",
+    "voice": "Samantha",
+    "startMs": 48643,
+    "endMs": 54076,
+    "text": "Conversion on the annual plan went up by six percent, but monthly churn also went up slightly."
+  },
+  {
+    "turn": 11,
+    "speaker": "C",
+    "voice": "Aman",
+    "startMs": 54326,
+    "endMs": 58911,
+    "text": "The churn increase may be seasonal. Last year we saw the same pattern in September."
+  },
+  {
+    "turn": 12,
+    "speaker": "A",
+    "voice": "Daniel",
+    "startMs": 59161,
+    "endMs": 63319,
+    "text": "Can we isolate the seasonal effect before we commit to rolling this out globally?"
+  },
+  {
+    "turn": 13,
+    "speaker": "B",
+    "voice": "Samantha",
+    "startMs": 63569,
+    "endMs": 68125,
+    "text": "Yes, I will run the analysis against last year cohorts and share it on Thursday."
+  },
+  {
+    "turn": 14,
+    "speaker": "A",
+    "voice": "Daniel",
+    "startMs": 68375,
+    "endMs": 74081,
+    "text": "Perfect. Third topic, hiring. We still have two open roles on the platform team."
+  },
+  {
+    "turn": 15,
+    "speaker": "C",
+    "voice": "Aman",
+    "startMs": 74331,
+    "endMs": 78832,
+    "text": "I screened four candidates this week. Two of them are moving to the technical interview."
+  },
+  {
+    "turn": 16,
+    "speaker": "B",
+    "voice": "Samantha",
+    "startMs": 79082,
+    "endMs": 84298,
+    "text": "Do we have enough interviewers? Last round we had to reschedule twice because of conflicts."
+  },
+  {
+    "turn": 17,
+    "speaker": "A",
+    "voice": "Daniel",
+    "startMs": 84548,
+    "endMs": 89081,
+    "text": "I will ask the infrastructure team to lend us two interviewers for the next two weeks."
+  },
+  {
+    "turn": 18,
+    "speaker": "C",
+    "voice": "Aman",
+    "startMs": 89331,
+    "endMs": 94162,
+    "text": "That would help a lot. The candidates were frustrated by the long gaps between rounds."
+  },
+  {
+    "turn": 19,
+    "speaker": "B",
+    "voice": "Samantha",
+    "startMs": 94412,
+    "endMs": 99076,
+    "text": "Agreed. A faster loop usually means a better acceptance rate for senior engineers."
+  },
+  {
+    "turn": 20,
+    "speaker": "A",
+    "voice": "Daniel",
+    "startMs": 99326,
+    "endMs": 104066,
+    "text": "Noted. Let us move to the documentation gap that came up in the customer review."
+  },
+  {
+    "turn": 21,
+    "speaker": "C",
+    "voice": "Aman",
+    "startMs": 104316,
+    "endMs": 109387,
+    "text": "The onboarding guide is outdated. It still references the old settings screen from March."
+  },
+  {
+    "turn": 22,
+    "speaker": "B",
+    "voice": "Samantha",
+    "startMs": 109637,
+    "endMs": 114045,
+    "text": "I can rewrite the onboarding section if someone reviews the screenshots afterwards."
+  },
+  {
+    "turn": 23,
+    "speaker": "A",
+    "voice": "Daniel",
+    "startMs": 114295,
+    "endMs": 120141,
+    "text": "I will review them. Please keep the structure but update every screenshot and the API examples."
+  },
+  {
+    "turn": 24,
+    "speaker": "C",
+    "voice": "Aman",
+    "startMs": 120391,
+    "endMs": 125148,
+    "text": "We should also add a troubleshooting page. Most tickets are about the same three errors."
+  },
+  {
+    "turn": 25,
+    "speaker": "B",
+    "voice": "Samantha",
+    "startMs": 125398,
+    "endMs": 129558,
+    "text": "Good idea. I will collect the top errors from the support queue and send them over."
+  },
+  {
+    "turn": 26,
+    "speaker": "A",
+    "voice": "Daniel",
+    "startMs": 129808,
+    "endMs": 135756,
+    "text": "Excellent. Last item, the quarterly planning offsite. Does the second week of October work?"
+  },
+  {
+    "turn": 27,
+    "speaker": "C",
+    "voice": "Aman",
+    "startMs": 136006,
+    "endMs": 140412,
+    "text": "The second week works for me, but I am traveling on the Monday of that week."
+  },
+  {
+    "turn": 28,
+    "speaker": "B",
+    "voice": "Samantha",
+    "startMs": 140662,
+    "endMs": 144969,
+    "text": "Tuesday to Thursday would be fine on my side. I will block the calendar now."
+  },
+  {
+    "turn": 29,
+    "speaker": "A",
+    "voice": "Daniel",
+    "startMs": 145219,
+    "endMs": 149599,
+    "text": "Let us lock Tuesday to Thursday then, and I will book the meeting room today."
+  },
+  {
+    "turn": 30,
+    "speaker": "C",
+    "voice": "Aman",
+    "startMs": 149849,
+    "endMs": 154353,
+    "text": "Should we invite the design team for the first day, or keep it engineering only?"
+  },
+  {
+    "turn": 31,
+    "speaker": "A",
+    "voice": "Daniel",
+    "startMs": 154603,
+    "endMs": 159076,
+    "text": "Invite design for the first day. The roadmap discussion needs them in the room."
+  },
+  {
+    "turn": 32,
+    "speaker": "B",
+    "voice": "Samantha",
+    "startMs": 159326,
+    "endMs": 163455,
+    "text": "I will send the invitation and prepare a short agenda before the end of the week."
+  },
+  {
+    "turn": 33,
+    "speaker": "A",
+    "voice": "Daniel",
+    "startMs": 163705,
+    "endMs": 170106,
+    "text": "Thanks everyone. To summarize, camera crash is a blocker, pricing analysis lands Thursday."
+  },
+  {
+    "turn": 34,
+    "speaker": "C",
+    "voice": "Aman",
+    "startMs": 170356,
+    "endMs": 174729,
+    "text": "And I will own the crash investigation plus the troubleshooting documentation page."
+  },
+  {
+    "turn": 35,
+    "speaker": "B",
+    "voice": "Samantha",
+    "startMs": 174979,
+    "endMs": 180094,
+    "text": "And I will handle the onboarding rewrite, the cohort analysis, and the offsite agenda."
+  },
+  {
+    "turn": 36,
+    "speaker": "A",
+    "voice": "Daniel",
+    "startMs": 180344,
+    "endMs": 185197,
+    "text": "That is everything. Let us end a few minutes early today. Talk to you tomorrow."
+  }
+]

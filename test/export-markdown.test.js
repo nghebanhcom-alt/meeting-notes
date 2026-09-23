@@ -27,6 +27,10 @@ global.Summary = {
   _formatSection: () => ''
 };
 global.meetingTypeByCode = () => null;
+// T-X2 (Architecture §X5.2) — export must render speaker names through the
+// SAME resolver as the live panel/meeting detail page, so this uses the real
+// js/speaker-names.js implementation rather than a hand-written stub.
+global.SpeakerNames = require('../js/speaker-names');
 
 const Export = require('../js/export');
 
@@ -85,6 +89,22 @@ test('merged meeting with a missing part: a top-of-file warning AND the part-gap
   const md = Export.toMarkdown(meeting);
   assert.ok(md.includes('⚠ Bản ghi này còn thiếu phần 2.'), 'top-of-file warning (PRG-17-style)');
   assert.ok(md.includes('*⚠ Phần 2 chưa có transcript*'), 'the permanent in-transcript gap marker (FAI-11) also survives export');
+});
+
+test('T-X2: toMarkdown/toPlainText/copyTranscript all resolve meeting.speakerNames through SpeakerNames, original label still visible', () => {
+  const meeting = baseMeeting({
+    speakerNames: { 'Speaker 1': { name: 'Hiếu' } },
+    transcript: [
+      { time: 0, speaker: 'Speaker 1', text: 'Chao moi nguoi.' },
+      { time: 5, speaker: 'Speaker 2', text: 'Chao anh.' }
+    ]
+  });
+  const md = Export.toMarkdown(meeting);
+  assert.ok(md.includes('**[0:00] Hiếu · Speaker 1:** Chao moi nguoi.'));
+  assert.ok(md.includes('**[0:05] Speaker 2:** Chao anh.'), 'unassigned label is untouched');
+
+  const txt = Export.toPlainText(meeting);
+  assert.ok(txt.includes('[0:00] Hiếu · Speaker 1: Chao moi nguoi.'));
 });
 
 test('includeTranscript:false still shows the top-of-file missing-parts warning (that warning is not part of the transcript section)', () => {

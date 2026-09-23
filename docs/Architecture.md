@@ -2113,6 +2113,8 @@ meeting.speakerNames = {
 ```
 Khoá = **nhãn thô đúng như nó nằm trong `seg.speaker`** (`"Speaker 1"`, X1.5) ⇒ dùng chung được cho Soniox và Deepgram (X1.12), không cần thêm field vào segment, không cần migration cho dữ liệu cũ.
 
+**Cập nhật sau khi code (Reviewer đối chiếu, 2026-09-23):** khoá phẳng ở trên chỉ đúng cho bản ghi **đơn phần**. Với bản ghi **ghép nhiều phần**, khoá thực tế trong `js/speaker-names.js` là **composite `` `${partId}::${rawLabel}` ``** — bắt buộc, vì "Speaker 1" ở part khác nhau là 2 phiên diarize độc lập, không phải cùng người (WHY-W11/X1.9). Dùng khoá phẳng cho multi-part sẽ gán nhầm tên giữa 2 người khác nhau. Đây không phải lệch khỏi thiết kế — Reviewer đã xác nhận đúng hướng, chỉ là tài liệu này viết trước khi chi tiết hoá case multi-part.
+
 **Vì sao bắt buộc phải là map chứ không phải sửa `seg.speaker` như post-hoc rename đang làm:**
 - Bẫy 1 (X1.6): trong lúc ghi, `meeting.transcript` bị ghi đè bằng `this._transcriptSegments` sau **mỗi** segment final. Ghi tên vào `seg.speaker` thì vài giây sau **mất sạch** — và mất **im lặng**, đúng loại lỗi Protocol 6 sinh ra để chặn.
 - Bẫy 3 (X1.9): trên meeting multi-part, server **nuốt** thay đổi `speaker` gửi lên.

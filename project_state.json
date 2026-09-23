@@ -141,6 +141,13 @@
       "file": "server/meeting-parts.js, test/meeting-parts.test.js",
       "status": "code_complete_pending_review",
       "note": "Bug found by Tech Lead during unrelated research (Architecture.md SX, 'Bay 3'): applyTranscriptEdits only compared/wrote the text field, so a speaker-only rename (js/app.js _openSpeakerRenameModal, text unchanged) on a multi-part meeting was silently dropped by preserveServerOwnedFields on PUT /api/meetings -- no error surfaced. Fix: changed-detection and write-back now cover both text and speaker. Confirmed single-part meetings are NOT affected (server.js only calls preserveServerOwnedFields when current.parts.length > 0; single-part falls through to accepting the incoming transcript wholesale). Verified js/app.js's rename modal already sends the correct request shape (spreads segment, only overrides speaker) -- no client change needed. New test added and confirmed to FAIL on pre-fix code, PASS after. npm test: 284 passing / 2 skipped / 0 failing (was 283/2/0, +1 new test, 0 regressions). Protocol 7: NOT yet reviewed -- no Reviewer spawned in this session, docs/review-report.md not updated for this change. Do not treat as done until a Reviewer round runs."
+    },
+    {
+      "date": "2026-09-23",
+      "title": "T-X1-T-X5-live-speaker-naming-plus-openSpeakerRenameModal-refactor-to-shared-map",
+      "file": "js/speaker-names.js (new), js/app.js, js/export.js, server/refine.js, test/speaker-names.test.js (new), test/refine.test.js, test/export-markdown.test.js, index.html",
+      "status": "code_complete_pending_review",
+      "note": "Architecture.md SX (T-X1..T-X5, checkpoint approved 2026-09-23 after M-X1 real measurement). meeting.speakerNames map (E-X4) now shared by live inline naming (new, T-X3) and the pre-existing post-hoc rename modal (refactored, no longer overwrites seg.speaker). Refine (server/refine.js) moves speakerNames to speakerNamesStale on success (T-X5, deny-by-default). Flagged for Tech Lead review: added an optional partId composite-key scoping not explicit in SX5.2's flat-map example, needed to preserve the already-shipped per-part rename scoping on merged recordings -- see docs/CHANGELOG.md 2026-09-23 entry for full reasoning. npm test: 302 tests, 297 passing / 2 skipped / 3 failing, all 3 reproduced identically on a clean stash (pre-existing flaky network tests, unrelated). T-X6 (chip shortcut) and T-X7 (QA end-to-end pass) explicitly NOT done in this pass. Protocol 7: NOT yet reviewed -- no Reviewer spawned in this session, docs/review-report.md not updated for this change. Do not treat as done until a Reviewer round runs."
     }
   ]
 }

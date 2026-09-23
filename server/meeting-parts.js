@@ -376,6 +376,10 @@ function applyTranscriptEdits(meeting, incomingTranscript) {
     if (!part || !Number.isInteger(segment.srcIndex) || !part.transcript[segment.srcIndex]) return;
     const target = part.transcript[segment.srcIndex];
     const incomingText = typeof incoming[i]?.text === 'string' ? incoming[i].text : target.text;
+    // Speaker rename now goes through meeting.speakerNames (§X E-X4) instead of
+    // rewriting `speaker` per-segment, so this branch rarely fires in practice.
+    // Left in place: it's the fix for a real data-loss bug (§X1.9, 49c6aa3),
+    // and a client edit that still sends a modified `speaker` should keep working.
     const incomingSpeaker = typeof incoming[i]?.speaker === 'string' ? incoming[i].speaker : target.speaker;
     if (incomingText !== target.text || incomingSpeaker !== target.speaker) {
       target.text = incomingText;

@@ -184,3 +184,65 @@ test('modeFor: mode "refine" resolves to JOB_MODES.refine, which does not own me
 test('MAX_REFINE_PART_SECONDS matches the fixed 300-minute Soniox async limit (§W9-S3)', () => {
   assert.strictEqual(MAX_REFINE_PART_SECONDS, 300 * 60);
 });
+
+/* ── T-X5 (Architecture §X5.4(a)/§X6): applyRefineResult/applyPartRefineResult
+   must move `speakerNames` to `speakerNamesStale` instead of leaving it as-is
+   (X5.4(b), rejected) or silently dropping it. Protocol 6 test: assert the
+   VALUE that moved, not just "the field changed". ── */
+
+test('applyRefineResult: a meeting WITH speakerNames gets them moved to speakerNamesStale, speakerNames is gone', () => {
+  const meeting = markRefineRunning({
+    id: 'm1', status: 'completed',
+    transcript: [{ time: 0, speaker: 'Speaker 1', text: 'live content' }],
+    translations: [],
+    speakerNames: { 'Speaker 1': { name: 'Hiếu', source: 'live' } }
+  }, 'job-1');
+
+  const result = { transcript: [{ time: 0, speaker: 'Speaker 1', text: 'refined content' }], translations: [], duration: 320 };
+  const done = applyRefineResult(meeting, result, usage());
+
+  assert.strictEqual(done.speakerNames, null, 'the old map must not still be readable as "current" names');
+  assert.deepStrictEqual(done.speakerNamesStale, { 'Speaker 1': { name: 'Hiếu', source: 'live' } }, 'exact old map value must be preserved for the "gán lại" banner');
+});
+
+test('applyRefineResult: a meeting that NEVER had speakerNames stays without speakerNamesStale (deny-by-default, no banner out of nowhere)', () => {
+  const meeting = markRefineRunning({
+    id: 'm1', status: 'completed',
+    transcript: [{ time: 0, speaker: 'Speaker 1', text: 'live content' }],
+    translations: []
+  }, 'job-1');
+
+  const result = { transcript: [{ time: 0, speaker: 'Speaker 1', text: 'refined content' }], translations: [], duration: 320 };
+  const done = applyRefineResult(meeting, result, usage());
+
+  assert.strictEqual(done.speakerNames, undefined);
+  assert.strictEqual(done.speakerNamesStale, undefined);
+});
+
+test('applyPartRefineResult: only the refined part\'s speakerNames entries go stale, other parts\' names are untouched', () => {
+  const meeting = mergedMeeting([
+    completedPart({ partId: 'part-aaaaaaaa', order: 1 }),
+    completedPart({ partId: 'part-bbbbbbbb', order: 2, filename: 'b.m4a' })
+  ]);
+  meeting.speakerNames = {
+    'part-aaaaaaaa::Speaker 1': { name: 'Hiếu', source: 'post-hoc' },
+    'part-bbbbbbbb::Speaker 1': { name: 'Chị Hà', source: 'post-hoc' }
+  };
+  const queued = markPartRefineQueued(meeting, 'part-bbbbbbbb', 'job-refine-1');
+  const result = { transcript: [{ time: 0, speaker: 'Speaker 1', text: 'refined content' }], translations: [], duration: 120 };
+  const done = applyPartRefineResult(queued, 'part-bbbbbbbb', result, usage());
+
+  assert.deepStrictEqual(done.speakerNames, { 'part-aaaaaaaa::Speaker 1': { name: 'Hiếu', source: 'post-hoc' } }, 'part A\'s name survives untouched');
+  assert.deepStrictEqual(done.speakerNamesStale, { 'part-bbbbbbbb::Speaker 1': { name: 'Chị Hà', source: 'post-hoc' } }, 'only part B\'s name became stale');
+});
+
+test('applyPartRefineResult: refining the ONLY part with names clears speakerNames down to null (not an empty {})', () => {
+  const meeting = mergedMeeting([completedPart({ partId: 'part-aaaaaaaa', order: 1 })]);
+  meeting.speakerNames = { 'part-aaaaaaaa::Speaker 1': { name: 'Hiếu' } };
+  const queued = markPartRefineQueued(meeting, 'part-aaaaaaaa', 'job-refine-1');
+  const result = { transcript: [{ time: 0, speaker: 'Speaker 1', text: 'refined content' }], translations: [], duration: 120 };
+  const done = applyPartRefineResult(queued, 'part-aaaaaaaa', result, usage());
+
+  assert.strictEqual(done.speakerNames, null);
+  assert.deepStrictEqual(done.speakerNamesStale, { 'part-aaaaaaaa::Speaker 1': { name: 'Hiếu' } });
+});

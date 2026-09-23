@@ -55,6 +55,41 @@ function sumUsageEntries(entries) {
   };
 }
 
+// X5.4(a)/X6 — after refine replaces the transcript with an async run, its
+// `Speaker N` numbering is INDEPENDENT of whatever numbering the live/previous
+// batch run used (X1.8): the same key can now point at a different person.
+// Rather than delete the map (destructive, no undo) or keep it as-is (X5.4(b),
+// rejected — silently wrong), move it to `speakerNamesStale` so the UI can
+// banner "gán lại" with the old names still there to re-apply quickly.
+// Deny-by-default (X-X5/T-X5 acceptance): a meeting that never had any names
+// assigned must not gain a stale banner out of nowhere.
+//
+// `partId` scopes this to ONE part's refine (multi-part `applyPartRefineResult`,
+// composite keys `${partId}::${rawLabel}` per js/speaker-names.js) — only that
+// part's entries go stale, other parts' names are untouched. Omitting `partId`
+// (single-meeting `applyRefineResult`) staless the whole map.
+function staleSpeakerNamesFields(meeting, partId) {
+  const names = meeting.speakerNames;
+  if (!names || typeof names !== 'object' || Object.keys(names).length === 0) return {};
+
+  if (partId === undefined) {
+    return { speakerNames: null, speakerNamesStale: { ...(meeting.speakerNamesStale || {}), ...names } };
+  }
+
+  const prefix = `${partId}::`;
+  const staleEntries = {};
+  const keptEntries = {};
+  for (const [key, value] of Object.entries(names)) {
+    if (key.startsWith(prefix)) staleEntries[key] = value;
+    else keptEntries[key] = value;
+  }
+  if (Object.keys(staleEntries).length === 0) return {};
+  return {
+    speakerNames: Object.keys(keptEntries).length > 0 ? keptEntries : null,
+    speakerNamesStale: { ...(meeting.speakerNamesStale || {}), ...staleEntries }
+  };
+}
+
 /* ── Single-meeting (no parts) writers — W3.2 / W4.2 ── */
 
 // Called by the route handler when a refine job is created (W3.2 step 3).
@@ -103,7 +138,8 @@ function applyRefineResult(meeting, result, usage) {
     transcriptSource: 'batch-refined',
     refine: { ...(meeting.refine || {}), status: 'done', finishedAt: isoNow(), error: null },
     usageBreakdown,
-    sonioxUsage: sumUsageEntries(usageBreakdown)
+    sonioxUsage: sumUsageEntries(usageBreakdown),
+    ...staleSpeakerNamesFields(meeting)
   };
 }
 
@@ -160,7 +196,7 @@ function applyPartRefineResult(meeting, partId, result, usage) {
     refine: { ...(part.refine || {}), status: 'done', finishedAt: isoNow(), error: null }
     // status intentionally untouched (WHY-W8)
   };
-  return rebuildMergedMeeting({ ...meeting, parts });
+  return rebuildMergedMeeting({ ...meeting, parts, ...staleSpeakerNamesFields(meeting, partId) });
 }
 
 // W11.3: unlike markPartFailed (attach mode), this must NOT flip

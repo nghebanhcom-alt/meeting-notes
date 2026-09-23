@@ -9,6 +9,7 @@ const App = {
   _interimText: '',
   _transcriptSegments: [],
   _translationSegments: [],
+  _speakerNames: {}, // T-X3/X5.1 — live map, mirrors `meeting.speakerNames`
   _recordingSaveInProgress: false,
   _backgroundAudioTasks: new Map(),
   _activePollers: new Map(),
@@ -1018,6 +1019,9 @@ const App = {
                   <div class="empty-icon" style="width: 56px; height: 56px; font-size: 1.4rem;">💬</div>
                   <p class="text-sm">Original speech will appear here in real-time...</p>
                 </div>
+                <div class="text-xs text-tertiary" id="rec-speaker-merge-hint" style="display:none; padding: var(--space-2) var(--space-4);">
+                  Đang thấy ít giọng hơn số người tham dự — có thể 2 người bị gộp chung 1 nhãn. Có thể sửa lại tên sau khi ghi xong.
+                </div>
                 <div id="rec-transcript-list" style="display:none;"></div>
               </div>
             </section>
@@ -1116,9 +1120,88 @@ const App = {
 
     this._transcriptSegments = [...(meeting.transcript || [])];
     this._translationSegments = [...(meeting.translations || [])];
+    this._speakerNames = { ...(meeting.speakerNames || {}) };
     this._interimText = '';
     let isRecordingActive = false;
     let isRecordingStarting = false;
+    let autoScrollSuspended = false; // T-X3 — paused while an inline naming input is focused
+
+    // T-X3/X5.1: persist the live map via the same PUT the rest of the
+    // recording page already uses (X1.11 — no guard blocks a 'recording'
+    // meeting) — no new server route needed (X1.10).
+    const saveSpeakerNames = () => {
+      const m = Storage.getMeeting(meetingId);
+      if (!m) return;
+      m.speakerNames = { ...this._speakerNames };
+      Storage.saveMeeting(m);
+    };
+
+    // X11.7 — the measured failure mode is MERGE (two people sharing one
+    // label), not renumbering. A cheap, always-available signal: fewer
+    // distinct raw labels seen than participants listed.
+    const maybeWarnMergedLabels = () => {
+      const hintEl = document.getElementById('rec-speaker-merge-hint');
+      if (!hintEl) return;
+      const participantCount = (meeting.participants || []).length;
+      const distinctLabels = new Set(
+        this._transcriptSegments.filter(seg => seg.speaker && seg.speaker.startsWith('Speaker')).map(seg => seg.speaker)
+      ).size;
+      hintEl.style.display = (participantCount > 1 && distinctLabels > 0 && distinctLabels < participantCount) ? '' : 'none';
+    };
+
+    // T-X3 (X4.1): tap a "Speaker N" label in the LIVE panel → inline input
+    // in place (not a modal, doesn't pause recording). Renames every block
+    // sharing the same raw label, past and future (X5.3 hồi tố).
+    const applyLiveSpeakerName = (rawLabel, name) => {
+      this._speakerNames = SpeakerNames.assignSpeakerName(this._speakerNames, rawLabel, name, {
+        assignedAt: new Date().toISOString(),
+        assignedAtSeconds: Recorder.getElapsedSeconds ? Recorder.getElapsedSeconds() : 0,
+        source: 'live'
+      });
+      saveSpeakerNames();
+      document.querySelectorAll(`.transcript-speaker[data-speaker-raw="${CSS.escape(rawLabel)}"]`).forEach(el => {
+        const resolved = SpeakerNames.resolveSpeakerLabel(rawLabel, this._speakerNames);
+        el.textContent = resolved.display;
+      });
+    };
+
+    const openInlineSpeakerInput = (labelEl, rawLabel) => {
+      if (labelEl.querySelector('input')) return; // already open
+      const resolved = SpeakerNames.resolveSpeakerLabel(rawLabel, this._speakerNames);
+      const previousText = labelEl.textContent;
+      const input = document.createElement('input');
+      input.className = 'input transcript-speaker-input';
+      input.maxLength = 80;
+      input.value = resolved.isNamed ? resolved.display.split(' · ')[0] : '';
+      input.placeholder = rawLabel;
+      labelEl.textContent = '';
+      labelEl.appendChild(input);
+
+      autoScrollSuspended = true;
+      let settled = false; // commit/cancel both remove `input` from the DOM,
+      // which fires a native `blur` on it — without this guard that blur
+      // would re-run cancel() right after a successful commit() and stomp
+      // the just-saved name back to the placeholder text.
+      const close = () => { autoScrollSuspended = false; };
+      const commit = () => {
+        if (settled) return;
+        settled = true;
+        applyLiveSpeakerName(rawLabel, input.value);
+        close();
+      };
+      const cancel = () => {
+        if (settled) return;
+        settled = true;
+        labelEl.textContent = previousText;
+        close();
+      };
+      input.addEventListener('keydown', event => {
+        if (event.key === 'Enter') { event.preventDefault(); commit(); }
+        else if (event.key === 'Escape') { event.preventDefault(); cancel(); }
+      });
+      input.addEventListener('blur', cancel);
+      input.focus();
+    };
 
     const updateWaveform = (data) => {
       const bars = waveformEl.querySelectorAll('.waveform-bar');
@@ -1143,10 +1226,11 @@ const App = {
       const segments = isTranslation ? this._translationSegments : this._transcriptSegments;
       const list = isTranslation ? translationList : transcriptList;
       if (!list) return;
+      const rawLabel = speaker ? `Speaker ${speaker}` : (isTranslation ? '' : 'Speaker');
       segments.push({
         text,
         time,
-        speaker: speaker ? `Speaker ${speaker}` : (isTranslation ? '' : 'Speaker'),
+        speaker: rawLabel,
         language: language || ''
       });
 
@@ -1158,23 +1242,38 @@ const App = {
         transcriptList.style.display = 'block';
       }
 
+      // T-X2 (X5.2): live panel is one of the 3 places that must render
+      // through the resolver — tapping the label (T-X3) is only wired for
+      // the original channel, translation keeps its plain label.
+      const speakerDisplay = isTranslation
+        ? (rawLabel || 'Translation')
+        : SpeakerNames.resolveSpeakerLabel(rawLabel, this._speakerNames).display;
+      const speakerAttr = !isTranslation && rawLabel
+        ? ` data-speaker-raw="${Utils.escapeHtml(rawLabel)}" title="Tap để đặt tên cho người nói này" style="cursor:pointer;"`
+        : '';
+
       const block = document.createElement('div');
       block.className = 'transcript-block';
       block.innerHTML = `
         <span class="transcript-time">${Utils.formatTimestamp(time)}</span>
         <div>
-          <div class="transcript-speaker">${Utils.escapeHtml(
-            speaker ? `Speaker ${speaker}` : (isTranslation ? 'Translation' : 'Speaker')
-          )}</div>
+          <div class="transcript-speaker"${speakerAttr}>${Utils.escapeHtml(speakerDisplay)}</div>
           <div class="transcript-text">${Utils.escapeHtml(text)}</div>
         </div>
       `;
       list.appendChild(block);
 
-      // Auto-scroll
+      if (!isTranslation && rawLabel) {
+        const labelEl = block.querySelector('.transcript-speaker');
+        labelEl.addEventListener('click', () => openInlineSpeakerInput(labelEl, rawLabel));
+        maybeWarnMergedLabels();
+      }
+
+      // Auto-scroll — suspended while an inline naming input is focused
+      // (X4.1.2: otherwise new segments keep pushing the input off-screen).
       const panelBody = isTranslation ? translationBody : transcriptBody;
       if (!panelBody) return;
-      panelBody.scrollTop = panelBody.scrollHeight;
+      if (isTranslation || !autoScrollSuspended) panelBody.scrollTop = panelBody.scrollHeight;
     };
 
     const updateInterim = (channel, text) => {
@@ -1497,16 +1596,33 @@ const App = {
       if (seg.kind === 'part-gap') {
         return `<div class="transcript-gap" data-index="${i}">${Utils.escapeHtml(seg.text)}</div>`;
       }
+      // T-X2 (X5.2): same resolver as the live panel/export — an assigned
+      // name shows here as "<name> · <rawLabel>", never replacing the raw
+      // label outright (X5.3).
+      const speakerDisplay = SpeakerNames.resolveSpeakerLabel(seg.speaker, meeting.speakerNames, seg.partId).display;
       return `
       <div class="transcript-block" data-index="${i}">
         <span class="transcript-time">${Utils.formatTimestamp(seg.time)}</span>
         <div class="flex-1">
-          <div class="transcript-speaker" data-speaker-seg-index="${i}" title="Click to rename this speaker" style="cursor:pointer;">${Utils.escapeHtml(seg.speaker || 'Speaker')}</div>
+          <div class="transcript-speaker" data-speaker-seg-index="${i}" title="Click to rename this speaker" style="cursor:pointer;">${Utils.escapeHtml(speakerDisplay)}</div>
           <div class="transcript-text" contenteditable="true" data-seg-index="${i}">${Utils.escapeHtml(seg.text)}</div>
         </div>
       </div>
     `;
     }).join('') || '<div class="empty-state" style="padding:var(--space-8);"><p class="text-sm">No transcript recorded.</p></div>';
+
+    // T-X5/X5.4(a): after a refine run, `speakerNames` was moved to
+    // `speakerNamesStale` (server/refine.js) — nudge the user to re-assign
+    // instead of silently trusting a mapping keyed to the OLD (pre-refine)
+    // Speaker N numbering. Deny-by-default: a meeting that never had names
+    // assigned never shows this (no `speakerNamesStale` was ever written).
+    const speakerNamesStaleBannerHtml = (meeting.speakerNamesStale && Object.keys(meeting.speakerNamesStale).length > 0) ? `
+      <div class="card" style="margin-bottom: var(--space-4); border-color: var(--color-warning); background: var(--color-warning-muted);">
+        <p class="text-sm">Bạn đã đặt tên người nói trước khi tinh chỉnh transcript. Vì bản tinh chỉnh đánh số lại người nói độc lập với bản trước, tên cũ (${
+          Object.values(meeting.speakerNamesStale).map(entry => Utils.escapeHtml(entry.name)).join(', ')
+        }) không còn khớp — hãy gán lại tên bằng cách nhấn vào nhãn "Speaker N" trong transcript bên dưới.</p>
+      </div>
+    ` : '';
     const translationHtml = (meeting.translations || []).map(seg => `
       <div class="transcript-block">
         <span class="transcript-time">${Utils.formatTimestamp(seg.time)}</span>
@@ -1701,6 +1817,7 @@ const App = {
                 Copy All
               </button>
             </div>
+            ${speakerNamesStaleBannerHtml}
             ${transcriptHtml}
           </div>
 
@@ -4674,18 +4791,35 @@ const App = {
   },
 
   /**
-   * Rename a "Speaker N" label after recording, applied to every segment
-   * sharing that exact label WITHIN THE SAME PART (segments carry `partId`
-   * once merged from multi-part audio, server/stt/merge.js). Segments with
-   * no `partId` belong to a single-part meeting, so the rename applies to
-   * the whole transcript — matching current behavior with no part boundaries.
+   * Rename a "Speaker N" label after recording. E-X4 (Architecture §X10):
+   * this now writes into the SAME `meeting.speakerNames` map T-X3's live
+   * naming uses, instead of overwriting `seg.speaker` in place — the raw
+   * label (`segment.speaker`) is left untouched forever (X5.1). The
+   * per-part scoping this used to get "for free" via `seg.partId` equality
+   * is preserved explicitly through `SpeakerNames`' composite key
+   * (`${partId}::${rawLabel}`, js/speaker-names.js) — segments carry
+   * `partId` once merged from multi-part audio (server/stt/merge.js);
+   * segments with no `partId` (single-part meeting) share one flat
+   * namespace, matching pre-existing behavior.
+   *
+   * Net effect on the X1.9 bug (`applyTranscriptEdits` dropping `speaker`
+   * edits on a multi-part meeting): this rename no longer sends a modified
+   * `speaker` field through `PUT /api/meetings` at all (only
+   * `meeting.speakerNames` changes, a meeting-level field `preserveServerOwnedFields`
+   * already passes through untouched, X1.10) — so that code path is no
+   * longer exercised BY THIS FEATURE. It is left in place (not deleted):
+   * the contenteditable transcript-TEXT edit on the same route still relies
+   * on it, and this Dev pass has not verified there is no other caller.
    */
   _openSpeakerRenameModal(meetingId, segIndex) {
     const meeting = Storage.getMeeting(meetingId);
     const segment = meeting?.transcript?.[segIndex];
     if (!meeting || !segment || segment.kind) return;
 
-    const originalLabel = segment.speaker || 'Speaker';
+    const rawLabel = segment.speaker || 'Speaker';
+    const partId = segment.partId;
+    const resolved = SpeakerNames.resolveSpeakerLabel(rawLabel, meeting.speakerNames, partId);
+    const currentName = resolved.isNamed ? resolved.display.split(' · ')[0] : rawLabel;
 
     this.showModal(`
       <div class="modal-header">
@@ -4693,9 +4827,9 @@ const App = {
         <button class="btn btn-ghost btn-icon" id="cancel-speaker-rename" type="button">✕</button>
       </div>
       <div class="input-group">
-        <label for="edit-speaker-name">New name for "${Utils.escapeHtml(originalLabel)}"</label>
-        <input class="input" id="edit-speaker-name" maxlength="80" value="${Utils.escapeHtml(originalLabel)}">
-        <span class="text-xs text-tertiary">Applies to every line labeled "${Utils.escapeHtml(originalLabel)}" in this ${segment.partId ? 'part of the ' : ''}meeting.</span>
+        <label for="edit-speaker-name">New name for "${Utils.escapeHtml(rawLabel)}"</label>
+        <input class="input" id="edit-speaker-name" maxlength="80" value="${Utils.escapeHtml(currentName)}">
+        <span class="text-xs text-tertiary">Applies to every line labeled "${Utils.escapeHtml(rawLabel)}" in this ${partId ? 'part of the ' : ''}meeting.</span>
       </div>
       <div class="modal-footer">
         <button class="btn btn-secondary" id="cancel-speaker-rename-footer" type="button">Cancel</button>
@@ -4713,12 +4847,17 @@ const App = {
       }
       const current = Storage.getMeeting(meetingId);
       if (!current) return;
-      current.transcript = (current.transcript || []).map(seg => {
-        if (seg.kind) return seg;
-        if (seg.speaker !== originalLabel) return seg;
-        if (segment.partId !== undefined && seg.partId !== segment.partId) return seg;
-        return { ...seg, speaker: newName };
-      });
+      current.speakerNames = SpeakerNames.assignSpeakerName(current.speakerNames, rawLabel, newName, {
+        assignedAt: new Date().toISOString(),
+        source: 'post-hoc'
+      }, partId);
+      // The user just (re-)assigned this exact label — it's no longer
+      // "stale" even if it was flagged after a refine (X5.4(a)/T-X5).
+      if (current.speakerNamesStale) {
+        const key = partId === undefined || partId === null ? rawLabel : `${partId}::${rawLabel}`;
+        const { [key]: _dropped, ...restStale } = current.speakerNamesStale;
+        current.speakerNamesStale = Object.keys(restStale).length > 0 ? restStale : null;
+      }
       Storage.saveMeeting(current);
       await Storage.flush();
       this.closeModal();
@@ -4727,8 +4866,8 @@ const App = {
     };
 
     document.getElementById('save-speaker-rename')?.addEventListener('click', save);
-    document.getElementById('cancel-speaker-rename')?.addEventListener('click', () => this.closeModal());
     document.getElementById('cancel-speaker-rename-footer')?.addEventListener('click', () => this.closeModal());
+    document.getElementById('cancel-speaker-rename')?.addEventListener('click', () => this.closeModal());
     input?.addEventListener('keydown', event => {
       if (event.key === 'Enter') save();
     });

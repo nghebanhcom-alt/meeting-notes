@@ -2867,3 +2867,178 @@ N/A — không đổi endpoint/tool bên ngoài nào; đây là fix logic thuầ
 - Dùng chung pattern `typeof ... === 'string' ? ... : target.<field>` nhất quán giữa `text` và
   `speaker` — dễ đọc, dễ mở rộng nếu sau này có thêm field field-by-field khác cần fix tương tự
   (ví dụ nếu sau này thêm edit field khác cho segment).
+
+---
+
+# Review Report — 2026-09-23 (T-X1 → T-X5: live speaker naming)
+
+## Verdict: APPROVE
+
+Đã đọc `docs/Architecture.md` §X4/X5/X6/X7/X10/X11 (đặc biệt X11.7 và bảng escalation §X10 đã
+duyệt), diff thật (`git diff`, CHƯA COMMIT tại thời điểm review), toàn bộ code mới/sửa
+(`js/speaker-names.js`, `js/app.js`, `js/export.js`, `server/refine.js`, `test/speaker-names.test.js`,
+`test/refine.test.js`, `test/export-markdown.test.js`). Không tin báo cáo Dev — tự chạy lại test,
+tự đọc từng dòng diff, tự trace lineage theo Protocol 6.
+
+## Trả lời dứt khoát 2 điểm Dev tự escalate
+
+**1. Composite key `partId::rawLabel` (deviation khỏi ví dụ phẳng ở §X5.1) — ĐÚNG, giữ nguyên, không
+phải lỗi.** §X5.1 chỉ đưa ví dụ khoá phẳng (`meeting.speakerNames["Speaker 1"]`) cho trường hợp chung,
+nhưng không hề nói "cấm scope theo partId" — và §X7 (bảng Protocol 8 audit) dòng "Post-hoc rename ghi
+đè `seg.speaker`" ghi rõ: hành vi cũ đã scope theo `partId`, do "Speaker 1" ở 2 part khác nhau là 2
+người khác nhau (đúng WHY-W11/X1.9). Đọc code cũ trước khi sửa (`git log -p` không cần, comment cũ tại
+chỗ diff hiển thị rõ: `if (segment.partId !== undefined && seg.partId !== segment.partId) return seg;`)
+xác nhận: nếu Dev implement đúng-nghĩa-đen khoá phẳng theo X5.1, tính năng post-hoc rename trên bản ghi
+ghép (multi-part) sẽ **regressed** — gán tên "Speaker 1" ở part A sẽ lộ sang cả part B, đúng loại lỗi
+mà Protocol 8/WHY-W11 tồn tại để chặn. Composite key giữ đúng bất biến cũ. Đã tự verify bằng cách đọc
+`js/speaker-names.js:21-23` (`_keyFor`) và test `assignSpeakerName + resolveSpeakerLabel: partId
+scoping...` (`test/speaker-names.test.js:69-76`) — test dùng đúng 2 `partId` khác nhau, xác nhận không
+gộp nhầm. Live naming (T-X3, không có `partId`) và single-part meeting vẫn dùng namespace phẳng, khớp
+đúng ví dụ X5.2. **Duy nhất 1 việc cần làm**: cập nhật §X5.1/X5.2 trong Architecture.md để ghi rõ tham
+số `partId` tuỳ chọn này — tài liệu hiện đang lệch với code đã đúng (Low, không chặn merge).
+
+**2. `applyTranscriptEdits` speaker-branch có phải dead code không — XÁC NHẬN: không phải dead code
+theo nghĩa unreachable, nhưng nhánh so sánh `speaker` bên trong giờ chỉ còn no-op trong luồng bình
+thường.** Đã trace: hàm này vẫn được gọi cho MỌI PUT `/api/meetings` transcript edit trên meeting có
+`parts` (`preserveServerOwnedFields` → `applyTranscriptEdits`), kể cả khi user chỉ sửa `text` qua
+contenteditable (`js/app.js:3149-3157`) — đường edit text đó KHÔNG đổi `seg.speaker`
+(`m.transcript[idx].text = el.textContent` — không đụng `.speaker`), nên `incomingSpeaker !==
+target.speaker` sẽ luôn `false` trong thực tế còn lại. Grep toàn repo xác nhận không còn caller nào
+client-side gửi `speaker` khác đi qua route này sau khi rename chuyển hẳn sang `speakerNames` map
+(`_openSpeakerRenameModal` giờ chỉ gọi `SpeakerNames.assignSpeakerName`, không còn set `seg.speaker`).
+Dev đúng khi không tự ý xoá nhánh đó (giữ làm lưới an toàn cho input thiếu field, đúng pattern có sẵn
+với `text`) — chỉ cần bổ sung 1 dòng comment ngắn tại `server/meeting-parts.js` (gần
+`incomingSpeaker`) giải thích WHY nhánh này gần như luôn no-op kể từ T-X5, để người đọc sau không nhầm
+tưởng đây là code đang được thực thi tích cực. Đây là gợi ý Medium, không chặn merge.
+
+## Issues Found
+
+### Critical
+(không có)
+
+### High
+(không có)
+
+### Medium
+- [ ] `docs/Architecture.md` §X5.1/§X5.2 — cập nhật tài liệu để phản ánh tham số `partId` tuỳ chọn
+  trong `resolveSpeakerLabel`/`assignSpeakerName` (xem phần trả lời điểm #1 ở trên). Tài liệu hiện chỉ
+  mô tả khoá phẳng, code (đúng) đã mở rộng — giữ tài liệu đồng bộ với code để lần sau không ai đọc
+  Architecture.md rồi tưởng nhầm là bug.
+- [ ] `server/meeting-parts.js` (gần dòng `incomingSpeaker = typeof incoming[i]?.speaker === 'string'
+  ...`) — thêm 1 dòng comment WHY: kể từ T-X5, không còn caller client nào gửi `speaker` thay đổi qua
+  route này (rename đã chuyển sang `meeting.speakerNames`); nhánh so sánh vẫn giữ làm lưới an toàn,
+  không phải dead code cần xoá. Tránh nhầm lẫn cho người review/sửa sau này.
+
+### Low
+- [ ] `js/app.js` inline naming (`applyLiveSpeakerName`) — tên gán được `saveSpeakerNames()` gọi
+  `Storage.saveMeeting` đồng bộ mỗi lần Enter, không debounce; với tần suất gán tên thực tế (vài lần
+  mỗi phiên họp) không phải vấn đề hiệu năng, nêu ra chỉ để lưu ý nếu sau này có tính năng gán hàng
+  loạt (T-X6 chip) thì cần xem lại.
+
+## Verify độc lập từng mục trọng tâm
+
+**(1) Claim "3 fail là pre-existing/flaky" — ĐÃ TỰ VERIFY, KHÔNG chỉ tin báo cáo.** `npm test` trên
+working tree hiện tại: 302 tests, 297 pass, 2 skip, 3 fail — đúng 3 test Dev nêu
+(`test/refine-routes.test.js:315`, `test/refine-routes.test.js:369`, `test/stt-formats.test.js:104`),
+không có test nào trong `speaker-names`/`refine`/`export-markdown` (phần feature này chạm tới) nằm
+trong danh sách fail. Sau đó `git stash -u` để lùi về code CŨ (trước T-X1→T-X5), chạy `npm test` **3
+lần liên tiếp**: lần 1 fail `refine-routes.test.js:369` (port/timing timeout "job did not reach a
+terminal state"), lần 2 fail `stt-formats.test.js:129` (`ECONNRESET`, khác cả tên test với lần đầu),
+lần 3 lại fail `refine-routes.test.js:369`. Kết luận: **3 fail này fail độc lập với thay đổi hiện tại,
+đúng bản chất flaky (network/port/timing)** — không cùng 1 test fail lặp lại mỗi lần, số lượng fail và
+danh tính test thay đổi qua các lần chạy trên CÙNG MỘT bản code cũ. `git stash pop` khôi phục lại đầy
+đủ working tree sau khi verify xong (`git status` xác nhận không mất gì).
+
+**(2) T-X3 hồi tố + tạm dừng auto-scroll — ĐÃ VERIFY đúng, đọc code không chỉ tin comment.**
+- Hồi tố: `applyLiveSpeakerName` sau khi cập nhật `this._speakerNames` chạy
+  `document.querySelectorAll('.transcript-speaker[data-speaker-raw="${rawLabel}"]')` rồi set lại
+  `textContent` cho MỌI block khớp nhãn thô — bao gồm cả block render TRƯỚC thời điểm gán, vì
+  querySelectorAll quét toàn bộ DOM hiện có, không giới hạn theo thời điểm. Khớp đúng E-X3 đã duyệt.
+- Auto-scroll: `autoScrollSuspended` được set `true` lúc `openInlineSpeakerInput` mở input, set lại
+  `false` trong `close()` gọi từ cả `commit()` lẫn `cancel()`; điều kiện scroll ở cuối
+  `addTranscriptSegment` là `if (isTranslation || !autoScrollSuspended) panelBody.scrollTop = ...` —
+  đúng: kênh translation không bao giờ bị ảnh hưởng (không có inline input ở đó), kênh gốc bị chặn
+  scroll khi có input đang mở. Guard `settled` chống double-fire (`blur` tự nhiên do
+  `labelEl.textContent = ''`/`appendChild` gây ra sau khi `commit()` đã set `settled = true`) được
+  verify đúng logic, không có race hiển nhiên.
+
+**(3) T-X5 stale banner — ĐÃ VERIFY deny-by-default + cả 2 luồng.**
+- `staleSpeakerNamesFields` trả `{}` (không đổi field nào) khi `meeting.speakerNames` rỗng/không tồn
+  tại → test `applyRefineResult: ... NEVER had speakerNames stays without speakerNamesStale` xác nhận
+  bằng `assert.strictEqual(done.speakerNamesStale, undefined)`, đúng deny-by-default, không phải suy
+  đoán.
+- Single-part (`applyRefineResult`) và multi-part (`applyPartRefineResult`, scope theo prefix
+  `${partId}::`) đều gọi `staleSpeakerNamesFields`, có test riêng cho từng nhánh, kể cả case "refine
+  phần duy nhất có tên" trả về `speakerNames: null` (không phải `{}` rỗng — đúng, tránh lẫn với "chưa
+  từng có tên nào" ở object rỗng dùng cho check `Object.keys(...).length > 0` phía UI).
+  `rebuildMergedMeeting` (đọc `server/meeting-parts.js:211-231`) spread `...meeting` nên
+  `speakerNamesStale`/`speakerNames` mới không bị mất qua bước rebuild.
+- UI: banner ở `_renderMeetingDetail` chỉ hiện khi `meeting.speakerNamesStale &&
+  Object.keys(...).length > 0` — đúng deny-by-default phía render, không chỉ phía server.
+
+**(4) X11.7 merge-hint — ĐÃ VERIFY không crash khi `participants` rỗng/undefined, deny-by-default
+đúng.** `maybeWarnMergedLabels`: `(meeting.participants || []).length` an toàn với undefined; điều
+kiện hiện hint là `participantCount > 1 && distinctLabels > 0 && distinctLabels < participantCount` —
+0 hoặc 1 participant, hoặc chưa có nhãn nào xuất hiện, đều không hiện hint (deny-by-default), không có
+nhánh nào throw.
+
+**(5) XSS — ĐÃ VERIFY escape đúng ở cả 3 nơi hiển thị.** Live panel:
+`Utils.escapeHtml(speakerDisplay)`; meeting detail: `Utils.escapeHtml(speakerDisplay)`; stale banner:
+`Utils.escapeHtml(entry.name)` cho từng tên trong danh sách. `export.js` không escape vì output là
+Markdown/plain text thuần (không đi vào `innerHTML`), không phải lỗ hổng. `input.value =` và
+`input.placeholder =` trong `openInlineSpeakerInput` dùng property assignment (an toàn, không phải
+`innerHTML`).
+
+**(6) Microcopy — ĐÃ VERIFY không có khẳng định tuyệt đối.** Merge hint dùng "có thể 2 người bị gộp
+chung 1 nhãn" (không khẳng định chắc chắn), banner stale dùng "không còn khớp — hãy gán lại" (không
+khẳng định tên cũ sai tuyệt đối, chỉ nói không còn đáng tin sau refine) — khớp đúng ràng buộc
+X11.6/X-U1b (không viết "mỗi Speaker N = một người" hay "tên đã gán đúng cho cả cuộc họp" theo kiểu
+tuyệt đối).
+
+## Data lineage (Protocol 6) — trace tay
+
+Bám theo bảng X6: (4) người dùng gán tên → `App._speakerNames` (RAM) + `saveSpeakerNames()` ghi
+`meeting.speakerNames` qua `Storage.saveMeeting` — đúng, không đụng `this._transcriptSegments`. (5)
+`PUT /api/meetings` — không có test HTTP thật cho vòng round-trip này trong lượt Dev này (T-X4
+acceptance "reload giữa lúc ghi → tên còn" là test tay, chưa thấy dẫn chứng log/ảnh trong
+`docs/test-report.md` — đây là việc của QA/T-X7, không chặn Reviewer approve code, nhưng ghi chú lại
+để nhắc QA đừng bỏ qua). (6) refine xong → `applyRefineResult`/`applyPartRefineResult` chuyển map →
+`speakerNamesStale`, có test `assert.deepStrictEqual` trên GIÁ TRỊ cụ thể (không chỉ `assert_called`),
+đúng yêu cầu Protocol 6.2.
+
+## External contract verification
+N/A — không có external tool/API mới trong lượt thay đổi này (Soniox request/response format không
+đổi, `test/speaker-names.test.js` dùng lại đúng golden fixture đã capture thật ở §X11.8, không mock
+tay).
+
+## Process gate
+- Không có claim `[UNVERIFIED]` nào bị implement thẳng — `X-U1b`/`X-U3` vẫn được tôn trọng đúng như
+  ràng buộc ở checkpoint (không đưa tên vào prompt, luôn hiện nhãn gốc, không khẳng định tuyệt đối).
+  E-X6 (không đưa tên vào prompt) được verify: `server/llm/prompts.js` không nằm trong diff, đúng
+  X5.5 giữ nguyên.
+- Golden fixture dùng thật (§X11.8), không phải mock viết tay theo giả định (`test/speaker-
+  names.test.js` đọc trực tiếp file `.jsonl`, `test/export-markdown.test.js` dùng
+  `require('../js/speaker-names')` thật thay vì stub tay).
+
+## Ghi chú ngoài phạm vi feature này (không chặn approve)
+`git status` cho thấy còn các file KHÔNG liên quan tới T-X1→T-X5 đang ở trạng thái uncommitted cùng
+lúc (`CLAUDE.md`, `js/meeting-types.js`, `server/llm/presets.js`, `docs/preset-templates.md`,
+`project_state.json` — thêm 2 preset "Đàm phán hợp đồng"/"Tìm hiểu cơ hội hợp tác", thuộc feature
+`summary-presets` khác). Verdict APPROVE này chỉ áp dụng cho phần speaker-naming đã review ở trên —
+nhóm file preset kể trên CHƯA được review trong lượt này và không nên bị coi là "đã duyệt" theo
+Protocol 7 nếu commit chung.
+
+## Positive Notes
+- Dev tự flag đúng 2 điểm rủi ro cao nhất của chính mình (composite key, dead-code khả nghi) thay vì
+  im lặng — đúng tinh thần Protocol 1 mở rộng, giúp Reviewer tập trung đúng chỗ thay vì phải tự mò từ
+  đầu.
+- Test cho refine (`test/refine.test.js`) assert đúng GIÁ TRỊ map di chuyển (`deepStrictEqual`), không
+  chỉ "đã gọi hàm" — đúng kỷ luật Protocol 6.2, và có test riêng cho case "object rỗng → deny-by-
+  default" thay vì chỉ test happy path.
+- `js/speaker-names.js` viết thuần, không DOM/fetch, dễ test độc lập — đúng đề bài §X5.2; test dùng
+  golden fixture thật thay vì tự bịa nhãn "1"/"2"/"3", đúng tinh thần Protocol 5.3 dù không có external
+  API call nào trong chính PR này.
+- `_openSpeakerRenameModal` refactor giữ nguyên UX (modal, nút Cancel, phím Enter) trong khi đổi hẳn
+  cơ chế lưu trữ bên dưới — không có regression về hành vi quan sát được từ phía user, đã tự phát hiện
+  và sửa luôn một side-effect tinh vi (pre-fill input phải đọc qua resolver, không đọc thẳng
+  `seg.speaker` nữa, nếu không sẽ luôn hiện "Speaker 1" ở lần sửa tên thứ 2).

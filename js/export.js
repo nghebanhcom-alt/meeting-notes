@@ -108,7 +108,7 @@ const Export = {
           return;
         }
         const time = Utils.formatTimestamp(seg.time);
-        const speaker = seg.speaker || 'Speaker';
+        const speaker = SpeakerNames.resolveSpeakerLabel(seg.speaker, meeting.speakerNames, seg.partId).display;
         lines.push(`**[${time}] ${speaker}:** ${seg.text}`);
         lines.push('');
       });
@@ -162,7 +162,7 @@ const Export = {
       lines.push('-'.repeat(40));
       meeting.transcript.forEach(seg => {
         const time = Utils.formatTimestamp(seg.time);
-        const speaker = seg.speaker || 'Speaker';
+        const speaker = SpeakerNames.resolveSpeakerLabel(seg.speaker, meeting.speakerNames, seg.partId).display;
         lines.push(`[${time}] ${speaker}: ${seg.text}`);
       });
       lines.push('');
@@ -211,7 +211,7 @@ const Export = {
     const text = (meeting.transcript || [])
       .map(seg => {
         const time = Utils.formatTimestamp(seg.time);
-        const speaker = seg.speaker || 'Speaker';
+        const speaker = SpeakerNames.resolveSpeakerLabel(seg.speaker, meeting.speakerNames, seg.partId).display;
         return `[${time}] ${speaker}: ${seg.text}`;
       })
       .join('\n');

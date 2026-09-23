@@ -898,3 +898,49 @@ trong project này, việc này bắt buộc lái UI thật qua trình duyệt),
   UI thật (không có meeting multi-part thật để dùng) — chỉ có bằng chứng từ test tự động.
 
 ## Verdict: PASS (phạm vi single-part đã verify qua UI thật với dữ liệu thật; multi-part còn ở mức test tự động, chưa E2E thật)
+
+---
+
+# Test Report — 2026-09-23 (bổ sung): Speaker naming E2E + phát hiện bug chặn release
+
+Feature: gán tên người nói lúc đang ghi + hợp nhất với tính năng đổi tên sau khi ghi (§X,
+commit `28a515b`, Reviewer đã APPROVE dựa trên `node --test`). Thực hiện bởi PM trực tiếp qua
+browser thật, dùng dữ liệu thật của user (meeting `261dac72-...`).
+
+## Phát hiện quan trọng: bug Critical lọt qua review, chặn TOÀN BỘ meeting detail
+
+Ngay khi mở lại app sau khi merge `28a515b`, mọi trang chi tiết meeting **crash ngay khi
+click** (`ReferenceError: SpeakerNames is not defined`, console lỗi lặp lại 7 lần). Nguyên
+nhân: `js/speaker-names.js` chỉ export qua `module.exports` cho `node --test`, không tạo
+global `SpeakerNames` cho trình duyệt — trong khi `js/app.js`/`js/export.js` gọi
+`SpeakerNames.resolveSpeakerLabel(...)` trực tiếp như 1 biến toàn cục. `node --test` **không
+bắt được** lỗi này vì nó chỉ chạy qua đường CommonJS, không mô phỏng việc nạp file qua
+`<script>` tag như trình duyệt thật.
+
+**Đây là bằng chứng cụ thể cho lý do phải luôn có bước mở app thật (Protocol 6.3) trước khi
+đóng feature — 297/300 test tự động xanh nhưng tính năng KHÔNG DÙNG ĐƯỢC MỘT CHÚT NÀO trên
+thực tế.** Đã sửa 1 dòng (thêm `const SpeakerNames = {...}` đúng theo pattern `SummaryStaleness`/
+`MeetingDate` có sẵn), Reviewer đã APPROVE lại (commit `1e84598`), rồi mới tiếp tục QA.
+
+## Test Results (sau khi fix)
+
+| # | Test Case | Status | Severity | Notes |
+|---|-----------|--------|----------|-------|
+| 1 | Mở meeting detail không còn crash, console sạch lỗi `SpeakerNames` | PASS | — | |
+| 2 | Click vào nhãn "Speaker 1" trong transcript → mở modal "Rename Speaker" | PASS | — | |
+| 3 | Nhập tên, bấm Rename → transcript hiện "Hiếu QA · Speaker 1" (tên + nhãn gốc, đúng thiết kế E-X1 (b)) | PASS | — | |
+| 4 | Lưu đúng vào `meeting.speakerNames` (`storage/meetings.json`), key phẳng `"Speaker 1"` cho meeting đơn phần | PASS | — | Xác nhận qua đọc trực tiếp file lưu trữ |
+| 5 | Reload trang (F5) → tên vẫn hiện đúng, không mất | PASS | — | |
+
+## Giới hạn phạm vi (chưa test được)
+- **Gán tên LÚC ĐANG GHI (T-X3, inline naming)**: cần mic thật streaming vào Soniox live —
+  không mô phỏng được qua browser automation. Cần user tự thử ở cuộc họp tiếp theo.
+- **Cảnh báo gộp nhầm** (số nhãn quan sát < số người tham dự, X11.7): cần meeting live có
+  ≥ 2 người tham dự khai báo trước — chưa có dữ liệu thật để test.
+- **Banner "cần gán lại" sau refine** (T-X5): cần 1 meeting đã gán tên rồi refine lại — chưa
+  test qua UI thật trong đợt này (có test tự động, xem review-report.md).
+- Bản ghi multi-part: vẫn chưa có dữ liệu thật (như đã ghi ở báo cáo trước).
+
+## Verdict: PASS có điều kiện — post-hoc rename (đã refactor) hoạt động đúng qua UI thật sau khi
+sửa 1 bug Critical. Phần T-X3 (gán lúc đang ghi) và banner stale sau refine CHƯA được verify
+qua UI thật, chỉ có bằng chứng test tự động — khuyến nghị user tự xác nhận ở lần ghi âm tiếp theo.

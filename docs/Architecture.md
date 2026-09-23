@@ -1992,3 +1992,423 @@ Thứ tự: T-W10 → T-W1 → T-W2 → T-W11/T-W12 → T-W3 → T-W13 → T-W5 
 ---
 
 ✅ **CHECKPOINT (Protocol 2) — ĐÃ DUYỆT §W10–§W16 (2026-09-22).** Toàn bộ E-W1→E-W6 đã được PM xác nhận tường minh qua AskUserQuestion với user thật (không phải suy diễn/im lặng — đúng yêu cầu "xác nhận phải tường minh" của CLAUDE.md). Dev đã bắt đầu implement phần backend multi-part (T-W1→T-W2, T-W3/T-W4, T-W10→T-W11) dựa trên checkpoint này. Mọi nhãn `[UNVERIFIED]` ở §W9 vẫn nguyên hiệu lực — không đổi hằng số bitrate/audio-format dựa trên các nhãn đó.
+
+---
+
+# X. RESEARCH (2026-09-22) — Gán tên người nói **trong lúc đang ghi trực tiếp** (live speaker naming)
+
+> **Trạng thái: RESEARCH / THIẾT KẾ ĐỀ XUẤT — chưa duyệt, Dev CHƯA được code (Protocol 2: đây là một ⏸ CHECKPOINT mới).**
+> Phần này *append*, không sửa §W/§W-MP. Tiền tố `X` để không đụng dãy `W`.
+> Khác với tính năng **đã merge** "đổi tên người nói sau khi ghi xong" (`js/app.js::_openSpeakerRenameModal`, commit `4556cb2`/`6c52a8c`) — ở đây là gán tên **ngay trong lúc cuộc họp đang diễn ra**.
+> Mọi claim về Soniox có nguồn ở §X9; điểm không verify được gắn `[UNVERIFIED]` tại chỗ.
+
+## X0. Kết luận sớm (3 dòng)
+
+1. **Câu hỏi chặn (nhãn có bị đánh số lại giữa phiên không?) — doc Soniox KHÔNG trả lời.** Doc chỉ nói real-time có "higher speaker attribution errors" và "temporary speaker switches that stabilize as more context is available"; **không có** câu nào nói nhãn `Speaker N` giữ nguyên danh tính suốt phiên, cũng **không có** câu nào nói nó bị renumber. ⇒ `[UNVERIFIED — X-U1]`, **không được suy đoán theo hướng nào**.
+2. **Nhưng một sự thật mạnh hơn thì ĐÃ verify:** doc khẳng định *"Once marked final, it will never change in future responses"* và *"Final tokens are sent only once and never repeated"* (§X9-S11). ⇒ Soniox **không bao giờ sửa lại** nhãn speaker của phần transcript đã phát ra. "Stabilize" = các token *tương lai* chính xác hơn, **không** = sửa quá khứ. Lỗi gán nhãn đã hiện trên màn hình là lỗi **vĩnh viễn** trong bản live.
+3. **Rủi ro nghiêm trọng nhất lại không phải renumbering giữa phiên**, mà là 2 chỗ trong chính code MeetNote (đã đọc source, X1.6 và X1.8) sẽ **âm thầm nuốt mất tên vừa gán**: (a) vòng autosave lúc ghi ghi đè `meeting.transcript` bằng mảng trong RAM của client sau **mỗi** segment final; (b) `applyRefineResult` thay toàn bộ transcript bằng bản async có **hệ đánh số khác**. Thiết kế dưới đây xoay quanh việc tránh 2 cái bẫy đó.
+
+---
+
+## X1. Hiện trạng đã verify (đọc source trong phiên này, 2026-09-22)
+
+| # | Sự thật | Nguồn (file:dòng) |
+|---|---|---|
+| X1.1 | Live Soniox chỉ bật `enable_speaker_diarization: true`; **không** bật `enable_endpoint_detection`, **không** gửi message `finalize` ⇒ đang ở cấu hình diarization tốt nhất có thể cho real-time (khớp cảnh báo §X9-S1) | `js/transcriber.js:88-106`, xác nhận lại §W5.1 |
+| X1.2 | Token final được gom vào buffer; **nhãn speaker của cả segment = speaker của token final ĐẦU TIÊN mở buffer** (`buffer.speaker = speaker` khi `!buffer.text`), các token sau chỉ nối text | `js/transcriber.js:259-280` |
+| X1.3 | Buffer bị `_flush` khi: (a) token final mới có speaker **khác** speaker buffer, (b) hết câu `.!?。！？`, (c) buffer dài ≥ 20 000 ms | `js/transcriber.js:265-279` |
+| X1.4 | Phần **interim** (`isFinal:false`) render **không có** nhãn speaker — chỉ có text mờ (`updateInterim` không in `transcript-speaker`) ⇒ **UI hiện tại đã tự nhiên chỉ để lộ nhãn speaker trên dữ liệu final** | `js/app.js:1180-1208` vs `1163-1171` |
+| X1.5 | Segment live lưu `speaker: \`Speaker ${speaker}\`` (chuỗi hiển thị, nhãn thô `"1"` bị nhúng trong chuỗi, **không** lưu riêng) | `js/app.js:1141-1151` |
+| X1.6 | **BẪY 1** — sau mỗi segment final, app ghi `m.transcript = [...this._transcriptSegments]` rồi `Storage.saveMeeting(m)`: mảng JS trong RAM của trang ghi âm là **nguồn sự thật duy nhất**. Mọi sửa đổi ghi thẳng vào `meeting.transcript` trong lúc ghi sẽ bị **ghi đè trong vài giây** | `js/app.js:1266-1272` |
+| X1.7 | Post-hoc rename **ghi đè huỷ dữ liệu**: `seg.speaker = newName` cho mọi segment cùng nhãn (cùng `partId`), nhãn gốc `Speaker N` **mất hẳn**, không undo | `js/app.js:4707-4727` |
+| X1.8 | **BẪY 2** — `applyRefineResult` thay **toàn bộ** `transcript` bằng kết quả async; async tự đánh số `Speaker N` của riêng nó (`server/stt/providers/soniox.js:45`) ⇒ mọi tên đã gán (live hay post-hoc) **biến mất**, và nếu chỉ "map lại theo nhãn" thì có nguy cơ **gán nhầm người** | `server/refine.js:85-108`, `server/stt/providers/soniox.js:35-62` |
+| X1.9 | **BẪY 3 (bug đã có sẵn, không do đề xuất này sinh ra)** — với bản ghi **nhiều part**, `applyTranscriptEdits` chỉ đẩy ngược field **`text`** về `part.transcript`; đổi `speaker` ⇒ `changed === false` ⇒ server trả lại `current.transcript` ⇒ **post-hoc rename bị server nuốt im lặng trên meeting multi-part** | `server/meeting-parts.js:358-398` |
+| X1.10 | `PUT /api/meetings` merge theo kiểu `{ ...incoming, <field server sở hữu> }` ở **cả 3** nhánh guard ⇒ một field **mới ở cấp meeting** do client sở hữu (vd. `speakerNames`) **sống sót** qua mọi nhánh, kể cả khi refine đang chạy và kể cả meeting multi-part | `server.js:2222-2270`, `server/meeting-parts.js:393-398` |
+| X1.11 | Trong lúc ghi, meeting đã tồn tại và `Storage.saveMeeting` → `PUT /api/meetings` vẫn chạy bình thường (không guard nào chặn `status: 'recording'`) ⇒ **không cần endpoint mới** để persist tên gán lúc live | `js/storage.js:196-253`, `server.js:2213-2270` |
+| X1.12 | Deepgram live cũng phát nhãn dạng `Speaker N` (`words[0].speaker + 1`) ⇒ thiết kế phải provider-agnostic, không gắn cứng vào Soniox | `js/transcriber.js:534-543` |
+
+---
+
+## X2. Câu hỏi 1 — Nhãn `Speaker N` real-time có đổi/đánh số lại giữa phiên không?
+
+### X2.1 Nguyên văn những gì doc Soniox **thực sự** nói (đã `curl` trong phiên này — §X9)
+
+Trang *Speaker diarization* (§X9-S1), mục **Real-time considerations**, nguyên văn đầy đủ:
+
+> *"Real-time speaker diarization is more challenging due to low-latency constraints. You may observe:*
+> * *Higher speaker attribution errors compared to async mode.*
+> * *Temporary speaker switches that stabilize as more context is available."*
+
+Và mục **Best practice**:
+
+> *"For the most accurate and reliable speaker separation, use **asynchronous transcription** — it provides significantly higher diarization accuracy because the model has access to the full audio context."*
+
+Trang *Real-time transcription* (§X9-S11), nguyên văn:
+
+> * *"**Non-final token** (`is_final: false`) → Provisional text. Appears instantly but may change, disappear, or be replaced as more audio arrives."*
+> * *"**Final token** (`is_final: true`) → Confirmed text. Once marked final, it will never change in future responses."*
+> * Callout: *"Non-final tokens may appear multiple times and change slightly until they stabilize into a final token. **Final tokens are sent only once and never repeated.**"*
+
+### X2.2 Ba kết luận rút ra được — và một kết luận **không** rút ra được
+
+| # | Kết luận | Trạng thái |
+|---|---|---|
+| X2.a | Soniox **không có cơ chế sửa lại quá khứ**: token final gửi đúng 1 lần, không lặp, không đổi. Vì `speaker` là một field **của token**, nhãn của phần đã final **không bao giờ được Soniox cập nhật lại** | ✅ **VERIFIED** (§X9-S11 + §X9-S10 schema token) |
+| X2.b | ⇒ "temporary speaker switches that **stabilize**" **không** có nghĩa "gán sai rồi sẽ tự sửa". Nó chỉ có nghĩa: (i) token **non-final** có thể nhảy speaker trước khi chốt, và/hoặc (ii) các đoạn **về sau** được gán chính xác hơn. Phần đã hiện ra dưới dạng final thì **sai vĩnh viễn** | ✅ Suy ra trực tiếp từ X2.a — nhưng vẫn là **suy luận của ta**, doc không viết thẳng câu này |
+| X2.c | Doc **không tồn tại** bất kỳ cam kết nào rằng `Speaker 1` ở phút 2 và `Speaker 1` ở phút 10 là **cùng một người**. Doc cũng không nói ngược lại. Đã grep toàn bộ `llms-full.txt` (2 056 801 byte) cho `renumber / relabel / consistent label / stable / speaker id` — không có kết quả nào về tính ổn định danh tính nhãn trong một phiên real-time | ⚠️ `[UNVERIFIED — X-U1]` |
+| X2.d | Manh mối gián tiếp duy nhất: changelog **v4 Async** ghi *"Improved speaker separation and **more consistent labeling** in multi-speaker audio"* (§X9-S12). Cụm "more consistent labeling" hàm ý labeling consistency **là** một trục chất lượng có thể kém — nhưng đây là changelog của **async**, không phải cam kết cho **real-time** | ⚠️ Không được trích như thể Soniox đã khẳng định điều gì về real-time |
+
+**Trả lời thẳng câu hỏi được giao:** *"Nếu nhãn Speaker 1 lúc phút 2 có thể không còn map với Speaker 1 lúc phút 10 thì gán tên tại 1 thời điểm là không đáng tin — điều đó có thật không?"*
+→ **Không xác nhận được từ doc, và cũng không bác bỏ được.** Cách duy nhất để biết là **đo trên chính dữ liệu của người dùng** (M-X1, §X8). Theo Protocol 8.2 (deny-by-default), khi chưa đo xong thì **không được thiết kế như thể nhãn ổn định** — mọi tên gán phải (a) có thể hoàn tác, (b) không huỷ nhãn gốc, (c) không được dùng để khẳng định "đây chắc chắn là A nói" trong prompt tóm tắt.
+
+### X2.3 Hai điều đã verify **quan trọng hơn** cho thiết kế
+
+- **`is_final` đã che được nửa vấn đề, và UI hiện tại vô tình đang làm đúng.** MeetNote chỉ tạo segment (và chỉ hiển thị nhãn speaker) từ token **final** (X1.2, X1.4); phần interim hiển thị không có nhãn. ⇒ Không cần thêm cơ chế "chờ chốt" nào cho **hiển thị**: nhãn nào người dùng nhìn thấy lúc ghi thì đã là final, Soniox sẽ không đổi nó nữa. Đây là câu trả lời cho Câu hỏi 2 phần "có cơ chế nào biết token đã chốt chưa": **có — chính `is_final`, và app đã dùng đúng**.
+- **Nhãn của segment = nhãn của token final đầu tiên** (X1.2). Nếu Soniox nhảy speaker *giữa* một buffer, các token sau sẽ mở buffer mới (X1.3a) — trừ khi token thiếu field `speaker` (`token.speaker || buffer.speaker`, dòng 261) thì nó **thừa hưởng nhãn cũ**. ⇒ Nhãn của một segment MeetNote **không** đại diện cho cả segment một cách được bảo chứng. `[UNVERIFIED — X-U2]`: tần suất token final thiếu `speaker` khi bật diarization (doc ghi `speaker` là field `optional`, §X9-S10) — chưa đo.
+
+---
+
+## X3. Câu hỏi 2 — Giảm thiểu bằng gì?
+
+| Biện pháp | Có làm được không | Căn cứ |
+|---|---|---|
+| Chỉ cho gán tên dựa trên dữ liệu **final** | ✅ Đã sẵn có, không tốn gì — app chỉ render nhãn trên segment final (X1.4). Chỉ cần **ràng buộc**: UI gán tên chỉ mở từ block final, không bao giờ từ block interim | X1.2/X1.4 |
+| Cơ chế của Soniox để biết "đã chốt" | ✅ `is_final` + `final_audio_proc_ms` (audio đã xử lý thành final token). App hiện **bỏ qua** `final_audio_proc_ms` — không cần cho v1 vì đã lọc theo `is_final` | §X9-S11 |
+| Chờ "ổn định thêm vài giây" rồi mới cho gán | ⚠️ **Không có cơ sở**: doc không cho biết "bao lâu thì ổn định", và với final token thì **không có gì để chờ** (không bao giờ đổi nữa). Một độ trễ tuỳ ý sẽ chỉ là con số bịa | X2.a + `[UNVERIFIED — X-U1]` |
+| Gửi tên đã gán ngược lên Soniox (`context.terms`) để model tách giọng tốt hơn | ❌ **Không làm được ở giữa phiên.** Doc STT real-time chỉ mô tả **một** *initial configuration message* gửi lúc mở WebSocket; **không có** API cập nhật config giữa phiên (thứ duy nhất có `update_options()` mid-session là **TTS**, §X9-S13). Code cũng đang gửi config đúng 1 lần ở `socket.onopen` | §X9-S11/S13, `js/transcriber.js:113-123` |
+| Ngăn lỗi ngay từ gốc | ✅ Chính là §W: chạy **async refine** sau khi ghi xong. Doc nói thẳng async chính xác hơn | §X9-S1 |
+
+**Hệ quả thiết kế:** live speaker naming **không làm diarization tốt lên**, nó chỉ **dán nhãn người vào kết quả diarization đang có**. Microcopy/CHANGELOG không được hứa nó "giảm nhầm người nói".
+
+---
+
+## X4. UX đề xuất (tối thiểu, không phân tán sự chú ý lúc họp)
+
+Nguyên tắc: trong lúc họp, **không modal, không chặn UI, không dừng ghi, không bắt cuộn ngược**.
+
+**X4.1 Luồng chính — tap vào nhãn ngay tại dòng transcript đang chạy**
+1. Mỗi block final trong panel transcript lúc ghi đã có `<div class="transcript-speaker">Speaker 2</div>` (X1.4). Thêm `data-speaker-raw="2"` + con trỏ pointer + `title="Gán tên cho người nói này"`.
+2. Tap ngắn → **inline input thay chỗ nhãn** (không phải modal): ô text nhỏ, `maxlength=80`, Enter = lưu, Esc/blur = huỷ. Auto-scroll của panel (`js/app.js:1174-1177`) phải **tạm dừng** khi input đang focus — nếu không người dùng sẽ bị cuộn mất ô đang gõ. Đây là chi tiết dễ bỏ sót nhất của tính năng này.
+3. Lưu xong: **mọi** block cùng nhãn thô đó (đã hiện và sẽ hiện) đổi ngay sang tên mới, kèm hậu tố mờ ` · Speaker 2` để nhãn gốc **không biến mất khỏi tầm mắt** (yêu cầu của X2.c: người dùng phải tự phát hiện được khi model nhảy nhãn).
+4. Không toast. Không confirm. Gán sai thì tap lại đổi/xoá tên (xoá = để trống → quay về nhãn thô).
+
+**X4.2 Đường tắt phụ (tuỳ PM, có thể cắt khỏi v1):** một hàng chip nhỏ dưới waveform liệt kê các nhãn đã xuất hiện trong phiên (`Speaker 1 · Speaker 2 · +`) để gán mà không cần tìm dòng. Gợi ý tên lấy từ `meeting.participants` (đã có sẵn, không cần nhập tay).
+
+**X4.3 Cái KHÔNG làm ở v1** (đều làm tăng tải nhận thức giữa cuộc họp):
+- Không popup "có vẻ có người nói mới, đặt tên?" — chủ động ngắt lời người dùng khi chính model đang không chắc là kiểu tệ nhất.
+- Không gán tên cho phần interim (X1.4).
+- Không hiển thị cảnh báo/độ tin cậy diarization lúc đang ghi.
+
+---
+
+## X5. Thiết kế kỹ thuật
+
+### X5.1 Quyết định gốc — **map ở cấp meeting, KHÔNG ghi đè `seg.speaker`**
+
+```js
+meeting.speakerNames = {
+  "Speaker 1": { name: "Hiếu", assignedAt: "2026-09-22T03:11:07.000Z", assignedAtSeconds: 132, source: "live" },
+  "Speaker 3": { name: "Chị Hà",  assignedAt: "...", assignedAtSeconds: 815, source: "live" }
+}
+```
+Khoá = **nhãn thô đúng như nó nằm trong `seg.speaker`** (`"Speaker 1"`, X1.5) ⇒ dùng chung được cho Soniox và Deepgram (X1.12), không cần thêm field vào segment, không cần migration cho dữ liệu cũ.
+
+**Vì sao bắt buộc phải là map chứ không phải sửa `seg.speaker` như post-hoc rename đang làm:**
+- Bẫy 1 (X1.6): trong lúc ghi, `meeting.transcript` bị ghi đè bằng `this._transcriptSegments` sau **mỗi** segment final. Ghi tên vào `seg.speaker` thì vài giây sau **mất sạch** — và mất **im lặng**, đúng loại lỗi Protocol 6 sinh ra để chặn.
+- Bẫy 3 (X1.9): trên meeting multi-part, server **nuốt** thay đổi `speaker` gửi lên.
+- Bẫy 2 (X1.8): transcript bị thay hoàn toàn sau refine; map ở cấp meeting còn sống để xử lý tường minh (X5.4), còn `seg.speaker` thì không còn gì để cứu.
+- X1.10: field mới ở cấp meeting sống sót qua **cả 3** nhánh guard của `PUT /api/meetings` ⇒ **không cần đụng server.js, không cần endpoint mới** cho v1.
+
+### X5.2 Áp dụng lúc render (hàm thuần, testable độc lập)
+
+File mới `js/speaker-names.js` — thuần, không DOM, không fetch:
+```
+resolveSpeakerLabel(rawLabel, speakerNames) -> { display, raw, isNamed }
+assignSpeakerName(speakerNames, rawLabel, name, meta) -> speakerNames'   // name rỗng = xoá
+listAssignedLabels(speakerNames) -> [{ raw, name }]
+```
+Dùng ở **3** nơi (Protocol 6 — đổi 1 chỗ phải đổi cả 3, nếu không màn hình ghi và màn hình chi tiết sẽ lệch nhau):
+1. panel transcript lúc ghi (`js/app.js:1163-1171`),
+2. transcript ở màn hình chi tiết meeting (`js/app.js:1504`),
+3. export `.md`/clipboard (§5 của tài liệu này) — nơi hiện đang in thẳng `seg.speaker`.
+
+### X5.3 Câu hỏi "hồi tố hay chỉ từ lúc gán trở đi?"
+
+**Đề xuất: hồi tố toàn phiên (mọi segment có cùng nhãn thô), nhưng theo kiểu *không huỷ dữ liệu* và luôn hiện nhãn gốc bên cạnh.** Lý do:
+- Nhất quán với tính năng post-hoc đã ship (X1.7) — người dùng đã có mô hình tinh thần "đổi tên = áp cho cả nhãn đó".
+- "Chỉ từ lúc gán trở đi" **không hề an toàn hơn**: nếu model nhảy nhãn thì cả hai hướng đều sai; nhưng forward-only tạo thêm một transcript có **hai tên cho cùng một nhãn** — khó hiểu hơn nhiều, và phải lưu thêm khoảng thời gian hiệu lực.
+- Rủi ro của hồi tố được bù bằng: hiện nhãn gốc (` · Speaker 2`), map hoàn tác được, và tên **không** được đẩy vào prompt tóm tắt ở v1 (X5.5).
+
+⚠️ Đây là lựa chọn **có đánh đổi**, không phải sự thật kỹ thuật ⇒ **E-X3**, PM chốt.
+
+### X5.4 Tương tác với refine (§W) — bắt buộc xử lý, không được để mặc
+
+Sau khi refine chạy xong, transcript là của **async**, hệ đánh số `Speaker N` **độc lập** với bản live (X1.8) và không có nguồn nào cho phép map 1-1. Ba lựa chọn, **không tự chọn**:
+
+| | Hành vi sau refine | Ưu | Nhược |
+|---|---|---|---|
+| (a) **Vô hiệu hoá, giữ lại để đối chiếu** *(Tech Lead nghiêng về)* | `speakerNames` chuyển thành `speakerNamesStale` (hiển thị lại nhãn thô + banner "Tên bạn đã gán không còn khớp sau khi tinh chỉnh — gán lại?" kèm danh sách tên cũ để bấm gán nhanh) | Không bao giờ gán nhầm tên cho người khác | Người dùng phải gán lại (2–3 cú tap, có gợi ý sẵn) |
+| (b) Giữ nguyên map theo khoá nhãn | Không phải làm gì | **Rủi ro cao**: `Speaker 1` của async có thể là người khác ⇒ transcript trông đúng nhưng **sai người**, không ai phát hiện |
+| (c) Map lại tự động bằng heuristic (khớp theo thời gian/độ dài nói) | Tự động | **Không có nguồn nào bảo chứng**, đúng loại suy đoán Protocol 5 cấm. Loại khỏi v1 |
+
+### X5.5 Tên đã gán **KHÔNG** đi vào prompt tóm tắt ở v1
+
+`server/llm/prompts.js` hiện đã có cảnh báo về độ tin cậy nhãn người nói (WHY-W11). Đưa tên người thật vào prompt sẽ khiến LLM viết *"Hiếu quyết định X"* dựa trên một gán ghép **chưa được verify** (X2.c) — sai loại nghiêm trọng hơn nhiều so với `Speaker 1`. ⇒ v1: tên chỉ ảnh hưởng **hiển thị + export**. Nếu PM muốn đưa vào prompt, phải áp cho **cả 2 luồng** `buildSummaryPrompt` **và** `buildChunkPrompt`/`buildSynthesisPrompt` (Protocol 6 — CLAUDE.md), và phải có kết quả đo M-X1 trước. → **E-X6**.
+
+---
+
+## X6. Lineage (Protocol 6) — artifact bước N → input bước N+1
+
+| Bước | Tạo ra (tên chính xác) | Bước sau đọc đúng cái nào |
+|---|---|---|
+| 1. Soniox WS message | `token.speaker` (chuỗi `"1"`), `token.is_final` | `_appendFinalToken` chỉ nhận token `is_final === true`; `buffer.speaker` = speaker token đầu buffer |
+| 2. `_flush` | `onResult({ speaker: "<raw>", isFinal: true, ... })` | `js/app.js` `Transcriber.onResult` nhánh `result.isFinal` |
+| 3. `addTranscriptSegment` | phần tử trong `this._transcriptSegments` với `speaker: "Speaker <raw>"` | DOM block **và** autosave `m.transcript = [...this._transcriptSegments]` (X1.6) |
+| 4. Người dùng gán tên (MỚI) | `App._speakerNames` (RAM) **và** `meeting.speakerNames` (persist) — **KHÔNG** đụng `this._transcriptSegments` | render đọc `resolveSpeakerLabel(seg.speaker, meeting.speakerNames)` |
+| 5. `Storage.saveMeeting` (MỚI: kèm `speakerNames`) | `PUT /api/meetings` body có `speakerNames` | `server.js:2222-2270` giữ nguyên qua `{ ...incoming }` (X1.10) — **không** cần code server mới |
+| 6. Refine xong (§W) | `applyRefineResult` trả meeting với transcript async mới | writer phải đồng thời chuyển `speakerNames` → `speakerNamesStale` (X5.4a). **Đây là điểm nối dễ quên nhất**: bỏ qua = "silent wrong", không phải "silent empty" |
+
+**Test bắt buộc:** (i) assert sau 1 vòng autosave (bước 3 chạy lại), `meeting.speakerNames` vẫn còn nguyên **và** `seg.speaker` vẫn là nhãn thô; (ii) assert `applyRefineResult(meetingCóSpeakerNames, ...)` trả về object **không còn** `speakerNames` và **có** `speakerNamesStale` bằng đúng map cũ. `assert_called()` suông = Reviewer flag.
+
+---
+
+## X7. Protocol 8 — audit TỪNG bước pipeline hiện có với "biến thể mới: nhãn do người gán"
+
+| Bước hiện có | Giải quyết vấn đề gì trước đây | Biến thể mới có vấn đề đó không? | Quyết định |
+|---|---|---|---|
+| `_flush` gom token theo speaker (`transcriber.js:259-280`) | Tạo segment đọc được | Không đổi gì — naming nằm **ngoài** transcriber | **GIỮ nguyên, không sửa `transcriber.js`** |
+| Autosave `m.transcript = [...segments]` (X1.6) | Không mất transcript nếu sập trình duyệt | **CÓ, và nguy hiểm** — sẽ xoá mọi sửa đổi ghi thẳng vào transcript | **GIỮ** bước, nhưng biến thể mới **KHÔNG được** dùng `seg.speaker` làm nơi lưu (X5.1) |
+| Post-hoc rename ghi đè `seg.speaker` (X1.7) | Đổi tên sau khi ghi xong, khi transcript đã tĩnh | Có — nhưng lúc **đang ghi** transcript **không** tĩnh | **KHÔNG tái dùng nguyên xi.** Xem E-X4 (hợp nhất 2 cơ chế hay để song song) |
+| `applyTranscriptEdits` đẩy edit về part (X1.9) | Sửa **text** trên meeting ghép | Có, và **đang hỏng sẵn cho `speaker`** | Với map thì **không liên quan** (map ở cấp meeting). Bug cũ vẫn tồn tại → E-X5 |
+| Guard `PUT /api/meetings` (X1.10) | Snapshot client cũ đè kết quả server | Không — `speakerNames` do client sở hữu hoàn toàn, server không bao giờ ghi nó | **GIỮ nguyên, không sửa** |
+| `applyRefineResult` thay transcript (X1.8) | Thay bản live bằng bản async chính xác hơn | **CÓ — nghiêm trọng**: nhãn đổi hệ đánh số | **SỬA**: thêm bước chuyển `speakerNames` → `speakerNamesStale` (X5.4) |
+| Prompt tóm tắt + cảnh báo nhãn speaker (WHY-W11) | LLM không được tin nhãn speaker | Có, **tăng nặng** (tên người thật thuyết phục hơn `Speaker 1`) | **SKIP mặc định** — v1 không đưa tên vào prompt (X5.5), deny-by-default vì X-U1 chưa gỡ |
+| Export `.md`/clipboard in `seg.speaker` (§5) | Xuất transcript | Có — sẽ in nhãn thô trong khi màn hình hiện tên ⇒ lệch | **CẬP NHẬT** cùng lúc với render (X5.2), nếu không sẽ đúng kiểu "1 luồng đổi, luồng kia lặng lẽ bỏ qua" |
+
+---
+
+## X8. Task Breakdown (chỉ chạy sau khi PM duyệt §X)
+
+| # | Task | File | Phụ thuộc | Acceptance |
+|---|---|---|---|---|
+| **M-X1** | **ĐO TRƯỚC, không code tính năng**: dump raw token (`speaker`, `is_final`, `start_ms`) của 1–2 cuộc họp thật ra golden file `tests/fixtures/soniox/live-tokens-*.jsonl`; thống kê: số nhãn khác nhau xuất hiện, nhãn cao nhất so với số người thật, số lần đổi nhãn/phút, tỉ lệ token final thiếu `speaker` (X-U2) | script tạm + `tests/fixtures/` | — | Có số liệu thật trong `docs/test-report.md` (**APPEND**, không ghi đè). Đây là dữ liệu để gỡ `X-U1`/`X-U2` và để PM quyết E-X1 |
+| T-X1 | `js/speaker-names.js` — 3 hàm thuần (X5.2) | mới | — | `node --test`: khoá lạ → trả nhãn thô; tên rỗng → xoá khoá; không mutate input |
+| T-X2 | Render dùng resolver ở **cả 3** nơi: panel ghi, chi tiết meeting, export (X5.2) | `js/app.js`, export | T-X1 | Đổi tên 1 lần → cả 3 nơi hiện tên mới; nhãn gốc vẫn hiện kèm |
+| T-X3 | Inline naming lúc ghi (X4.1) + tạm dừng auto-scroll khi input focus | `js/app.js:1141-1208`, `css/` | T-X2 | Ghi thật 2 phút: gán tên, tiếp tục nói → tên **không** bị autosave xoá (chính là X1.6); không dừng ghi, không modal |
+| T-X4 | Persist qua `Storage.saveMeeting({ speakerNames })`; reload trang vẫn còn | `js/app.js`, `js/storage.js` | T-X3 | Reload giữa lúc ghi → tên còn; **không** thêm route server nào |
+| T-X5 | `applyRefineResult` → `speakerNamesStale` + banner gán lại (X5.4a) | `server/refine.js`, `js/app.js` | T-X1 | Test thuần theo X6(ii); meeting chưa từng gán tên ⇒ **không** banner (deny-by-default) |
+| T-X6 | (tuỳ PM) chip gợi ý tên từ `meeting.participants` (X4.2) | `js/app.js` | T-X3 | — |
+| T-X7 | QA chạy **xuyên suốt** trên bản ghi thật: ghi → gán tên → dừng → refine → kiểm **nội dung** transcript + export (Protocol 6.3) | QA | tất cả | Ảnh chụp/log trong `docs/test-report.md` (APPEND) |
+
+Thứ tự: **M-X1 trước tiên** → T-X1 → T-X2 → T-X3 → T-X4 → T-X5 → (T-X6) → T-X7.
+M-X1 có thể làm song song với T-X1/T-X2 (2 task này an toàn dù kết quả đo ra sao), nhưng **T-X3 không được bắt đầu** trước khi PM đọc số liệu M-X1 và chốt E-X1.
+
+---
+
+## X9. External Contracts + Nguồn xác thực (Protocol 5)
+
+Truy cập **2026-09-22**, tải thật bằng `curl` trong phiên này (Soniox phục vụ Markdown khi thêm `.mdx`):
+
+| ID | Nguồn | Dùng để khẳng định |
+|---|---|---|
+| **S1** | `https://soniox.com/docs/stt/concepts/speaker-diarization.mdx` (3 387 byte, đọc toàn văn) | Nguyên văn "Real-time considerations" (2 gạch đầu dòng ở X2.1); "Best practice" async; tối đa 15 speaker; endpointing/manual finalization làm giảm độ chính xác. **Toàn trang không có câu nào về tính ổn định danh tính nhãn trong 1 phiên** |
+| **S10** | `https://soniox.com/docs/api-reference/stt/websocket-api` (qua `llms-full.txt`, dòng ~9020-9090) | Schema response: `tokens[].speaker` là `string`, **optional**, "Speaker label (if diarization enabled)"; `final_audio_proc_ms` / `total_audio_proc_ms` |
+| **S11** | `https://soniox.com/docs/stt/rt/real-time-transcription.mdx` (đọc toàn văn) | Nguyên văn final/non-final ở X2.1; "Final tokens are sent only once and never repeated"; chỉ có **initial configuration message** |
+| **S12** | `https://soniox.com/docs/llms-full.txt` (2 056 801 byte) — grep `renumber\|relabel\|consistent label\|stable\|stabil\|speaker` | Không có cam kết nào về label identity trong real-time ⇒ cơ sở cho `[UNVERIFIED — X-U1]`; changelog v4 Async "more consistent labeling" (dòng 4675) |
+| **S13** | `llms-full.txt` dòng 13976 (`update_options()` — **TTS**) đối chiếu với trang STT real-time | STT real-time **không có** API đổi config giữa phiên ⇒ không gửi được tên đã gán vào `context` giữa cuộc họp (X3) |
+| **S14** | Source trong repo, đọc trực tiếp 2026-09-22 | `js/transcriber.js`, `js/app.js`, `js/storage.js`, `server.js`, `server/refine.js`, `server/meeting-parts.js`, `server/stt/providers/soniox.js`, `server/stt/contracts.js` — mọi dòng trích ở §X1 |
+
+### `[UNVERIFIED]` — chặn đúng phần nào
+
+| ID | Nội dung | Chặn gì | Gỡ bằng cách |
+|---|---|---|---|
+| **X-U1** | Nhãn `Speaker N` real-time có giữ nguyên danh tính suốt 1 phiên hay không | Chặn: (1) mọi microcopy khẳng định "tên đã gán áp đúng cho cả cuộc họp"; (2) đưa tên vào prompt tóm tắt (X5.5); (3) bỏ hiển thị nhãn gốc kèm tên. **Không chặn** T-X1/T-X2 | M-X1 |
+| **X-U2** | Tỉ lệ token final thiếu field `speaker` (doc ghi optional) khi bật diarization | Chặn mọi giả định "mỗi segment luôn có nhãn đúng" trong logic gán | M-X1 |
+| **X-U3** | Heuristic map nhãn live ↔ nhãn async sau refine | Chặn phương án X5.4(c) hoàn toàn | Không có nguồn nào khả dĩ ⇒ loại khỏi phạm vi |
+| (kế thừa) | `W-U1`, `W-U2`, `W-U3`, `W-U4` ở §W9 | Vẫn nguyên hiệu lực | — |
+
+---
+
+## X10. Escalation lên PM — không tự quyết
+
+| ID | Vấn đề | Đề xuất của Tech Lead |
+|---|---|---|
+| ~~E-X1~~ 🔴 | Nhãn speaker có giữ danh tính suốt phiên không (X2.c, `X-U1`) | ✅ **Đã duyệt tường minh (2026-09-23), sau khi có số đo M-X1**: chọn **(b) bản nhẹ an toàn**. Chi tiết ràng buộc ở §X11.7 |
+| ~~E-X2~~ 🔴 | Sau refine, tên đã gán còn đáng tin không | ✅ **Đã duyệt tường minh (2026-09-23)**: (a) vô hiệu hoá map + banner "cần gán lại", không giữ nguyên map cũ |
+| ~~E-X3~~ | Hồi tố cả phiên hay chỉ từ thời điểm gán | ✅ **Đã duyệt tường minh (2026-09-23)**: hồi tố cả phiên — số đo M-X1 ủng hộ (nhãn không đổi số trong phiên đo) |
+| ~~E-X4~~ | Hợp nhất post-hoc rename vào cùng cơ chế map hay để song song | ✅ **Đã duyệt tường minh (2026-09-23)**: hợp nhất 1 cơ chế — `meeting.speakerNames` map dùng chung cho cả rename post-hoc và gán lúc live |
+| ~~E-X5~~ | Bug đổi tên speaker bị nuốt trên multi-part | ✅ **Đã fix và commit riêng** (`49c6aa3`, Reviewer APPROVE) — độc lập với §X, không chờ merge cơ chế map mới |
+| ~~E-X6~~ | Tên đã gán có vào prompt tóm tắt không | ✅ **Đã duyệt tường minh (2026-09-23)**: v1 KHÔNG — chỉ ảnh hưởng hiển thị/export, giữ nguyên X5.5 |
+| ~~E-X7~~ | Có làm chip gợi ý tên từ `participants` ở v1 không | ✅ **Đã duyệt tường minh (2026-09-23)**: KHÔNG, v1 chỉ cần tap nhãn + gõ tên |
+
+---
+
+✅ **CHECKPOINT (Protocol 2) — ĐÃ DUYỆT (2026-09-23).** Toàn bộ E-X1→E-X7 đã được PM xác nhận tường minh qua AskUserQuestion với user thật, dựa trên số đo thật M-X1 (§X11), không phải suy diễn. Dev được bắt đầu implement theo thiết kế (b) bản nhẹ ở §X11.7, hợp nhất cơ chế map theo E-X4, dùng golden fixture §X11.8 cho test. Mọi nhãn `[UNVERIFIED]` còn lại (`X-U1b`, `X-U3` — xem §X11.5) vẫn nguyên hiệu lực: không viết microcopy khẳng định "mỗi Speaker N = một người", luôn hiện nhãn gốc kèm tên, không đưa tên vào prompt tóm tắt.
+
+---
+
+## X11. M-X1 — KẾT QUẢ ĐO THẬT (chạy 2026-09-22, 22:37–22:56 giờ máy)
+
+> **Trạng thái: M-X1 ĐÃ CHẠY.** Đây là **dữ liệu đo**, không phải suy đoán. Mọi con số dưới đây lấy từ 4 phiên WebSocket thật tới `wss://stt-rt.soniox.com/transcribe-websocket` + 1 phiên async thật tới `https://api.soniox.com/v1`, tổng ~13 phút audio, 4 921 final token.
+> **Giới hạn quan trọng (đọc trước khi dùng kết quả này):** user không có cuộc họp thật để ghi tại thời điểm đo ⇒ audio là **tổng hợp bằng macOS `say`**, không phải giọng người thật. Xem §X11.6 — đây là **proxy**, không phải bằng chứng tuyệt đối.
+
+### X11.1 Phương pháp (tái lập được)
+
+| Hạng mục | Giá trị thật đã dùng |
+|---|---|
+| Endpoint | `wss://stt-rt.soniox.com/transcribe-websocket` — đúng URL ở `js/transcriber.js:109` |
+| Config gửi lúc `onopen` | Sao chép **nguyên văn** từ `js/transcriber.js:88-106` + `_buildContext` (`:197-212`): `model: 'stt-rt-v5'`, `audio_format: 'auto'`, `enable_language_identification: true`, `enable_speaker_diarization: true`, `context.general = [domain='Business meeting', topic='Weekly product sync']`, `language_hints: ['en']`. Không bật `enable_endpoint_detection`, không gửi `finalize` — khớp X1.1 |
+| Auth | API key thật lấy qua `security find-generic-password -a soniox-api-key -s meetnote-local -w`. **Khác app 1 điểm:** app dùng temporary key từ `/api/soniox/temporary-key`; phép đo dùng key gốc. Khác biệt này chỉ nằm ở lớp xác thực, không đụng cấu hình diarization |
+| Nhịp gửi audio | Binary frame **mỗi 500 ms**, đúng bằng `mediaRecorder.start(500)` ở `js/recorder.js:175`, phát theo thời gian thực (không dồn) |
+| Định dạng audio | WAV PCM s16le 16 kHz mono, header 44 byte đi kèm frame đầu; `audio_format:'auto'` nhận diện `wav` (doc: §X9-S15). **Khác app:** app gửi WebM/Opus từ `MediaRecorder` |
+| Kết thúc | Gửi frame rỗng `''` — đúng `js/transcriber.js:190`; keepalive 15 s — đúng `:327-333` |
+| Ground truth | Tự sinh audio nên biết chính xác ai nói từ ms nào đến ms nào (file `*.ground-truth.json`) |
+| Giọng | `say -v` — 3 giọng khác nhau, luân phiên A-B-A-C-B… |
+
+### X11.2 Bốn phiên đã chạy
+
+| Run | Audio | Giọng (A / B / C) | Độ dài | Mục đích |
+|---|---|---|---|---|
+| **Run 1** | `meeting-sim.wav`, 36 lượt | Daniel (nam, en_GB) / Samantha (nữ, en_US) / Karen (nữ, en_AU) | 185,8 s | Phép đo cơ sở |
+| **Run 2** | **cùng file Run 1** | như trên | 185,8 s | Kiểm tra tính lặp lại giữa 2 phiên khác nhau |
+| **Run 3** | `meeting-sim-v2.wav`, cùng kịch bản 36 lượt | Daniel / Samantha / **Aman (nam, en_IN)** | 185,2 s | Đổi bộ giọng cho khác nhau rõ hơn |
+| **Run 4** | `meeting-sim-v3.wav`, 53 lượt | Daniel / Samantha / Aman | 234,4 s | **Test tái nhập**: A nói ở đầu, **im lặng 193,9 s**, rồi quay lại nói ở cuối |
+| **Async** | cùng file Run 1 | như Run 1 | 185,8 s | Đối chứng live vs async (`stt-async-v5`, config sao từ `server/stt/providers/soniox.js:134-144`) |
+
+### X11.3 Số liệu thô
+
+**(a) Tồn kho nhãn + so với số người thật**
+
+| Run | Số nhãn Soniox phát ra | Người thật | Khớp? | Độ chính xác token (sau khi map nhãn→người theo đa số) |
+|---|---|---|---|---|
+| Run 1 (live) | **2** (`"1"`, `"2"`) | 3 | ❌ **gộp** B+C thành `"2"` | 875/932 = 93,9 % |
+| Run 2 (live) | **2** | 3 | ❌ gộp y hệt Run 1 | 876/933 = 93,9 % |
+| Run 3 (live) | **3** (`"1"`,`"2"`,`"3"`) | 3 | ✅ | 927/929 = **99,8 %** |
+| Run 4 (live) | **3** | 3 | ✅ | 1 184/1 197 = **98,9 %** |
+| Async (đối chứng) | **2** | 3 | ❌ gộp B+C **y như live** | 929/930 = 99,9 % (trong hệ 2 nhãn) |
+
+**(b) Nhãn có bị đánh số lại giữa phiên không? — bảng "đa số người thật của mỗi nhãn, theo từng phút"**
+
+```
+Run 1  nhãn 1: min0:A(113/113) min1:A(128/182) min2:A(113/113) min3:A(24/24)
+       nhãn 2: min0:B         min1:C          min2:B          min3:B      <- B và C bị GỘP chung, không phải renumber
+Run 3  nhãn 1: min0:A(119/119) min1:A(124/124) min2:A(111/111) min3:A(24/24)
+       nhãn 2: min0:B(108/108) min1:B(105/106) min2:B(96/97)   min3:B(1/1)
+       nhãn 3: min0:C(76/76)   min1:C(70/70)   min2:C(93/93)
+Run 4  nhãn 1: min0:A(88/88)   ......... (A im lặng 193,9 s) ......... min3:A(27/27)
+       nhãn 2: min0:B(105/105) min1:B(160/163) min2:B(136/139) min3:B(125/129)
+       nhãn 3: min0:C(106/106) min1:C(151/151) min2:C(168/168) min3:C(118/118)
+```
+
+⇒ **Không có bất kỳ lần đánh số lại nào trong cả 4 phiên.** Nhãn `"1"` ở giây thứ 1 và nhãn `"1"` ở giây thứ 234 luôn là **cùng một giọng**.
+
+**(c) Run 4 — kết quả quyết định cho câu hỏi gốc**
+
+A nói xong lượt cuối lúc **35,2 s**, im lặng **193,9 s** (B và C nói 44 lượt xen kẽ), rồi quay lại lúc **229,1 s**.
+→ A nhận lại **đúng nhãn `"1"`**, không phải nhãn mới `"4"`. 27/27 final token của lượt quay lại mang nhãn `"1"`.
+
+**(d) Nhãn được cấp theo thứ tự xuất hiện lần đầu, và chỉ cấp thêm (append-only)** — Run 3:
+
+| Nhãn | Lần đầu xuất hiện (audio ms) | Người thật |
+|---|---|---|
+| `"1"` | 60 ms | A (nói đầu tiên) |
+| `"2"` | 6 660 ms | B (nói thứ hai) |
+| `"3"` | 17 640 ms | C (nói thứ ba, lượt 4) |
+
+**(e) Soniox có gửi lại / sửa lại final token không?**
+
+| Run | Final token | Token bị gửi lại (trùng `start_ms|end_ms|text`) | Trong đó đổi `speaker` |
+|---|---|---|---|
+| Run 1 | 932 | **0** | 0 |
+| Run 2 | 933 | **0** | 0 |
+| Run 3 | 929 | **0** | 0 |
+| Run 4 | 1 197 | **0** | 0 |
+| Async | 930 | **0** | 0 |
+
+⇒ **X2.a được xác nhận bằng thực nghiệm**, không chỉ bằng doc: 4 921/4 921 final token gửi đúng một lần, không bao giờ bị sửa nhãn về sau.
+
+**(f) `X-U2` — tỉ lệ final token thiếu field `speaker`:** **0/4 921 = 0,0 %** trên cả 5 phiên. Nhánh fallback `token.speaker || buffer.speaker` (`js/transcriber.js:261`) **chưa từng được kích hoạt** trong dữ liệu đo.
+
+**(g) Nhãn của token *non-final* có nhảy trước khi chốt không?** 0/955 (Run 1) và 0/940 (Run 3) chuỗi interim có nhãn thay đổi. Doc cảnh báo "temporary speaker switches" (§X9-S1) nhưng audio tổng hợp không có chồng tiếng nên **không tái hiện được** hiện tượng này — không kết luận gì từ số 0 này.
+
+**(h) Mô phỏng đúng logic `_appendFinalToken` + `_flush` của app trên token đã bắt được — tức là *thứ người dùng thật sự nhìn thấy trên màn hình*:**
+
+| Run | Số segment UI | Map nhãn→người | Segment bị gán **sai người** |
+|---|---|---|---|
+| Run 1 (live) | 63 | `{1:A, 2:B}` | **18 (28,6 %)** |
+| Run 3 (live) | 66 | `{1:A, 2:B, 3:C}` | **0 (0,0 %)** |
+| Run 4 (live) | 62 | `{1:A, 2:B, 3:C}` | **0 (0,0 %)** |
+| Async (cùng audio Run 1) | 60 | `{1:A, 2:B}` | **12 (20,0 %)** |
+
+### X11.4 Kết luận — và nó **đổi hướng** phân tích ở §X2
+
+| # | Kết luận | Bằng chứng | Trạng thái |
+|---|---|---|---|
+| X11.a | **Không quan sát thấy renumbering.** Trong 4 phiên live (~13 phút), một nhãn đã cấp thì giữ nguyên danh tính đến hết phiên | X11.3(b) | ✅ **ĐO ĐƯỢC** trong phạm vi ≤ 4 phút/phiên |
+| X11.b | **Người nói vắng mặt 3,2 phút rồi quay lại vẫn nhận đúng nhãn cũ** | X11.3(c) | ✅ **ĐO ĐƯỢC** |
+| X11.c | Nhãn cấp theo thứ tự nói lần đầu, chỉ thêm mới, không xáo lại số cũ | X11.3(d) | ✅ **ĐO ĐƯỢC** |
+| X11.d | Final token không bao giờ bị gửi lại/sửa nhãn — xác nhận X2.a bằng thực nghiệm | X11.3(e) | ✅ **ĐO ĐƯỢC** |
+| X11.e | **Rủi ro thật KHÔNG phải renumber mà là GỘP (merge).** Khi 2 giọng gần nhau, Soniox gộp 2 người thành 1 nhãn **vĩnh viễn** ⇒ 2 nhãn cho 3 người, 28,6 % segment trên màn hình bị gán sai người | X11.3(a)(h), Run 1+2 | ✅ **ĐO ĐƯỢC** |
+| X11.f | **Refine async KHÔNG cứu được lỗi gộp này.** Cùng file audio, async cũng gộp B+C vào 1 nhãn (20,0 % segment sai) | X11.3(a)(h) hàng Async | ✅ **ĐO ĐƯỢC** — đây là điểm mới so với giả định "async sẽ chính xác hơn" ở X2.1 |
+| X11.g | Live **kém hơn** async đúng như doc nói, nhưng khoảng cách hẹp: 28,6 % vs 20,0 % segment sai trên cùng audio khó; ở audio dễ (Run 3) live đạt 0 % | X11.3(h) | ✅ **ĐO ĐƯỢC** |
+| X11.h | Lặp lại được: Run 1 và Run 2 (2 phiên WebSocket riêng, cùng audio) cho kết quả gần như trùng khít (932 vs 933 final token, cùng ma trận nhầm lẫn) | X11.3(a) | ✅ **ĐO ĐƯỢC** |
+
+### X11.5 Cập nhật trạng thái `[UNVERIFIED]`
+
+| ID | Trước M-X1 | Sau M-X1 |
+|---|---|---|
+| **`X-U1`** (nhãn có giữ danh tính suốt phiên không) | `[UNVERIFIED]`, chặn 3 thứ | ⬇️ **HẠ CẤP, KHÔNG GỠ HẲN** → đổi tên thành **`X-U1b`**. Đã có bằng chứng thực nghiệm **phủ định** giả thuyết renumbering ở phiên **≤ 4 phút, 3 người, không chồng tiếng, giọng tổng hợp**. **Chưa** phủ định được cho: phiên **dài > 10 phút**, **> 3 người**, **giọng người thật có chồng tiếng/tiếng ồn**, và **tiếng Việt**. ⇒ `X-U1b` vẫn chặn: (2) đưa tên vào prompt tóm tắt (X5.5) và (3) bỏ hiển thị nhãn gốc kèm tên. **Không còn chặn** (1) — microcopy được phép nói tên áp cho cả cuộc họp, nhưng vẫn phải kèm cách kiểm tra lại |
+| **`X-U2`** (tỉ lệ final token thiếu `speaker`) | `[UNVERIFIED]` | ✅ **GỠ** — 0/4 921 = 0,0 %. Logic gán được phép giả định mọi final token có `speaker` khi diarization bật; nhánh fallback `token.speaker || buffer.speaker` giữ nguyên như lưới an toàn, không cần thiết kế thêm quanh nó |
+| **`X-U3` (MỚI)** | — | 🔴 **MỚI PHÁT SINH TỪ M-X1**: tần suất **gộp 2 người vào 1 nhãn** trên giọng người thật trong tiếng Việt là bao nhiêu? Đây mới là chế độ hỏng chi phối (X11.e). Chặn: mọi microcopy khẳng định "mỗi Speaker N = một người". Gỡ bằng: 1 cuộc họp thật có ≥ 3 người, đối chiếu tay |
+
+### X11.6 Giới hạn của phép đo — phải đọc kèm mọi kết luận trên
+
+1. **Audio tổng hợp `say`, không phải giọng người.** TTS ổn định hơn người thật rất nhiều (không đổi cảm xúc, không đổi khoảng cách mic, không thay đổi tốc độ). Việc "không thấy renumber" có thể một phần do giọng TTS quá ổn định ⇒ embedding người nói gần như bất biến. Đây là **proxy**, không phải bằng chứng tuyệt đối.
+2. **Không có chồng tiếng, không tiếng ồn, không cắt lời.** Mỗi lượt cách nhau 250 ms im lặng sạch. Họp thật thì ngược lại — mà chính chồng tiếng là thứ doc Soniox cảnh báo gây "temporary speaker switches".
+3. **Tiếng Anh, không phải tiếng Việt.** macOS chỉ có **1** giọng `vi_VN` (Linh) nên không thể dựng 3 người nói tiếng Việt khác nhau. `language_hints:['en']` đã dùng; hành vi diarization với tiếng Việt **chưa đo**.
+4. **Codec khác app.** Đo gửi WAV PCM 16 kHz; app gửi WebM/Opus qua `MediaRecorder`. PCM sạch hơn Opus ⇒ kết quả đo có thể **lạc quan hơn** thực tế.
+5. **Độ dài 3–4 phút, không phải 1 tiếng.** Đây là giới hạn rõ nhất: `X-U1b` chỉ được kiểm chứng trong ~4 phút.
+6. **3 người, ít nhất 1 cặp giọng cùng giới.** Số người thật trong họp có thể 5–10; càng nhiều người nguy cơ gộp càng cao.
+7. **Auth bằng API key gốc** thay vì temporary key như app (X11.1) — không ảnh hưởng diarization nhưng cần ghi cho trung thực.
+
+### X11.7 Khuyến nghị cho E-X1 — **chọn (b), bản nhẹ an toàn**
+
+**Không chọn (c) "bỏ hẳn":** nỗi lo cốt lõi từng biện minh cho (c) — nhãn bị đánh số lại giữa chừng khiến tên gán lúc phút 2 vô nghĩa ở phút 10 — **đã bị dữ liệu bác bỏ** trong mọi phiên đo, kể cả qua 3,2 phút im lặng (X11.a, X11.b). Bỏ hẳn tính năng vì một rủi ro không tái hiện được là quá bảo thủ.
+
+**Không chọn (a) "làm đầy đủ, coi tên là sự thật":** M-X1 tìm ra một chế độ hỏng **khác và tệ hơn** — Soniox gộp 2 người thành 1 nhãn và giữ vĩnh viễn (X11.e). Trong Run 1, gán "nhãn 2 = Chị Chi" sẽ khiến **28,6 % segment** ghi tên Chi cho lời của người khác, và **refine async không sửa được** (X11.f). Đây đúng là kịch bản "sai người một cách thuyết phục" mà E-X1 lo, chỉ khác nguyên nhân.
+
+**Chọn (b)** — cho gán tên lúc live, nhưng ràng buộc bằng đúng những gì đã đo:
+
+| Điều kiện của (b) | Vì sao, dựa trên số đo |
+|---|---|
+| **Luôn hiện nhãn gốc `Speaker N` bên cạnh tên** (không thay thế) | Chế độ hỏng chi phối là gộp (X11.e); người dùng cần thấy "2 người này đang chung một nhãn" thì mới phát hiện ra |
+| **Không ghi đè `seg.speaker`; map ở cấp meeting, hoàn tác được** (giữ nguyên X5.1) | Không đổi — M-X1 không cho lý do nào để nới lỏng |
+| **Tên hồi tố cả phiên** (E-X3 = hồi tố) | Được M-X1 **ủng hộ**: nhãn ổn định suốt phiên và qua cả khoảng im lặng dài (X11.a/b), nên hồi tố là đúng chứ không phải liều |
+| **Không đưa tên vào prompt tóm tắt ở v1** (X5.5 giữ nguyên) | `X-U1b` + `X-U3` vẫn mở; rủi ro gộp chưa đo trên người thật |
+| **Sau khi ghi xong, nhắc đối chiếu lại tên** (nudge, không bắt buộc) | 20–28,6 % segment sai ở kịch bản xấu (X11.3h) là quá cao để coi tên là chốt hạ |
+| **Microcopy nhắc khả năng gộp**, ví dụ *"Nếu hai người bị gom chung một nhãn, hãy sửa lại sau khi ghi xong"* | Trực tiếp từ X11.e; đây là cảnh báo **đúng**, thay cho cảnh báo renumbering **sai** mà §X4 đang giả định |
+| **Vẫn giữ nguyên E-X2 = (a) vô hiệu hoá map + banner gán lại sau refine** | M-X1 **củng cố**: async đánh số riêng và thậm chí có thể ra **số lượng nhãn khác** live trên cùng audio |
+
+**Một điều chỉnh thiết kế mà M-X1 bắt buộc phải sửa ở §X4:** UX hiện đang được viết quanh giả định "rủi ro = nhãn nhảy số". Đúng phải là **"rủi ro = hai người chung một nhãn / một người bị tách hai nhãn"**. Nếu số nhãn quan sát được **< số người trong `participants`**, UI nên nói thẳng điều đó (ví dụ *"Đang thấy 2 người nói nhưng bạn ghi 3 người tham dự — có thể 2 người bị gom chung"*) — đây là tín hiệu **rẻ, có sẵn ngay lúc live**, và chính là thứ số đo chứng minh là quan trọng.
+
+### X11.8 Golden file (Protocol 5.3)
+
+| File | Nội dung |
+|---|---|
+| `tests/fixtures/soniox/live-final-tokens-synth-3voices.jsonl` | Toàn bộ **final token thật** Soniox trả về ở Run 3 (89 message), kèm `tMs` (mốc wall-clock từ lúc mở WS) |
+| `tests/fixtures/soniox/live-final-tokens-synth-3voices.ground-truth.json` | Timeline ai nói từ ms nào tới ms nào của Run 3 |
+| `tests/fixtures/soniox/live-final-tokens-synth-reentry.jsonl` | Final token thật của Run 4 (113 message) — kịch bản người nói vắng 193,9 s rồi quay lại |
+| `tests/fixtures/soniox/live-final-tokens-synth-reentry.ground-truth.json` | Timeline Run 4 |
+
+⚠️ Đây là output **thật** của Soniox nhưng trên audio **tổng hợp** — dùng được làm golden file cho test logic gom segment / gán tên (T-X1), **không** dùng được để kết luận về chất lượng diarization trên giọng người thật. Token non-final đã bị lược bỏ (nguyên bản ~2,7 MB/phiên); nếu test cần interim thì phải bắt lại.
+
+### X11.9 Nguồn xác thực bổ sung cho §X9
+
+| ID | Nguồn | Xác thực điều gì |
+|---|---|---|
+| **S15** | `https://soniox.com/docs/llms-full.txt` (2 056 801 byte, tải lại 2026-09-22), mục *Audio formats* | `audio_format:'auto'` tự nhận diện `aac, aiff, amr, asf, flac, mp3, ogg, wav, webm` ⇒ gửi WAV là hợp lệ với đúng config của app; audio phải gửi dưới dạng **binary WebSocket frame**; kết thúc bằng **frame rỗng**; mỗi stream tối đa 300 phút |
+| **S16** | 4 phiên WebSocket thật + 1 job async thật, log đầy đủ, 2026-09-22 22:37–22:56 | Toàn bộ số liệu §X11.3 |
+
+### X11.10 Việc còn lại để đóng hẳn `X-U1b` và `X-U3`
+
+Khi user có một cuộc họp thật (≥ 3 người, ≥ 20 phút, tiếng Việt): bật ghi như bình thường, dump raw token qua đúng script đã dùng, rồi chạy lại đúng 8 phép thống kê ở §X11.3. Không cần thiết kế lại gì — chỉ thay file audio. **Cho tới lúc đó, khuyến nghị (b) đứng vững; (a) thì không.**

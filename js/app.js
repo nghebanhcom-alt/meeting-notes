@@ -2645,26 +2645,29 @@ const App = {
       const button = event.currentTarget;
       button.disabled = true;
       button.textContent = 'Đang export…';
-      await this._runExport(meetingId, includeTranscript);
-      this.closeModal();
+      // On success _runExport already replaced this modal with the result
+      // modal — closing it here would dismiss the result straight away.
+      const exported = await this._runExport(meetingId, includeTranscript);
+      if (!exported) this.closeModal();
     });
   },
 
+  // Resolves true only when the file was written and the result modal is showing.
   async _runExport(meetingId, includeTranscript) {
     const meeting = Storage.getMeeting(meetingId);
-    if (!meeting) return;
+    if (!meeting) return false;
 
     let settings;
     try {
       settings = await Exporter.getSettings();
     } catch (error) {
       this.toast(error.message || 'Không thể đọc cấu hình xuất file.', 'error');
-      return;
+      return false;
     }
     if (!settings.configured) {
       this.toast('Chưa cấu hình thư mục xuất file — mở Cài đặt để chọn thư mục (BR-44).', 'warning');
       this.navigate('settings');
-      return;
+      return false;
     }
 
     // BR-52: only relevant when the summary actually used a preset — a
@@ -2682,13 +2685,15 @@ const App = {
     try {
       const result = await Exporter.exportMarkdown(meetingId, content, includeTranscript);
       this._showExportResult(result);
+      return true;
     } catch (error) {
       if (error.code === 'EXPORT_DIR_NOT_CONFIGURED') {
         this.toast('Chưa cấu hình thư mục xuất file — mở Cài đặt để chọn thư mục.', 'warning');
         this.navigate('settings');
-        return;
+        return false;
       }
       this.toast(error.message || 'Export thất bại', 'error');
+      return false;
     }
   },
 
